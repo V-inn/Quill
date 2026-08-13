@@ -83,6 +83,7 @@ int main(int argc, char **argv) {
 		return 1;
 	}
 	int card = atoi(argv[1]);
+	setvbuf(stdout, NULL, _IOLBF, 0);
 
 	enum evdi_device_status status = evdi_check_device(card);
 	if (status != AVAILABLE) {

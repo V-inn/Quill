@@ -34,6 +34,27 @@ frames can be read from userspace.
   all other work saved/closed first.
 - Next attempt should target the `plasmax11.desktop` (Plasma X11) SDDM session per the
   plan's fallback path, with the above precautions.
+- **2026-08-13, Plasma X11 session (kwin_x11), first connect:** loaded evdi, connected,
+  KDE popped its native display-arrangement dialog (mirror/extend/etc) — good sign, no
+  freeze. User closed the dialog without choosing an option, so KWin never issued a
+  modeset; `mode_changed_handler` never fired. Clean SIGINT shutdown afterward, no
+  crash.
+- **2026-08-13, Plasma X11 session, second connect:** reconnected, this time enabled
+  the output manually via `xrandr --output DVI-I-1-1 --auto --right-of eDP-1` instead
+  of the dialog. Succeeded — virtual screen extended to 3840x1080, `DVI-I-1-1` active
+  at 1920x1080. Then, on disconnect/cleanup (exact trigger unconfirmed — either the
+  xrandr disable or the client process ending), the machine froze/black-screened
+  again — this time briefly, and it **self-recovered** without a reboot (confirmed via
+  `journalctl --list-boots`: same boot session throughout, no new boot entry).
+- **Working theory:** this is not Wayland-specific. Both the hard Wayland freeze and
+  the milder X11 freeze happened around evdi modeset/connect-state transitions on this
+  machine's Intel TigerLake Iris Xe GPU, which has *both* `i915` and `xe` kernel
+  drivers available (`i915` currently bound, per `lspci -k`). Whether the dual-driver
+  availability is related is unconfirmed — worth checking `i915`-vs-`xe` driver
+  binding and searching for known evdi/i915 TigerLake modeset issues before further
+  live testing. **Treat every future evdi connect/disconnect on this machine as
+  freeze-risk** regardless of session type, keep the SSH escape hatch ready, and save
+  work first.
 
 ## 2. Daemon v0
 
