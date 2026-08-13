@@ -264,7 +264,7 @@ limitations stacked together — every frame is a full independent I-frame (~26-
 each, no P-frame savings), software-decoded, over the full USB adb-tunnel path.
 Tuning (real GOP structure, buffer sizing) is explicitly Milestone 7's job.
 
-## 4. Android client v0 — hardware-decoder bug fixed, latency measurement pending
+## 4. Android client v0 — DONE
 
 Decode + render only, measure glass-to-glass latency with a stopwatch/high-fps camera
 test.
@@ -293,6 +293,43 @@ doc calls for a stopwatch/high-fps camera test — inherently a physical, hands-
 measurement (filming both the source screen and the tablet simultaneously and
 comparing timestamps frame-by-frame), needs the user's participation, not something
 that can be done from the terminal.
+
+**2026-08-13, glass-to-glass latency measured — Milestone 4 done.** Method: a
+millisecond-precision clock (`requestAnimationFrame`-driven, see the approach in this
+session) shown in two windows, one on the real screen, one dragged onto the virtual
+monitor (so it's captured/streamed/decoded like any other content). Both read the same
+system clock, so filming both screens together in slow-motion and reading the two
+displayed values in a single video frame gives the latency directly. Two
+measurements: 53.580 vs 53.262 (**318ms**), 52.447 vs 52.145 (**302ms**). User also
+observed the tablet's effective refresh rate looked noticeably slower/choppier than
+the source's.
+
+**~300ms is far higher than our own "dequeue→encoded" instrumentation ever showed**
+(avg ~40ms throughout this same run, 5124 frames, no growth trend). Root cause: that
+metric only times from calling `dequeue_buffer()` to finishing encode — it excludes
+any time a frame already spent sitting in PipeWire's internal buffer queue *before* we
+got to it. The clock's source content changes about as fast as the display refreshes
+(~60Hz), but our own pipeline can only process one frame every ~40ms (~25fps) purely
+for capture+encode, before transport and decode are even counted — since nothing in
+the current pipeline checks buffer timestamps or drops stale/backlogged frames, we're
+structurally slower than the rate content changes, so a growing backlog of
+increasingly-stale buffers accumulates and we always end up encoding/sending an old
+one. This is a coherent, root-caused explanation, not a mystery: buffer staleness
+invisible to our own internal timer, not (only) an inherently-slow individual stage.
+
+**Confirms the known Milestone-2 optimization flag is the right next lever, not just
+theoretical:** the pipeline currently does a lot of avoidable CPU↔GPU round-tripping
+— `StreamFlags::MAP_BUFFERS` explicitly requests CPU-mapped memory from PipeWire
+(not zero-copy DMA-BUF), then `bgrx_to_nv12` runs a scalar CPU loop, then that result
+gets copied back up to a GPU surface for VAAPI. A real hardware-accelerated pipeline
+(SuperDisplay-equivalent, and what PipeWire/VAAPI both actually support) would import
+a DMA-BUF handle directly into a VAAPI surface with zero CPU copies and let the GPU do
+color conversion too, keeping every stage's ~40ms cost down and directly shrinking the
+backlog that causes the 300ms glass-to-glass gap. **Concrete direction for Milestone
+7:** (1) negotiate/import DMA-BUF from PipeWire instead of `MAP_BUFFERS`, (2) always
+grab the newest available buffer and explicitly drop stale queued ones instead of
+processing in strict FIFO order, (3) a real GOP with P-frames instead of all-intra, to
+cut per-frame cost further.
 
 ## 5. Input path
 
