@@ -67,10 +67,11 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
 
                 val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height)
-                // Diagnostic: force the AOSP software decoder instead of the
-                // device's hardware one, to tell apart a hardware-decoder
-                // quirk from a bug in our own bitstream/app code.
-                codec = MediaCodec.createByCodecName("c2.android.avc.decoder")
+                // Back to the device's default (hardware) decoder now that the
+                // daemon encodes Main profile/CABAC instead of Constrained
+                // Baseline/CAVLC -- the latter caused a solid-green render on
+                // this tablet's hardware decoder specifically (see MILESTONES.md).
+                codec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
                 Log.i(tag, "using decoder: ${codec!!.name}")
                 codec!!.configure(format, holder.surface, null, 0)
                 codec!!.start()

@@ -72,7 +72,7 @@ impl VaapiEncoder {
             unsafe {
                 ffi::vaGetConfigAttributes(
                     dpy,
-                    ffi::VAProfile_VAProfileH264ConstrainedBaseline,
+                    ffi::VAProfile_VAProfileH264Main,
                     ffi::VAEntrypoint_VAEntrypointEncSliceLP,
                     &mut packed_headers_attrib,
                     1,
@@ -106,7 +106,7 @@ impl VaapiEncoder {
             unsafe {
                 ffi::vaCreateConfig(
                     dpy,
-                    ffi::VAProfile_VAProfileH264ConstrainedBaseline,
+                    ffi::VAProfile_VAProfileH264Main,
                     ffi::VAEntrypoint_VAEntrypointEncSliceLP,
                     attribs.as_mut_ptr(),
                     attribs.len() as i32,
@@ -253,7 +253,12 @@ impl VaapiEncoder {
         unsafe {
             pic.pic_fields.bits.set_idr_pic_flag(1);
             pic.pic_fields.bits.set_reference_pic_flag(0);
-            pic.pic_fields.bits.set_entropy_coding_mode_flag(0); // CAVLC: required by ConstrainedBaseline
+            // CABAC + Main profile instead of CAVLC + Constrained Baseline: the
+            // tablet's hardware decoder rendered solid green with CAVLC/Baseline
+            // (confirmed decoding, just wrong colors) while both ffmpeg and
+            // Android's software decoder handled the same bytes fine -- CABAC is
+            // the far more heavily used/tested path on most decoder silicon.
+            pic.pic_fields.bits.set_entropy_coding_mode_flag(1);
             pic.pic_fields.bits.set_deblocking_filter_control_present_flag(1);
         }
 
@@ -275,7 +280,7 @@ impl VaapiEncoder {
         // hand them over as "packed header" buffers so every frame (each an
         // independent IDR) is standalone-decodable.
         let h264_params = H264Params {
-            profile_idc: 66, // Constrained Baseline
+            profile_idc: 77, // Main
             level_idc: seq.level_idc,
             mbs_width: mbs_w,
             mbs_height: mbs_h,

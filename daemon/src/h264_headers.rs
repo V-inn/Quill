@@ -103,11 +103,12 @@ pub fn build_sps(p: &H264Params) -> Vec<u8> {
     let mut nal = vec![0x67u8]; // nal_ref_idc=3, nal_unit_type=7 (SPS)
     let mut w = BitWriter::new();
     w.write_bits(p.profile_idc as u32, 8);
-    w.write_bits(0xC0, 8); // constraint_set0_flag=1, constraint_set1_flag=1, rest 0
+    w.write_bits(0x00, 8); // constraint_set flags: none claimed, plain Main profile
     w.write_bits(p.level_idc as u32, 8);
     w.write_ue(0); // seq_parameter_set_id
-    // chroma_format_idc/bit_depth fields omitted: only present when
-    // profile_idc indicates a High-profile family, not for Baseline (66).
+    // chroma_format_idc/bit_depth fields omitted: only present in the SPS for
+    // profile_idc in the High-profile family (100/110/122/...), not for
+    // Main (77) or Baseline (66).
     w.write_ue(p.log2_max_frame_num_minus4);
     w.write_ue(0); // pic_order_cnt_type
     w.write_ue(p.log2_max_pic_order_cnt_lsb_minus4);
@@ -136,7 +137,7 @@ pub fn build_pps(p: &H264Params) -> Vec<u8> {
     let mut w = BitWriter::new();
     w.write_ue(0); // pic_parameter_set_id
     w.write_ue(0); // seq_parameter_set_id
-    w.write_bit(0); // entropy_coding_mode_flag (CAVLC, required by Constrained Baseline)
+    w.write_bit(1); // entropy_coding_mode_flag (CABAC) -- must match pic.pic_fields in vaapi_encoder.rs
     w.write_bit(0); // bottom_field_pic_order_in_frame_present_flag
     w.write_ue(0); // num_slice_groups_minus1
     w.write_ue(0); // num_ref_idx_l0_default_active_minus1

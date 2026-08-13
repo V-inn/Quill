@@ -264,10 +264,35 @@ limitations stacked together — every frame is a full independent I-frame (~26-
 each, no P-frame savings), software-decoded, over the full USB adb-tunnel path.
 Tuning (real GOP structure, buffer sizing) is explicitly Milestone 7's job.
 
-## 4. Android client v0
+## 4. Android client v0 — hardware-decoder bug fixed, latency measurement pending
 
 Decode + render only, measure glass-to-glass latency with a stopwatch/high-fps camera
 test.
+
+**Fixed the Milestone 3 hardware-decoder color bug.** Hypothesis: Constrained
+Baseline profile forces CAVLC entropy coding, a much less-used/tested code path on
+most decoder silicon than CABAC (used by Main/High profile) — plausible cause of a
+hardware-specific decode bug that both `ffmpeg` and Android's software decoder didn't
+hit. Switched the daemon to H.264 Main profile + CABAC:
+`daemon/src/vaapi_encoder.rs` (`VAProfile_VAProfileH264Main`,
+`entropy_coding_mode_flag=1`) and `daemon/src/h264_headers.rs` (`profile_idc: 77`,
+matching `entropy_coding_mode_flag` bit in the hand-built PPS — this has to stay in
+sync with the VAAPI-side picture-parameter setting, or the PPS metadata would lie
+about what's actually in the bitstream). Validated locally first (`ffprobe` now
+reports `profile=Main`, decodes clean, frame extracted and visually correct) before
+touching the tablet again.
+
+**Live-tested on the real hardware decoder (`c2.exynos.h264.decoder`, confirmed via
+Android's own `codec.name` log)**: colors render correctly. 447 frames captured,
+encoded, transported, decoded, and rendered in one continuous run, clean shutdown
+both sides. Bonus: CABAC compresses better than CAVLC, so frames also got smaller
+(~18.7KB avg vs ~26KB before, same content).
+
+**Remaining for this milestone:** measure actual glass-to-glass latency. The design
+doc calls for a stopwatch/high-fps camera test — inherently a physical, hands-on
+measurement (filming both the source screen and the tablet simultaneously and
+comparing timestamps frame-by-frame), needs the user's participation, not something
+that can be done from the terminal.
 
 ## 5. Input path
 
