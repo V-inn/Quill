@@ -331,9 +331,60 @@ grab the newest available buffer and explicitly drop stale queued ones instead o
 processing in strict FIFO order, (3) a real GOP with P-frames instead of all-intra, to
 cut per-frame cost further.
 
-## 5. Input path
+## 5. Input path — DONE
 
 uinput virtual tablet device on Linux, static test with synthetic events in Krita/GIMP.
+
+**Implementation:** `daemon/src/uinput_tablet.rs` (`UinputTablet`, reusable module for
+Milestone 6) using the `input-linux` crate rather than hand-rolled ioctls — its API is
+clean and well-typed, and `/dev/uinput` already had a working per-user ACL grant from
+earlier in the session, no root needed. Declares `BTN_TOOL_PEN`/`BTN_TOUCH`/
+`BTN_STYLUS` and `ABS_X`/`ABS_Y`/`ABS_PRESSURE`/`ABS_TILT_X`/`ABS_TILT_Y`. Key/button
+events are edge-triggered (only sent on an actual state change, matching real
+hardware) rather than resent every frame. Test harness: `daemon/src/bin/uinput_test`,
+a separate throwaway binary that creates the device and injects a synthetic diagonal
+stroke with pressure ramping 0→max→0, GIMP open with the Paintbrush tool and
+pressure-sensitive dynamics enabled.
+
+**Debugging journey — device was invisible on screen despite being 100% correct at
+the kernel level.** First attempts: cursor never appeared to move, no stroke drawn in
+GIMP, in either native-Wayland GIMP or GIMP forced through XWayland (same underlying
+Wayland session either way, so not a true independent test — user firmly ruled out
+switching to a full X11 session again, given it broke before too, so this was worked
+through entirely on Wayland).
+
+Root-caused methodically:
+1. `udevadm info` confirmed `ID_INPUT_TABLET=1` — udev classification was never the
+   problem.
+2. `evtest` (needed `/dev/input/eventN` access — fixed by adding the user to the
+   `input` group via `usermod -aG input`, then using `sg input -c '...'` to run
+   commands with that group active without a full re-login; far less friction than
+   repeated `pkexec` prompts) confirmed, at the raw kernel level, that our events were
+   flawless: smooth `ABS_X`/`ABS_Y`/`ABS_PRESSURE`/`ABS_TILT_X` changes, correct
+   `SYN_REPORT` framing, correct `BTN_TOUCH` 1→0 transition at stroke end. The kernel
+   and evdev layer saw exactly what they should — ruling out our event-emission code
+   as the cause.
+3. Web research: even Weylus (this project's own cited precedent) documents Wayland
+   input support as "experimental" with acknowledged gaps; GfxTablet needed a
+   dedicated "Wayland-compatible fork". Confirms this is a known rough edge in the
+   ecosystem generally, not something obviously wrong in our approach.
+4. Found the actual fix by comparing against `LinusCDE/rmTabletDriver` (a real,
+   community-tested uinput tablet driver for the reMarkable): it explicitly sets a
+   non-zero `resolution` field (units/mm) on `ABS_X`/`ABS_Y`, while our code had
+   `resolution: 0` ("no calibration data") on every axis. Changed `ABS_X`/`ABS_Y`
+   resolution to `100` (arbitrary but plausible units/mm, matching that reference) —
+   **this fixed it immediately.** Likely explanation: libinput needs real resolution
+   data to compute a valid tablet-to-screen coordinate mapping; without it, the
+   device was correctly classified as a tablet but effectively unmappable, so no
+   visible pointer motion was ever produced despite perfect kernel-level events.
+
+**Confirmed working end to end:** cursor moves, `BTN_TOUCH` registers as a genuine
+click/drag system-wide (first observed indirectly — a full corner-to-corner stroke
+grabbed and dragged whatever window was frontmost), and a stroke deliberately
+centered on a smaller coordinate range (40%-60% of the full range, landing inside
+GIMP's canvas instead of sweeping through surrounding panels) produced a real,
+visibly pressure-tapered brush stroke in GIMP — thin → thick → thin, confirmed
+directly by the user. Milestone 5's exit criterion is met.
 
 ## 6. End-to-end input
 
