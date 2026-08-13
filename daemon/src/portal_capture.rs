@@ -98,6 +98,18 @@ pub fn run_capture(
             .unwrap_or_else(|e| panic!("failed to connect to 127.0.0.1:{port}: {e}"));
         s.set_nodelay(true).ok();
         eprintln!("[transport] connected");
+
+        // Input (S Pen -> daemon) flows the opposite direction on this same
+        // socket from video (daemon -> S Pen), so a cloned handle with its
+        // own read loop on a separate thread doesn't interfere with the
+        // video-writing half used by the capture callback below.
+        match s.try_clone() {
+            Ok(input_stream) => {
+                std::thread::spawn(move || crate::input_receiver::run(input_stream));
+            }
+            Err(e) => eprintln!("[input] failed to clone transport socket: {e}"),
+        }
+
         s
     });
     let stats = Rc::new(RefCell::new(CaptureStats::default()));

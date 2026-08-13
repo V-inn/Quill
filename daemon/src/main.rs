@@ -1,7 +1,9 @@
 mod color_convert;
 mod ffi;
 mod h264_headers;
+mod input_receiver;
 mod portal_capture;
+mod uinput_tablet;
 mod vaapi_encoder;
 
 use std::sync::atomic::{AtomicBool, Ordering};

@@ -5,22 +5,42 @@ import android.media.MediaCodec
 import android.media.MediaFormat
 import android.os.Bundle
 import android.util.Log
+import android.view.InputDevice
+import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import java.io.BufferedInputStream
+import java.io.BufferedOutputStream
 import java.io.DataInputStream
+import java.io.DataOutputStream
 import java.net.ServerSocket
 import java.net.Socket
+import java.util.concurrent.LinkedBlockingQueue
+import kotlin.math.cos
+import kotlin.math.roundToInt
+import kotlin.math.sin
+
+/** One pen/touch sample, queued from the UI thread and written to the
+ * socket on a dedicated background thread -- touch/hover callbacks run on
+ * the UI thread, and Android forbids network I/O there
+ * (NetworkOnMainThreadException). */
+private data class PenEvent(
+    val type: Int,
+    val x: Int,
+    val y: Int,
+    val pressure: Int,
+    val tiltX: Int,
+    val tiltY: Int,
+    val buttons: Int,
+)
 
 /**
- * Milestone 3 throwaway test app: listens on a TCP port (reached via
- * `adb forward tcp:PORT tcp:PORT`, matching the design doc's transport
- * direction -- this app listens, the host daemon connects out), reads
- * length-prefixed H.264 frames, and feeds them straight into MediaCodec.
- *
- * Hardcoded 1920x1080 and a fixed port are intentional for this throwaway
- * scope -- the real capability handshake (no hardcoded resolution anywhere)
- * is Milestone 4+ work, not this transport-validation step.
+ * Milestone 6: real S Pen `MotionEvent` capture -> protocol -> uinput,
+ * layered onto the Milestone 3 decode test app. Listens on a TCP port
+ * (reached via `adb forward tcp:PORT tcp:PORT`), reads length-prefixed
+ * H.264 frames on the read side (video, daemon -> device), and writes a
+ * capability handshake + a stream of input event records on the write
+ * side (S Pen -> daemon) -- independent directions of the same socket.
  */
 class MainActivity : Activity(), SurfaceHolder.Callback {
     private val tag = "QuillDecodeTest"
@@ -29,6 +49,11 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private val height = 1080
 
     private var decodeThread: Thread? = null
+    private var inputWriterThread: Thread? = null
+    private val eventQueue = LinkedBlockingQueue<PenEvent>()
+
+    @Volatile
+    private var output: DataOutputStream? = null
 
     @Volatile
     private var running = true
@@ -38,6 +63,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         val surfaceView = SurfaceView(this)
         setContentView(surfaceView)
         surfaceView.holder.addCallback(this)
+        surfaceView.setOnTouchListener { _, event -> handleMotionEvent(event, down = true) }
+        surfaceView.setOnHoverListener { _, event -> handleMotionEvent(event, down = false) }
     }
 
     override fun surfaceCreated(holder: SurfaceHolder) {
@@ -56,6 +83,105 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         running = false
     }
 
+    /**
+     * Converts Android's single tilt-from-vertical angle + orientation into
+     * Wacom-style perpendicular tilt_x/tilt_y (degrees), matching what the
+     * daemon's uinput ABS_TILT_X/Y axes expect.
+     */
+    private fun tiltXY(event: MotionEvent): Pair<Int, Int> {
+        val tilt = event.getAxisValue(MotionEvent.AXIS_TILT) // radians from vertical
+        val orientation = event.orientation // radians
+        val tiltDeg = Math.toDegrees(tilt.toDouble())
+        val tiltX = (tiltDeg * sin(orientation.toDouble())).roundToInt()
+        val tiltY = (tiltDeg * cos(orientation.toDouble())).roundToInt()
+        return tiltX to tiltY
+    }
+
+    private fun handleMotionEvent(event: MotionEvent, down: Boolean): Boolean {
+        if (output == null) return false
+        val (tiltX, tiltY) = tiltXY(event)
+        val pressureRaw = (event.pressure * pressureMax).roundToInt()
+
+        val type: Int = when (event.action) {
+            MotionEvent.ACTION_HOVER_ENTER -> EV_HOVER_ENTER
+            MotionEvent.ACTION_HOVER_MOVE -> EV_HOVER_MOVE
+            MotionEvent.ACTION_HOVER_EXIT -> EV_HOVER_EXIT
+            MotionEvent.ACTION_DOWN -> EV_DOWN
+            MotionEvent.ACTION_MOVE -> EV_MOVE
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> EV_UP
+            else -> return down // unhandled action, let the view keep default handling
+        }
+
+        val buttons = if (event.buttonState and MotionEvent.BUTTON_STYLUS_PRIMARY != 0) 1 else 0
+
+        // Cheap, non-blocking enqueue on the UI thread; the actual socket
+        // write happens on inputWriterThread.
+        eventQueue.offer(
+            PenEvent(type, event.x.roundToInt(), event.y.roundToInt(), pressureRaw, tiltX, tiltY, buttons)
+        )
+        return true
+    }
+
+    /** Drains eventQueue on a dedicated thread, blocking-writes each event to
+     * the socket -- the actual I/O that used to run (illegally) on the UI
+     * thread inside handleMotionEvent. */
+    private fun runInputWriterLoop(out: DataOutputStream) {
+        while (running) {
+            val ev = try {
+                eventQueue.take()
+            } catch (e: InterruptedException) {
+                break
+            }
+            try {
+                out.writeByte(ev.type)
+                out.writeInt(ev.x)
+                out.writeInt(ev.y)
+                out.writeInt(ev.pressure)
+                out.writeInt(ev.tiltX)
+                out.writeInt(ev.tiltY)
+                out.writeByte(ev.buttons)
+                out.flush()
+            } catch (e: Exception) {
+                Log.w(tag, "input writer stopping, socket write failed", e)
+                break
+            }
+        }
+    }
+
+    @Volatile
+    private var pressureMax = 4095 // overwritten from the real stylus MotionRange once known
+
+    private fun sendHandshake(out: DataOutputStream) {
+        // Real Display metrics + InputDevice.getMotionRange() -- the design
+        // doc's capability handshake, not hardcoded per-device constants.
+        val metrics = resources.displayMetrics
+        val stylusDevice = InputDevice.getDeviceIds()
+            .map { InputDevice.getDevice(it) }
+            .firstOrNull { d -> d != null && d.sources and InputDevice.SOURCE_STYLUS == InputDevice.SOURCE_STYLUS }
+
+        val pressureRange = stylusDevice?.getMotionRange(MotionEvent.AXIS_PRESSURE)
+        val tiltRange = stylusDevice?.getMotionRange(MotionEvent.AXIS_TILT)
+
+        val pMin = 0
+        val pMax = ((pressureRange?.max ?: 1.0f) * 4095).roundToInt().coerceAtLeast(1)
+        pressureMax = pMax
+        val tMaxDeg = Math.toDegrees((tiltRange?.max ?: (Math.PI / 4)).toDouble()).roundToInt()
+
+        Log.i(
+            tag,
+            "handshake: ${metrics.widthPixels}x${metrics.heightPixels}px, " +
+                "pressure $pMin..$pMax, tilt -$tMaxDeg..$tMaxDeg (stylus device: ${stylusDevice?.name})"
+        )
+
+        out.writeInt(metrics.widthPixels)
+        out.writeInt(metrics.heightPixels)
+        out.writeInt(pMin)
+        out.writeInt(pMax)
+        out.writeInt(-tMaxDeg)
+        out.writeInt(tMaxDeg)
+        out.flush()
+    }
+
     private fun runDecodeLoop(holder: SurfaceHolder) {
         Log.i(tag, "Listening on port $port, waiting for daemon (adb forward)...")
         var codec: MediaCodec? = null
@@ -65,6 +191,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 val socket: Socket = server.accept()
                 Log.i(tag, "daemon connected from ${socket.remoteSocketAddress}")
                 val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
+                val out = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
+                output = out
+                sendHandshake(out)
+                inputWriterThread = Thread { runInputWriterLoop(out) }.also { it.start() }
 
                 val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height)
                 // Back to the device's default (hardware) decoder now that the
@@ -145,7 +275,18 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         } finally {
             codec?.stop()
             codec?.release()
+            output = null
+            inputWriterThread?.interrupt()
             Log.i(tag, "decode loop stopped")
         }
+    }
+
+    companion object {
+        private const val EV_HOVER_ENTER = 0
+        private const val EV_HOVER_MOVE = 1
+        private const val EV_HOVER_EXIT = 2
+        private const val EV_DOWN = 3
+        private const val EV_MOVE = 4
+        private const val EV_UP = 5
     }
 }

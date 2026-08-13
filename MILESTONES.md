@@ -386,9 +386,64 @@ GIMP's canvas instead of sweeping through surrounding panels) produced a real,
 visibly pressure-tapered brush stroke in GIMP — thin → thick → thin, confirmed
 directly by the user. Milestone 5's exit criterion is met.
 
-## 6. End-to-end input
+## 6. End-to-end input — DONE
 
 Wire Android `MotionEvent` capture → protocol → uinput injection end to end.
+
+**Implementation.** Android side: `MainActivity.kt` registers `setOnTouchListener` (finger/
+pen contact) and `setOnHoverListener` (S Pen hover, proximity without contact) on the
+`SurfaceView`. `tiltXY()` converts Android's single tilt-from-vertical `AXIS_TILT` +
+`orientation` into Wacom-style perpendicular `tiltX`/`tiltY` via trig, matching the
+daemon's `ABS_TILT_X`/`ABS_TILT_Y` axes. `sendHandshake()` sends the real capability
+handshake before any input records — actual `Display` metrics and the stylus device's
+`InputDevice.getMotionRange()` for pressure and tilt, not per-device constants, per the
+design doc's hard constraint. Daemon side: `input_receiver.rs` runs on its own thread,
+reading a cloned half of the same TCP socket video is written on (input flows
+Android→daemon, video flows daemon→Android, independent directions of one connection —
+no separate port). It reads the handshake once, creates the `uinput` tablet from the
+*real* reported ranges (`TabletRanges`, reusing Milestone 5's `UinputTablet`), then loops
+injecting events via `tablet.emit()`.
+
+**Bug hit and fixed: `android.os.NetworkOnMainThreadException`.** First live test failed
+silently (`"failed to send input event: null"` — an unhelpfully stripped log call).
+Fixed the logging to print the full exception (`Log.w(tag, "...", e)`), rebuilt, and got
+the real exception: touch/hover listener callbacks run on Android's UI thread, and
+writing directly to the socket from inside them (as the first version did) violates
+Android's ban on network I/O on the main thread. **Fix:** `handleMotionEvent` now only
+does a cheap, non-blocking `eventQueue.offer(PenEvent(...))` (a `LinkedBlockingQueue`); a
+dedicated `inputWriterThread` blocks on `eventQueue.take()` and performs the actual
+`DataOutputStream` writes. Thread is started right after the handshake is sent and
+interrupted in the decode loop's `finally` block on teardown.
+
+**Bug hit and fixed: tablet took over the main screen depending on where the desktop
+cursor started.** Live-tested end to end (daemon log showed real events — hover, moves,
+pressure varying 1044–2319 — reaching uinput), but drawing on the tablet sometimes
+dragged the cursor around the *laptop's built-in screen* instead of the virtual monitor.
+Root cause: `libinput list-devices` showed the virtual tablet with an unrestricted
+`Calibration: identity matrix` / `Area rectangle: (0,0)-(1,1)` — i.e. its normalized
+0..1 input range was mapped across KWin's *entire combined desktop geometry*
+(`kscreen-doctor -o` confirmed two outputs side by side: `eDP-1` at `0,0 1536x864` and
+`Virtual-QuillTest` at `1536,0 1920x1080`), not just the virtual monitor. **Fix:** KDE's
+own `kcm_tablet` panel (System Settings → Graphics Tablet) lists the device (it shows up
+there because `input_linux`'s uinput device declares itself as a proper tablet — pressure,
+tilt, `BTN_TOOL_PEN`) and offers a per-device screen-mapping dropdown; setting it to
+`Virtual-QuillTest` and applying fixed it immediately, confirmed live by starting the
+desktop cursor on the main screen and drawing — stroke landed correctly on the virtual
+monitor regardless. No code change needed. Because the uinput device uses a fixed,
+hardcoded `InputId` (`bustype: BUS_VIRTUAL, vendor: 0x1209, product: 0x0001` — see
+`uinput_tablet.rs`), this mapping is a **one-time setting that persists across daemon
+restarts** on a given machine (KDE keys it by device identity), not a per-session
+workaround. Should be noted in setup docs as a one-time step on a new machine.
+
+**Confirmed working end to end:** real device metrics in the handshake
+(`2560x1498 px, pressure 0..4095, tilt -90..90 deg`, matching the actual Tab S9 FE+ — no
+hardcoding), real varying pressure values reaching the daemon, and a real S Pen stroke
+drawn on the tablet appearing correctly in GIMP on the virtual monitor.
+
+**Known gap, not blocking:** S Pen side button (`BTN_STYLUS`) is not wired up.
+`input_receiver.rs` defines `EV_BUTTON_DOWN`/`EV_BUTTON_UP` (protocol event types 6/7)
+but the receive loop doesn't act on them yet — declared as dead code, flagged as a
+follow-up rather than part of this milestone's exit criteria.
 
 ## 7. Tuning pass
 

@@ -1,0 +1,173 @@
+//! Receives real S Pen input from the Android client and injects it into
+//! the virtual uinput tablet (`uinput_tablet.rs`). Runs on its own thread,
+//! reading from a cloned half of the same TCP socket video is sent on --
+//! independent read/write directions of one connection, no separate port.
+//!
+//! Wire format (all big-endian, Android -> daemon):
+//!
+//! Handshake (24 bytes, sent once, before any input records) -- this is
+//! the capability handshake from the design doc: Android reports its real
+//! `Display` metrics and `InputDevice.getMotionRange()` so nothing is
+//! hardcoded here.
+//!   u32 screen_width_px
+//!   u32 screen_height_px
+//!   i32 pressure_min
+//!   i32 pressure_max
+//!   i32 tilt_min_deg
+//!   i32 tilt_max_deg
+//!
+//! Input event record (22 bytes, repeated):
+//!   u8  event_type   (0=hover_enter 1=hover_move 2=hover_exit 3=down 4=move 5=up 6=button_down 7=button_up)
+//!   i32 x_px
+//!   i32 y_px
+//!   i32 pressure
+//!   i32 tilt_x_deg
+//!   i32 tilt_y_deg
+//!   u8  buttons      (bit0 = stylus primary button)
+
+use crate::uinput_tablet::{TabletRanges, UinputTablet};
+use std::io::{self, Read};
+use std::net::TcpStream;
+
+fn read_u32(r: &mut impl Read) -> io::Result<u32> {
+    let mut b = [0u8; 4];
+    r.read_exact(&mut b)?;
+    Ok(u32::from_be_bytes(b))
+}
+
+fn read_i32(r: &mut impl Read) -> io::Result<i32> {
+    Ok(read_u32(r)? as i32)
+}
+
+fn read_u8(r: &mut impl Read) -> io::Result<u8> {
+    let mut b = [0u8; 1];
+    r.read_exact(&mut b)?;
+    Ok(b[0])
+}
+
+struct Handshake {
+    width: u32,
+    height: u32,
+    pressure_min: i32,
+    pressure_max: i32,
+    tilt_min: i32,
+    tilt_max: i32,
+}
+
+fn read_handshake(r: &mut impl Read) -> io::Result<Handshake> {
+    Ok(Handshake {
+        width: read_u32(r)?,
+        height: read_u32(r)?,
+        pressure_min: read_i32(r)?,
+        pressure_max: read_i32(r)?,
+        tilt_min: read_i32(r)?,
+        tilt_max: read_i32(r)?,
+    })
+}
+
+const EV_HOVER_ENTER: u8 = 0;
+const EV_HOVER_MOVE: u8 = 1;
+const EV_HOVER_EXIT: u8 = 2;
+const EV_DOWN: u8 = 3;
+const EV_MOVE: u8 = 4;
+const EV_UP: u8 = 5;
+const EV_BUTTON_DOWN: u8 = 6;
+const EV_BUTTON_UP: u8 = 7;
+
+/// Blocks reading the handshake, creates the uinput tablet from the real
+/// reported ranges, then loops injecting input events until the stream
+/// closes. Meant to run on its own thread.
+pub fn run(mut stream: TcpStream) {
+    let handshake = match read_handshake(&mut stream) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("[input] failed to read capability handshake: {e}");
+            return;
+        }
+    };
+    eprintln!(
+        "[input] handshake: {}x{} px, pressure {}..{}, tilt {}..{} deg",
+        handshake.width,
+        handshake.height,
+        handshake.pressure_min,
+        handshake.pressure_max,
+        handshake.tilt_min,
+        handshake.tilt_max
+    );
+
+    let ranges = TabletRanges {
+        width: handshake.width as i32,
+        height: handshake.height as i32,
+        pressure_max: handshake.pressure_max,
+        tilt_min: handshake.tilt_min,
+        tilt_max: handshake.tilt_max,
+    };
+    let tablet = match UinputTablet::create(&ranges) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("[input] failed to create uinput tablet: {e}");
+            return;
+        }
+    };
+    eprintln!("[input] virtual tablet ready, waiting for S Pen input...");
+
+    let mut event_count = 0u64;
+    loop {
+        let event_type = match read_u8(&mut stream) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[input] stream ended: {e}");
+                break;
+            }
+        };
+        let x = match read_i32(&mut stream) {
+            Ok(v) => v,
+            Err(_) => break,
+        };
+        let y = match read_i32(&mut stream) {
+            Ok(v) => v,
+            Err(_) => break,
+        };
+        let pressure = match read_i32(&mut stream) {
+            Ok(v) => v,
+            Err(_) => break,
+        };
+        let tilt_x = match read_i32(&mut stream) {
+            Ok(v) => v,
+            Err(_) => break,
+        };
+        let tilt_y = match read_i32(&mut stream) {
+            Ok(v) => v,
+            Err(_) => break,
+        };
+        let _buttons = match read_u8(&mut stream) {
+            Ok(v) => v,
+            Err(_) => break,
+        };
+
+        let in_contact = matches!(event_type, EV_DOWN | EV_MOVE);
+        // Button events carry no fresh position; re-emit the last known
+        // pose is out of scope for v0 -- just forward position/pressure/
+        // tilt as given, contact state derived from the event type.
+        if matches!(
+            event_type,
+            EV_HOVER_ENTER | EV_HOVER_MOVE | EV_HOVER_EXIT | EV_DOWN | EV_MOVE | EV_UP
+        ) {
+            if let Err(e) = tablet.emit(x, y, pressure.max(0), tilt_x, tilt_y, in_contact) {
+                eprintln!("[input] emit failed: {e}");
+            }
+        }
+        // EV_BUTTON_DOWN/UP (S Pen side button) handling is a real gap for
+        // v0: BTN_STYLUS is declared on the device but this loop doesn't
+        // toggle it yet. Noted as follow-up, not blocking the core
+        // pen-tracking path.
+
+        event_count += 1;
+        if event_count == 1 || event_count % 100 == 0 {
+            eprintln!(
+                "[input] event {event_count}: type={event_type} x={x} y={y} pressure={pressure}"
+            );
+        }
+    }
+    eprintln!("[input] receiver thread exiting after {event_count} events");
+}
