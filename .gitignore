@@ -5,6 +5,10 @@ daemon/target/
 experiments/**/*.o
 experiments/evdi-bringup/evdi_test_client
 
+# vendored evdi source clone (used to build a newer module for testing) --
+# third-party GPL/LGPL source, not ours to track, keep it out of the repo
+experiments/evdi-bringup/vendor/evdi/
+
 # Android
 *.apk
 android-client/.gradle/

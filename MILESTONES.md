@@ -114,8 +114,28 @@ frames can be read from userspace.
   specifically for "Intel Core Ultra 7". Our GPU is Intel Iris Xe (TigerLake) and our
   symptom is literally a black screen — this is very likely the actual fix, already
   upstream, just not in Debian's packaged `evdi-dkms` (5+ releases behind). Not a KWin
-  config problem after all. Next step (not yet attempted): build evdi from source at a
-  current tag, replacing the apt-installed DKMS module, and retry.
+  config problem after all.
+- **2026-08-13, built evdi v1.14.16 from source, replaced the apt-installed 1.14.8
+  DKMS module and matching `libevdi` (source: `experiments/evdi-bringup/vendor/evdi`,
+  scripts: `vendor/upgrade-evdi.sh` and `vendor/swap-evdi-watcher.sh` for the
+  module-swap-after-logout dance — old module's refcount never reliably hit 0 without
+  a full reboot). Confirmed running (`LibEvdi version (1.14.16)` / `Evdi version
+  (1.14.16)` in the test client's own log). Retried under Wayland: **same
+  `flip_done timed out` / `[CRTC:36:crtc-0] commit wait timed out` at ~10s
+  post-connect, identical to every prior attempt.** The v1.14.11 "black screens on
+  Intel Xe" fix addressed a different manifestation, not this one.
+- **Final verdict (four reproductions, four different mitigations, all identical
+  failure):** no env vars → hard freeze/reboot; `KWIN_DRM_NO_AMS=1` → same stall,
+  self-recovered; `+ KWIN_DRM_NO_DIRECT_SCANOUT=1` → same stall, needed manual kill;
+  evdi upgraded to 1.14.16 → same stall again. This is an unfixed upstream evdi bug in
+  its vblank/flip-completion simulation specifically under `kwin_wayland` real
+  compositing on this Intel Iris Xe (TigerLake) GPU — not a KWin config issue, not an
+  outdated-package issue, not a client-loop-speed issue. **Wayland is closed out as
+  not viable on this machine for this project.** X11 remains the working path (real
+  extended display achieved, self-recovers cleanly, `mode_changed`/negotiation both
+  confirmed correct). Filing an upstream evdi bug report is a reasonable future step
+  but out of scope for this project right now — daemon development proceeds targeting
+  Plasma X11.
 
 ## 2. Daemon v0
 
