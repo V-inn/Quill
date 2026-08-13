@@ -136,6 +136,37 @@ frames can be read from userspace.
   confirmed correct). Filing an upstream evdi bug report is a reasonable future step
   but out of scope for this project right now — daemon development proceeds targeting
   Plasma X11.
+- **2026-08-13, X11 verdict revised — evdi abandoned entirely.** The real Milestone 2
+  daemon (not the trivial test client) caused a **hard freeze requiring reboot under
+  X11 too** — first time X11 needed a reboot rather than self-recovering. Leading
+  theory: the daemon's per-frame work (BGRX→NV12 conversion + full VAAPI encode
+  setup/render/teardown) runs synchronously inside the evdi `update_ready_handler`,
+  competing with X11/KWin for the same physical GPU heavily enough to stall the KMS
+  commit path harder than the trivial C client ever did. No forensic data survived
+  (tmpfs wiped on reboot). Given evdi has now caused genuine freezes under *both*
+  session types, at the user's request we researched a Wayland-native alternative
+  instead of chasing this further.
+- **2026-08-13, `krfb-virtualmonitor` + portal/PipeWire capture — verified as the
+  path forward.** KWin has a native, compositor-level virtual-output mechanism
+  (`zkde-screencast-unstable-v1`, a KDE-internal Wayland protocol — no stable
+  cross-desktop equivalent exists; confirmed the standard
+  `org.freedesktop.portal.RemoteDesktop` has no virtual-monitor support at all) that
+  never touches DRM/KMS, so the atomic-commit stall class of bug structurally can't
+  happen. `krfb-virtualmonitor --resolution 1920x1080 --name QuillTest` created a
+  real KWin output (`Virtual-QuillTest`, enabled, connected, correct mode, positioned
+  beside the real panel) instantly, no crash. Verified it's genuinely capturable
+  through the *standard* portal too: a `spectacle -f` fullscreen screenshot captured
+  both the real panel and the virtual monitor's desktop content side by side. Clean
+  teardown on `pkill krfb-virtualmonitor` (output disappeared, no leftover state).
+  **Decision: pivot away from evdi entirely.** New architecture: `krfb-virtualmonitor`
+  (or a from-scratch minimal client of the same protocol, later) creates the virtual
+  output; capture moves from `evdi_grab_pixels()` to the standard `ScreenCast` portal
+  + PipeWire (mature Rust support via `ashpd` + `pipewire-rs`, same mechanism
+  OBS/Sunshine use). VAAPI encoder (`daemon/src/vaapi_encoder.rs`) and H.264 header
+  packing (`daemon/src/h264_headers.rs`) are unaffected and carry forward unchanged —
+  only the capture-source code (`daemon/src/evdi_capture.rs`) is being replaced.
+  `experiments/evdi-bringup/` and the `daemon/src/ffi.rs`/`build.rs` evdi bindings are
+  kept as-is for the historical record but are no longer part of the live daemon path.
 
 ## 2. Daemon v0
 
