@@ -18,6 +18,7 @@ use pw::{properties::properties, spa::pod::Pod};
 use std::cell::RefCell;
 use std::fs::File;
 use std::io::Write;
+use std::net::TcpStream;
 use std::os::fd::OwnedFd;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -62,10 +63,21 @@ struct CaptureData {
     y_plane: Vec<u8>,
     uv_plane: Vec<u8>,
     out_file: File,
+    transport: Option<TcpStream>,
     stats: Rc<RefCell<CaptureStats>>,
 }
 
-pub fn run_capture(node_id: u32, fd: OwnedFd, out_path: &str) -> Result<CaptureStats, pw::Error> {
+/// `transport_port`: if set, connects out to 127.0.0.1:<port> (meant to be
+/// reached via `adb forward tcp:<port> tcp:<port>`, matching the design
+/// doc's §3.3 "adb forward" direction -- the Android app listens, the host
+/// daemon connects as a client) and writes each frame there too, as a
+/// 4-byte big-endian length prefix followed by the frame bytes.
+pub fn run_capture(
+    node_id: u32,
+    fd: OwnedFd,
+    out_path: &str,
+    transport_port: Option<u16>,
+) -> Result<CaptureStats, pw::Error> {
     pw::init();
 
     let mainloop = pw::main_loop::MainLoopRc::new(None)?;
@@ -80,6 +92,14 @@ pub fn run_capture(node_id: u32, fd: OwnedFd, out_path: &str) -> Result<CaptureS
     crate::set_up_sigint_handler();
 
     let out_file = File::create(out_path).expect("create output file");
+    let transport = transport_port.map(|port| {
+        eprintln!("[transport] connecting to 127.0.0.1:{port} (via adb forward)...");
+        let s = TcpStream::connect(("127.0.0.1", port))
+            .unwrap_or_else(|e| panic!("failed to connect to 127.0.0.1:{port}: {e}"));
+        s.set_nodelay(true).ok();
+        eprintln!("[transport] connected");
+        s
+    });
     let stats = Rc::new(RefCell::new(CaptureStats::default()));
     let data = CaptureData {
         format: Default::default(),
@@ -87,6 +107,7 @@ pub fn run_capture(node_id: u32, fd: OwnedFd, out_path: &str) -> Result<CaptureS
         y_plane: Vec::new(),
         uv_plane: Vec::new(),
         out_file,
+        transport,
         stats: stats.clone(),
     };
 
@@ -194,6 +215,13 @@ pub fn run_capture(node_id: u32, fd: OwnedFd, out_path: &str) -> Result<CaptureS
                     }
                     drop(stats);
                     let _ = user_data.out_file.write_all(&encoded);
+                    if let Some(sock) = user_data.transport.as_mut() {
+                        let len = (encoded.len() as u32).to_be_bytes();
+                        if sock.write_all(&len).and_then(|_| sock.write_all(&encoded)).is_err() {
+                            eprintln!("[transport] write failed, dropping connection");
+                            user_data.transport = None;
+                        }
+                    }
                 }
                 Err(e) => eprintln!("[capture] encode_frame error: {e}"),
             }

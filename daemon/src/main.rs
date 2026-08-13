@@ -34,6 +34,10 @@ async fn main() {
     let out_path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "/tmp/daemon_capture.h264".to_string());
+    let transport_port: Option<u16> = std::env::args().nth(2).map(|s| {
+        s.parse()
+            .unwrap_or_else(|_| panic!("invalid port: {s}"))
+    });
 
     eprintln!("Opening portal ScreenCast session -- pick the virtual monitor in the dialog...");
     let (stream, fd) = portal_capture::open_portal()
@@ -46,7 +50,8 @@ async fn main() {
         stream.position()
     );
 
-    let stats = portal_capture::run_capture(node_id, fd, &out_path).expect("capture failed");
+    let stats = portal_capture::run_capture(node_id, fd, &out_path, transport_port)
+        .expect("capture failed");
 
     if stats.frame_count == 0 {
         println!("No frames captured.");

@@ -209,10 +209,60 @@ Capture → VAAPI encode → dump to a file, measure encode latency. Originally 
 session types — see findings above. Final: `ScreenCast` portal + PipeWire → VAAPI
 encode → file, 1200+ frames validated live, avg 40.85ms/frame.
 
-## 3. Transport
+## 3. Transport — DONE
 
 `adb forward` socket, stream encoded frames to a throwaway Android test app, confirm
 decode via `MediaCodec`.
+
+**Environment setup:** Debian's packaged Android SDK (API 28) and Gradle (4.4.1) are
+years too old for current Kotlin/AGP tooling. Installed `openjdk-21-jdk-headless` via
+apt; downloaded Google's official cmdline-tools and used `sdkmanager` to fetch
+`platform-tools` (37.0.1), `platforms;android-34`, `build-tools;34.0.0`, all under
+`~/Android/Sdk` (home partition — root only had 5.6GB free, home has 50GB). Downloaded
+the official Gradle 8.9 binary distribution (paired with AGP 8.5.2, a known-stable
+combo) to generate a proper wrapper — apt's Gradle 4.4.1 can't run modern AGP at all.
+
+**Daemon side:** `run_capture` now takes an optional `transport_port`; when set, it
+connects out to `127.0.0.1:<port>` (reached via `adb forward tcp:<port> tcp:<port>`,
+matching the design doc's transport direction — device listens, host connects) and
+writes each frame as a 4-byte big-endian length prefix + the frame bytes, alongside
+the existing file output.
+
+**Android side:** `experiments/android-decode-test/` — minimal Kotlin/Gradle app,
+`SurfaceView` + `MediaCodec`. Listens on a fixed port (throwaway-scope hardcoded
+1920x1080/port 7777 — the real capability handshake with no hardcoded resolution is
+Milestone 4+ work, not this transport-validation step), reads length-prefixed frames,
+feeds each directly to the decoder with `BUFFER_FLAG_KEY_FRAME` (matches our all-intra
+encoding). Built clean on the first real attempt.
+
+**Live end-to-end result:** `adb forward tcp:7777 tcp:7777`, daemon connects, streams
+to the Tab S9 FE+. 458 frames captured → encoded → transported → decoded → rendered
+in one continuous run, clean shutdown on both sides (`stream ended: null` on Android,
+full summary on the daemon), no crashes anywhere in the chain.
+
+**Found and diagnosed a real bug along the way:** using the default (hardware)
+decoder via `MediaCodec.createDecoderByType`, the tablet's screen rendered solid
+green instead of the actual desktop content — but `queued`/`rendered` counters
+confirmed the decoder *was* successfully decoding and rendering every frame; this
+was a color-interpretation bug, not a decode failure. Cross-checked by forcing the
+AOSP software decoder (`MediaCodec.createByCodecName("c2.android.avc.decoder")`):
+**colors rendered correctly**, isolating this to a hardware-decoder-specific quirk on
+this tablet's chip, not a bug in our encoding pipeline or app code (also independently
+corroborated: the exact same bytes, decoded via `ffmpeg`/libavcodec on the desktop
+earlier in Milestone 2, already looked correct). Our H.264 stream carries no VUI color
+metadata (`vui_parameters_present_flag=0`); Android's logged output format shows it
+guessing `color-standard=1` (BT.709) with no signal to go on either way. **Open item
+for Milestone 4:** figure out why the hardware decoder specifically mishandles this
+and fix it (likely needs explicit VUI color signaling in our hand-built SPS, or a
+different level/profile setting this chip's decoder is stricter about) — hardware
+decode is required for real latency numbers, software decode doesn't represent
+achievable performance.
+
+**Also expected, not a bug:** streaming felt laggy with visible motion
+duplication/ghosting when the mouse stopped moving. Consistent with known v0
+limitations stacked together — every frame is a full independent I-frame (~26-45KB
+each, no P-frame savings), software-decoded, over the full USB adb-tunnel path.
+Tuning (real GOP structure, buffer sizing) is explicitly Milestone 7's job.
 
 ## 4. Android client v0
 
