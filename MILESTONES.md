@@ -2,7 +2,7 @@
 
 Each milestone is validated (by the user) before starting the next.
 
-## 1. evdi bring-up — IN PROGRESS
+## 1. evdi bring-up — MOSTLY DONE (one item deferred to Milestone 2)
 
 Get evdi building and loaded as a DKMS module, create a virtual output, confirm it
 shows up as a real display in the desktop environment, and confirm raw framebuffer
