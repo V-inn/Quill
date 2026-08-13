@@ -56,15 +56,22 @@ static void mode_changed_handler(struct evdi_mode mode, void *user_data) {
 	evdi_request_update(g_handle, g_buffer_id);
 }
 
+static unsigned long g_update_count;
+
 static void update_ready_handler(int buffer_to_be_updated, void *user_data) {
 	(void)user_data;
 	int num_rects = g_buffer.rect_count;
 
 	evdi_grab_pixels(g_handle, g_buffer.rects, &num_rects);
-	printf("[update_ready] buffer=%d dirty_rects=%d\n", buffer_to_be_updated,
-	       num_rects);
-
+	/* Re-request immediately, before any logging I/O, so we don't add our
+	 * own latency to the next flip. */
 	evdi_request_update(g_handle, g_buffer_id);
+
+	g_update_count++;
+	if (g_update_count == 1 || g_update_count % 60 == 0) {
+		printf("[update_ready] buffer=%d dirty_rects=%d total_updates=%lu\n",
+		       buffer_to_be_updated, num_rects, g_update_count);
+	}
 }
 
 static void dpms_handler(int dpms_mode, void *user_data) {
