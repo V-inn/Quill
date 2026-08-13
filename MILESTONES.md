@@ -21,7 +21,9 @@ frames can be read from userspace.
       single-threaded test client (see finding below). Real daemon needs a proper
       continuous servicing loop; deferred to Milestone 2 rather than retried here with
       more live-freeze risk.
-- [ ] `adb devices -l` shows the tablet in `device` (authorized) state over USB
+- [x] `adb devices -l` shows the tablet in `device` (authorized) state over USB —
+      confirmed: `RX2Y200XQ3R device usb:3-4 product:gts9fepwifixx model:SM_X610`
+      (Galaxy Tab S9 FE+ Wi-Fi). `adb forward tcp:9873 tcp:9873` also confirmed working.
 - [x] Findings recorded below: session type, KWin quirks/crashes seen, exact
       evdi/kernel/adb versions
 
