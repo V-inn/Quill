@@ -93,6 +93,30 @@ frames can be read from userspace.
   further live evdi work on this machine; Wayland is parked, not pursued further** —
   chasing the KWin-internals root cause is out of scope for this project.
 
+- **2026-08-13, `KWIN_DRM_NO_AMS=1` retry:** created
+  `~/.config/plasma-workspace/env/evdi-legacy-kms.sh` forcing legacy (non-atomic) KMS
+  in KWin. Stall recurred anyway (`flip_done timed out` at t≈9290s, ~10s after
+  connect) — self-recovered without reboot this time, screen came back on its own.
+  Revised theory: this env var changes which ioctl *KWin* uses, but the timeout comes
+  from *inside* evdi.ko's own vblank-completion simulation, which still uses atomic
+  helpers internally regardless — wrong lever. Positive side finding: our own client's
+  log finally showed `mode_changed` firing correctly (1920x1080@60), confirming
+  negotiation itself is solid.
+- **2026-08-13, `KWIN_DRM_NO_DIRECT_SCANOUT=1` added:** same stall recurred a third
+  time, same ~10s-after-connect pattern, this time needing a manual `pkill` (no
+  self-recovery, no reboot). Three-for-three: neither KWin env var lever fixes it.
+- **2026-08-13, root cause reframed via evdi's own changelog:** checked
+  `github.com/DisplayLink/evdi` releases between our installed 1.14.8 (Debian package,
+  Dec 2024) and current (1.15.0, Jul 2026). Directly relevant fixes we don't have:
+  **v1.14.11 — "Fix for black screens on Intel Xe" / "Fix for corruptions on Intel
+  Xe"**; v1.14.12 — "Fix artifacts on Intel Meteor Lake and newer... integrated
+  graphics" / "Fix 'Failed to map scanout buffer' error"; v1.14.13 — same scanout fix
+  specifically for "Intel Core Ultra 7". Our GPU is Intel Iris Xe (TigerLake) and our
+  symptom is literally a black screen — this is very likely the actual fix, already
+  upstream, just not in Debian's packaged `evdi-dkms` (5+ releases behind). Not a KWin
+  config problem after all. Next step (not yet attempted): build evdi from source at a
+  current tag, replacing the apt-installed DKMS module, and retry.
+
 ## 2. Daemon v0
 
 evdi → VAAPI encode → dump to a file, measure encode latency.
