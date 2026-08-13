@@ -18,7 +18,22 @@ frames can be read from userspace.
 - [ ] Findings recorded below: session type, KWin quirks/crashes seen, exact
       evdi/kernel/adb versions
 
-**Findings:** _(fill in after running)_
+**Findings:**
+
+- **2026-08-13, KWin/Wayland session (Plasma 6.3.6, kwin_wayland 6.3.6):** loading
+  `evdi` (`initial_device_count=1`) and connecting via `evdi_test_client` worked fine —
+  `card1` appeared, KWin opened it, `mode_changed` looked to be about to fire. Shortly
+  after connect, the screen went black and the machine was fully unresponsive for
+  ~20s; had to hard power-cycle (confirmed via `journalctl --list-boots`: previous boot
+  ended abruptly with no clean shutdown, immediately followed by a new boot). Kernel
+  log from the crashed boot wasn't captured (no elevated journalctl access at the
+  time) — root cause unconfirmed, but this matches the exact risk flagged in
+  `linux-tablet-display-design.md` §7 (KWin+evdi Wayland compatibility is unresolved
+  upstream). **Do not run evdi test clients under the Wayland session again without a
+  recovery escape hatch in place** (SysRq, a free VT, or SSH-from-another-device) and
+  all other work saved/closed first.
+- Next attempt should target the `plasmax11.desktop` (Plasma X11) SDDM session per the
+  plan's fallback path, with the above precautions.
 
 ## 2. Daemon v0
 
