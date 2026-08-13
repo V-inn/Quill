@@ -73,13 +73,25 @@ frames can be read from userspace.
   path — consistent with design doc §7's flagged KWin/Wayland fragility).
   Corroborating evidence: the *first* X11 attempt (dialog closed, KWin never issued a
   modeset) had zero freeze. The *second* attempt (`xrandr --auto`, real composited
-  frames flowing) is exactly when it hung. Working theory: `evdi_test_client`'s
-  event loop (single-threaded `poll()`, 1s timeout) isn't servicing
-  `evdi_request_update()`/`evdi_grab_pixels()` fast enough to keep up with KWin's
-  ~60Hz pageflip pacing — a throwaway-test-client limitation, not an evdi/hardware
-  incompatibility. The real Milestone 2 daemon has an actual continuous capture/encode
-  loop and should not hit this. **Still keep the SSH escape hatch ready for any future
-  live evdi test** until the real daemon's loop is proven to keep up.
+  frames flowing) is exactly when it hung.
+- **2026-08-13, tightened client + Wayland retry:** rewrote `update_ready_handler` to
+  call `evdi_request_update()` immediately after `grab_pixels`, before any logging, and
+  throttled prints to ~1/sec (was: log every frame, request-update last). Rebuilt,
+  retried under `kwin_wayland` with the SSH escape hatch confirmed live first. **Same
+  `flip_done timed out` stall recurred anyway** — this rules out "test client too slow
+  to service updates" as the (sole) cause, at least under Wayland. This time, VT-switch
+  (Ctrl+Alt+F3, which didn't respond on the first Wayland incident but did this time)
+  successfully recovered the session with **no reboot needed** — `kwin_wayland` kept
+  the same PID throughout, never crashed. dmesg showed the same three-strikes pattern
+  (`CRTC`/`CONNECTOR`/`PLANE` commit-wait timeouts, ~10s apart) before the client
+  disconnected.
+- **Final verdict for this machine:** the evdi + KWin/Wayland atomic-commit stall is a
+  genuine compositor-level gap (matches design doc §7's flagged risk), not something
+  fixed by a faster userspace client. X11 is the only session where this daemon/evdi
+  combination self-recovers cleanly and has successfully driven a real extended
+  display (3840x1080, `DVI-I-1-1` active). **Decision: target Plasma X11 for all
+  further live evdi work on this machine; Wayland is parked, not pursued further** —
+  chasing the KWin-internals root cause is out of scope for this project.
 
 ## 2. Daemon v0
 
