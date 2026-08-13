@@ -167,10 +167,38 @@ frames can be read from userspace.
   only the capture-source code (`daemon/src/evdi_capture.rs`) is being replaced.
   `experiments/evdi-bringup/` and the `daemon/src/ffi.rs`/`build.rs` evdi bindings are
   kept as-is for the historical record but are no longer part of the live daemon path.
+- **2026-08-13, portal/PipeWire capture implemented and validated end-to-end —
+  Milestone 2 done.** New module `daemon/src/portal_capture.rs`: negotiates a
+  `ScreenCast` session via `ashpd` (`SourceType::Monitor`, `CursorMode::Embedded`),
+  triggers KDE's native screen-picker dialog, opens the PipeWire remote, and connects
+  a `pipewire` stream to the selected node requesting `BGRx` (matches evdi's old XR24
+  byte order exactly, so `color_convert::bgrx_to_nv12` needed zero changes). Required
+  bumping off Debian's packaged rustc 1.85 to a `rustup`-installed 1.97 (ashpd's zbus
+  dependency chain needs 1.87+) and installing `libpipewire-0.3-dev`.
+  **Live-tested against a real `krfb-virtualmonitor` output under Wayland: 1200+
+  frames captured, encoded, and written continuously with zero crashes and zero
+  freezes** — real live desktop content confirmed by decoding and viewing a frame
+  partway through the capture (showed an actual open browser window). No `pkexec`/root
+  needed anywhere in this path (unlike evdi) — portal access and VAAPI both work as
+  the normal user. Latency (dequeue-buffer → encoded-bytes-ready), sampled every 30th
+  frame over the run: avg 40.85ms, min 35.98ms, max 51.30ms. Isolated VAAPI encode
+  alone was ~3-5ms/frame (measured earlier in Milestone 2's first attempt) — the gap
+  is almost certainly the unoptimized scalar `bgrx_to_nv12` CPU conversion (a full
+  1920x1080 pixel loop, no SIMD). Known v0 optimization opportunity, correctly
+  deferred to Milestone 7 (tuning pass) rather than fixed now.
+  **Milestone 2 core goal (evdi → VAAPI encode → dump to file, measure latency) is
+  met**, on the new capture architecture. One rough edge noted, not blocking: the
+  daemon's SIGINT handler (`mainloop.quit()` via `pipewire`'s signal source) didn't
+  print the final summary before the process exited during this run — output file and
+  per-frame logging were unaffected, but worth a look before this becomes the
+  long-running daemon.
 
-## 2. Daemon v0
+## 2. Daemon v0 — DONE (capture architecture changed from evdi to portal/PipeWire)
 
-evdi → VAAPI encode → dump to a file, measure encode latency.
+Capture → VAAPI encode → dump to a file, measure encode latency. Originally scoped as
+"evdi → VAAPI encode"; evdi was dropped mid-milestone after causing freezes under both
+session types — see findings above. Final: `ScreenCast` portal + PipeWire → VAAPI
+encode → file, 1200+ frames validated live, avg 40.85ms/frame.
 
 ## 3. Transport
 
