@@ -187,11 +187,20 @@ frames can be read from userspace.
   1920x1080 pixel loop, no SIMD). Known v0 optimization opportunity, correctly
   deferred to Milestone 7 (tuning pass) rather than fixed now.
   **Milestone 2 core goal (evdi → VAAPI encode → dump to file, measure latency) is
-  met**, on the new capture architecture. One rough edge noted, not blocking: the
-  daemon's SIGINT handler (`mainloop.quit()` via `pipewire`'s signal source) didn't
-  print the final summary before the process exited during this run — output file and
-  per-frame logging were unaffected, but worth a look before this becomes the
-  long-running daemon.
+  met**, on the new capture architecture.
+- **2026-08-13, fixed: SIGINT summary not printing.** Root cause was pipewire's own
+  `Loop::add_signal_local` signal source: registered without error, but its callback
+  never actually fired — `SIGINT` hit the OS default disposition (immediate terminate)
+  every time, confirmed via `timeout --signal=INT` deterministically killing the
+  process before any post-registration diagnostic ever printed. Tried forcing a
+  single-threaded tokio runtime first (`flavor = "current_thread"`, on the theory that
+  a multi-threaded runtime could let the signal land on a worker thread that never
+  blocked it) — didn't fix it alone, so not the whole story. Replaced it with the
+  same plain `libc::signal` + atomic flag + manual `loop_.iterate()` polling pattern
+  already used successfully in the old evdi-based daemon (`daemon/src/main.rs`:
+  `set_up_sigint_handler`/`sigint_received`; `portal_capture::run_capture` polls it
+  every 100ms instead of blocking on `mainloop.run()`). Verified fixed: SIGINT now
+  stops the loop, stats compute correctly, and the full summary prints every time.
 
 ## 2. Daemon v0 — DONE (capture architecture changed from evdi to portal/PipeWire)
 

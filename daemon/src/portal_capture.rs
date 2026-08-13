@@ -72,14 +72,12 @@ pub fn run_capture(node_id: u32, fd: OwnedFd, out_path: &str) -> Result<CaptureS
     let context = pw::context::ContextRc::new(&mainloop, None)?;
     let core = context.connect_fd_rc(fd, None)?;
 
-    // Ctrl+C stops the pipewire mainloop directly (its own event loop, not
-    // the manual poll loop evdi_capture.rs used).
-    let mainloop_weak = mainloop.downgrade();
-    let _sig_source = mainloop.loop_().add_signal_local(pw::loop_::Signal::INT, move || {
-        if let Some(ml) = mainloop_weak.upgrade() {
-            ml.quit();
-        }
-    });
+    // pipewire's own add_signal_local mechanism turned out unreliable here
+    // (registered fine, callback never fired -- SIGINT killed the process
+    // via the OS default disposition regardless, even single-threaded).
+    // Falling back to the plain, proven pattern: libc::signal + atomic flag
+    // + manual loop iteration, same shape as the old evdi_capture.rs.
+    crate::set_up_sigint_handler();
 
     let out_file = File::create(out_path).expect("create output file");
     let stats = Rc::new(RefCell::new(CaptureStats::default()));
@@ -264,9 +262,14 @@ pub fn run_capture(node_id: u32, fd: OwnedFd, out_path: &str) -> Result<CaptureS
     )?;
 
     eprintln!("[pipewire] connected, running (Ctrl+C to stop)...");
-    mainloop.run();
+    let loop_ = mainloop.loop_();
+    while !crate::sigint_received() {
+        loop_.iterate(pw::loop_::Timeout::Finite(Duration::from_millis(100)));
+    }
+    eprintln!("[pipewire] SIGINT received, stopping...");
 
     let frame_count = stats.borrow().frame_count;
     let durations = stats.borrow().durations.clone();
+    eprintln!("[pipewire] stats computed: {frame_count} frames, returning...");
     Ok(CaptureStats { frame_count, durations })
 }
