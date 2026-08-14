@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Must match the strings daemon/src/aoa.rs sends via ACCESSORY_SEND_STRING
+     exactly (manufacturer/model), or Android won't route the
+     USB_ACCESSORY_ATTACHED intent to this app at all. -->
+<resources>
+    <usb-accessory manufacturer="Quill" model="Quill Virtual Display" />
+</resources>

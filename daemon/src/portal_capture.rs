@@ -16,11 +16,28 @@ use pw::spa;
 use pw::{properties::properties, spa::pod::Pod};
 use std::cell::RefCell;
 use std::fs::File;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::os::fd::OwnedFd;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
+
+/// Milestone 8: either transport implements plain `Read`/`Write` once
+/// connected, so the rest of this module (and `input_receiver.rs`) doesn't
+/// need to know or care which one is actually in use.
+pub type TransportReader = Box<dyn Read + Send>;
+pub type TransportWriter = Box<dyn Write + Send>;
+
+/// How to reach the Android client. `TcpForward` is the original adb-forward
+/// path (Milestones 3-7); `Aoa` talks directly over raw USB, bypassing adb
+/// entirely (Milestone 8) -- kept as a separate selectable mode rather than
+/// replacing the working adb-forward path outright, since AOA is new and
+/// unproven relative to it.
+pub enum TransportConfig {
+    None,
+    TcpForward(u16),
+    Aoa,
+}
 
 #[derive(Default, Clone)]
 pub struct CaptureStats {
@@ -92,20 +109,104 @@ struct CaptureData {
     format: spa::param::video::VideoInfoRaw,
     encoder: Option<VaapiEncoder>,
     out_file: File,
-    transport: Option<TcpStream>,
+    transport: Option<TransportWriter>,
     stats: Rc<RefCell<CaptureStats>>,
 }
 
-/// `transport_port`: if set, connects out to 127.0.0.1:<port> (meant to be
-/// reached via `adb forward tcp:<port> tcp:<port>`, matching the design
-/// doc's §3.3 "adb forward" direction -- the Android app listens, the host
-/// daemon connects as a client) and writes each frame there too, as a
-/// 4-byte big-endian length prefix followed by the frame bytes.
+/// Connects whichever transport `config` selects, spawns the input-receiver
+/// thread on the read half, runs the Milestone 7 clock-offset calibration
+/// exchange, and returns the write half for video frames -- identical
+/// downstream handling regardless of which transport actually carried the
+/// bytes.
+fn setup_transport(config: TransportConfig) -> Option<TransportWriter> {
+    // AOA needs a much longer clock-sync wait than TCP: adb-forward's
+    // ServerSocket::accept() already guarantees a connected, ready peer by
+    // the time we get here, but AOA's USB_ACCESSORY_ATTACHED flow involves
+    // Android routing an intent, showing a one-time permission dialog, and
+    // waiting on a human to tap "Allow" -- realistically tens of seconds,
+    // not milliseconds. Confirmed live: a 5s timeout here fired well before
+    // the user could react, and the daemon (wrongly, at the time) treated
+    // that as non-fatal and started streaming video anyway -- Android's
+    // eventual first read landed mid-frame instead of on the clock-sync
+    // reply that was never sent, corrupting both sides' framing.
+    let clock_sync_timeout = match config {
+        TransportConfig::Aoa => Duration::from_secs(120),
+        _ => Duration::from_secs(5),
+    };
+
+    let (reader, mut writer): (TransportReader, TransportWriter) = match config {
+        TransportConfig::None => return None,
+        TransportConfig::TcpForward(port) => {
+            eprintln!("[transport] connecting to 127.0.0.1:{port} (via adb forward)...");
+            let s = TcpStream::connect(("127.0.0.1", port))
+                .unwrap_or_else(|e| panic!("failed to connect to 127.0.0.1:{port}: {e}"));
+            s.set_nodelay(true).ok();
+            eprintln!("[transport] connected");
+            let r = s
+                .try_clone()
+                .unwrap_or_else(|e| panic!("failed to clone transport socket: {e}"));
+            (Box::new(r), Box::new(s))
+        }
+        TransportConfig::Aoa => {
+            eprintln!("[transport] connecting via AOA (USB accessory mode, bypassing adb)...");
+            let t = crate::aoa::connect().unwrap_or_else(|e| panic!("AOA connect failed: {e}"));
+            eprintln!("[transport] AOA connected, waiting for the Android app to open the accessory...");
+            let (r, w) = t.split();
+            // USB bulk transfers are packet-oriented, not stream-oriented
+            // like TCP: a read_bulk() call fails with Overflow if the
+            // caller's buffer is smaller than the incoming packet, it
+            // doesn't just silently return a truncated read. Android's
+            // handshake writes all its fields via a single flush() (one
+            // ~32-byte USB packet), but input_receiver.rs reads them 4-8
+            // bytes at a time -- confirmed live: without buffering here,
+            // the very first small read overflowed. BufReader gives read()
+            // its own large internal buffer for the actual read_bulk()
+            // call and serves the small reads from that.
+            (Box::new(std::io::BufReader::new(r)), Box::new(w))
+        }
+    };
+
+    let (clock_tx, clock_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || crate::input_receiver::run(reader, clock_tx));
+
+    // Milestone 7 clock-offset calibration (see clock_sync.rs) doubles as
+    // Milestone 8's "is the peer actually ready" signal: block for the
+    // input thread to hand over the Android-side clock-ping it just read
+    // out of the handshake, then reply on the video channel before any
+    // frame is sent. If this never arrives, DON'T stream anyway (unlike
+    // the old TCP-only behavior of logging a warning and continuing
+    // regardless) -- with no peer confirmed ready, video bytes would just
+    // corrupt whatever the real handshake turns out to be once someone
+    // finally does connect.
+    match clock_rx.recv_timeout(clock_sync_timeout) {
+        Ok((android_send_ms, daemon_recv_ms)) => {
+            let daemon_send_ms = crate::clock_sync::now_millis();
+            let mut reply = Vec::with_capacity(24);
+            reply.extend_from_slice(&daemon_send_ms.to_be_bytes());
+            reply.extend_from_slice(&android_send_ms.to_be_bytes());
+            reply.extend_from_slice(&daemon_recv_ms.to_be_bytes());
+            if let Err(e) = writer.write_all(&reply) {
+                eprintln!("[clock-sync] failed to send calibration reply: {e}");
+                return None;
+            }
+        }
+        Err(e) => {
+            eprintln!("[clock-sync] never received clock ping: {e} -- not streaming, no confirmed peer");
+            return None;
+        }
+    }
+
+    Some(writer)
+}
+
+/// `transport_config`: which transport (if any) carries video frames out to
+/// the Android client and reads S Pen input back, as a 4-byte big-endian
+/// length prefix followed by the frame bytes -- see `TransportConfig`.
 pub fn run_capture(
     node_id: u32,
     fd: OwnedFd,
     out_path: &str,
-    transport_port: Option<u16>,
+    transport_config: TransportConfig,
 ) -> Result<CaptureStats, pw::Error> {
     pw::init();
 
@@ -121,47 +222,7 @@ pub fn run_capture(
     crate::set_up_sigint_handler();
 
     let out_file = File::create(out_path).expect("create output file");
-    let transport = transport_port.map(|port| {
-        eprintln!("[transport] connecting to 127.0.0.1:{port} (via adb forward)...");
-        let s = TcpStream::connect(("127.0.0.1", port))
-            .unwrap_or_else(|e| panic!("failed to connect to 127.0.0.1:{port}: {e}"));
-        s.set_nodelay(true).ok();
-        eprintln!("[transport] connected");
-
-        // Input (S Pen -> daemon) flows the opposite direction on this same
-        // socket from video (daemon -> S Pen), so a cloned handle with its
-        // own read loop on a separate thread doesn't interfere with the
-        // video-writing half used by the capture callback below.
-        let mut s = s;
-        match s.try_clone() {
-            Ok(input_stream) => {
-                let (clock_tx, clock_rx) = std::sync::mpsc::channel();
-                std::thread::spawn(move || crate::input_receiver::run(input_stream, clock_tx));
-
-                // Milestone 7 clock-offset calibration (see clock_sync.rs):
-                // block briefly for the input thread to hand over the
-                // Android-side clock-ping it just read out of the
-                // handshake, then reply on the video channel before any
-                // frame is sent.
-                match clock_rx.recv_timeout(Duration::from_secs(5)) {
-                    Ok((android_send_ms, daemon_recv_ms)) => {
-                        let daemon_send_ms = crate::clock_sync::now_millis();
-                        let mut reply = Vec::with_capacity(24);
-                        reply.extend_from_slice(&daemon_send_ms.to_be_bytes());
-                        reply.extend_from_slice(&android_send_ms.to_be_bytes());
-                        reply.extend_from_slice(&daemon_recv_ms.to_be_bytes());
-                        if let Err(e) = s.write_all(&reply) {
-                            eprintln!("[clock-sync] failed to send calibration reply: {e}");
-                        }
-                    }
-                    Err(e) => eprintln!("[clock-sync] never received clock ping: {e}"),
-                }
-            }
-            Err(e) => eprintln!("[input] failed to clone transport socket: {e}"),
-        }
-
-        s
-    });
+    let transport = setup_transport(transport_config);
     let stats = Rc::new(RefCell::new(CaptureStats::default()));
     let data = CaptureData {
         format: Default::default(),
@@ -390,8 +451,8 @@ pub fn run_capture(
                         frame_buf.extend_from_slice(&crate::clock_sync::now_millis().to_be_bytes());
                         frame_buf.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
                         frame_buf.extend_from_slice(&encoded);
-                        if sock.write_all(&frame_buf).is_err() {
-                            eprintln!("[transport] write failed, dropping connection");
+                        if let Err(e) = sock.write_all(&frame_buf) {
+                            eprintln!("[transport] write failed ({e}), dropping connection");
                             user_data.transport = None;
                         }
                     }

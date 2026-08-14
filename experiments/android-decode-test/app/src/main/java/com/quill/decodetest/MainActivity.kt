@@ -1,6 +1,9 @@
 package com.quill.decodetest
 
 import android.app.Activity
+import android.content.Intent
+import android.hardware.usb.UsbAccessory
+import android.hardware.usb.UsbManager
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
@@ -10,10 +13,10 @@ import android.view.InputDevice
 import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
-import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
-import java.io.DataInputStream
 import java.io.DataOutputStream
+import java.io.FileInputStream
+import java.io.FileOutputStream
 import java.net.ServerSocket
 import java.net.Socket
 import java.util.concurrent.LinkedBlockingQueue
@@ -59,8 +62,15 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     @Volatile
     private var running = true
 
+    // Milestone 8: set from the launching intent (or a later
+    // USB_ACCESSORY_ATTACHED broadcast) when the daemon has switched the
+    // tablet into AOA accessory mode -- see daemon/src/aoa.rs. Null means
+    // "use the original adb-forward socket path" (Milestones 3-7).
+    private var usbAccessory: UsbAccessory? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        usbAccessory = accessoryFromIntent(intent) ?: alreadyAttachedAccessory()
         val surfaceView = SurfaceView(this)
         setContentView(surfaceView)
         surfaceView.holder.addCallback(this)
@@ -74,8 +84,37 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         surfaceView.setOnGenericMotionListener { _, event -> handleMotionEvent(event, down = false) }
     }
 
+    /** Fallback for a manual relaunch (tapping the app icon after the decode
+     * loop already exited, e.g. daemon restarted) -- there's no fresh
+     * USB_ACCESSORY_ATTACHED intent in that case since the USB device
+     * itself never actually detached, so check whether one's already
+     * attached and permission already granted (from the original attach
+     * event) instead of silently falling back to the adb-forward path. */
+    private fun alreadyAttachedAccessory(): UsbAccessory? {
+        val usbManager = getSystemService(USB_SERVICE) as UsbManager
+        val accessory = usbManager.accessoryList?.firstOrNull() ?: return null
+        if (!usbManager.hasPermission(accessory)) {
+            Log.w(tag, "accessory attached but no permission -- falling back to adb-forward")
+            return null
+        }
+        return accessory
+    }
+
+    private fun accessoryFromIntent(intent: Intent?): UsbAccessory? {
+        if (intent?.action != UsbManager.ACTION_USB_ACCESSORY_ATTACHED) return null
+        @Suppress("DEPRECATION") // getParcelableExtra(String) is fine pre-Tiramisu-only warning noise here
+        return intent.getParcelableExtra(UsbManager.EXTRA_ACCESSORY)
+    }
+
     override fun surfaceCreated(holder: SurfaceHolder) {
-        decodeThread = Thread { runDecodeLoop(holder) }.also { it.start() }
+        decodeThread = Thread {
+            val accessory = usbAccessory
+            if (accessory != null) {
+                runAoaDecodeLoop(holder, accessory)
+            } else {
+                runAdbForwardDecodeLoop(holder)
+            }
+        }.also { it.start() }
     }
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, w: Int, h: Int) {}
@@ -219,6 +258,60 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         out.flush()
     }
 
+    /** Minimal replacement for `BufferedInputStream` over the USB accessory
+     * fd. `BufferedInputStream` itself can't be used there -- confirmed
+     * live: it calls `FileInputStream.available()` as a read optimization,
+     * which throws `IOException("Invalid argument")` on this fd type (the
+     * FIONREAD ioctl isn't supported on it). But going fully unbuffered is
+     * *worse*: USB bulk transfers are packet-oriented, and confirmed live,
+     * requesting fewer bytes than a single incoming packet holds silently
+     * drops the remainder of that packet instead of queuing it for the next
+     * read() call (unlike a stream socket) -- every read after the first
+     * then desyncs onto whatever arrives next (observed: `readClockOffset`'s
+     * first 8-byte field always came back correct, every field after it did
+     * not, byte-for-byte reproducible across runs). Always refilling from a
+     * buffer at least as large as the daemon's largest single write (video
+     * frames can be ~100KB) avoids both problems at once. */
+    private class BufferedAccessoryInput(private val underlying: java.io.InputStream, size: Int = 1 shl 20) {
+        private val buf = ByteArray(size)
+        private var pos = 0
+        private var limit = 0
+
+        private fun fill() {
+            val n = underlying.read(buf, 0, buf.size)
+            if (n < 0) throw java.io.EOFException("accessory stream closed")
+            pos = 0
+            limit = n
+        }
+
+        fun readExact(len: Int): ByteArray {
+            val result = ByteArray(len)
+            var got = 0
+            while (got < len) {
+                if (pos >= limit) fill()
+                val n = minOf(limit - pos, len - got)
+                System.arraycopy(buf, pos, result, got, n)
+                pos += n
+                got += n
+            }
+            return result
+        }
+
+        fun readLong(): Long {
+            val b = readExact(8)
+            var v = 0L
+            for (i in 0 until 8) v = (v shl 8) or (b[i].toLong() and 0xFF)
+            return v
+        }
+
+        fun readInt(): Int {
+            val b = readExact(4)
+            var v = 0
+            for (i in 0 until 4) v = (v shl 8) or (b[i].toInt() and 0xFF)
+            return v
+        }
+    }
+
     /**
      * Reads the daemon's clock-sync reply (sent once, before any video
      * frame) and computes the android-clock-minus-daemon-clock offset via
@@ -226,7 +319,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
      * derivation. Assumes symmetric one-way transport delay, reasonable for
      * a single local adb-forward/USB link.
      */
-    private fun readClockOffset(input: DataInputStream): Long {
+    private fun readClockOffset(input: BufferedAccessoryInput): Long {
         val daemonSendMs = input.readLong()
         val androidSendEchoMs = input.readLong()
         val daemonRecvMs = input.readLong()
@@ -237,16 +330,56 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         return offset
     }
 
-    private fun runDecodeLoop(holder: SurfaceHolder) {
+    /** Original transport (Milestones 3-7): listens on a TCP port reached
+     * via `adb forward tcp:PORT tcp:PORT`. */
+    private fun runAdbForwardDecodeLoop(holder: SurfaceHolder) {
         Log.i(tag, "Listening on port $port, waiting for daemon (adb forward)...")
-        var codec: MediaCodec? = null
         try {
             ServerSocket(port).use { server ->
                 server.reuseAddress = true
                 val socket: Socket = server.accept()
                 Log.i(tag, "daemon connected from ${socket.remoteSocketAddress}")
-                val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
+                val input = BufferedAccessoryInput(socket.getInputStream())
                 val out = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
+                runDecodeLoop(holder, input, out)
+            }
+        } catch (e: Exception) {
+            Log.e(tag, "adb-forward decode loop error", e)
+        }
+    }
+
+    /** Milestone 8: talks directly to the daemon over raw USB via the
+     * Android Open Accessory framework, no adb involved at all -- the
+     * daemon (daemon/src/aoa.rs) already switched the device into
+     * accessory mode before this activity was even launched (that's what
+     * the USB_ACCESSORY_ATTACHED intent means). */
+    private fun runAoaDecodeLoop(holder: SurfaceHolder, accessory: UsbAccessory) {
+        Log.i(tag, "Opening USB accessory: ${accessory.manufacturer}/${accessory.model}")
+        val usbManager = getSystemService(USB_SERVICE) as UsbManager
+        val pfd = usbManager.openAccessory(accessory)
+        if (pfd == null) {
+            Log.e(tag, "openAccessory returned null -- permission not granted?")
+            return
+        }
+        pfd.use {
+            val fd = it.fileDescriptor
+            val input = BufferedAccessoryInput(FileInputStream(fd))
+            val out = DataOutputStream(BufferedOutputStream(FileOutputStream(fd)))
+            try {
+                runDecodeLoop(holder, input, out)
+            } catch (e: Exception) {
+                Log.e(tag, "AOA decode loop error", e)
+            }
+        }
+    }
+
+    /** Shared protocol logic -- handshake, clock-sync, video decode/render,
+     * input writer thread -- identical regardless of which transport
+     * carried the bytes in (`input`/`out` are already open and connected). */
+    private fun runDecodeLoop(holder: SurfaceHolder, input: BufferedAccessoryInput, out: DataOutputStream) {
+        var codec: MediaCodec? = null
+        try {
+            run {
                 output = out
                 sendHandshake(out)
                 val clockOffsetMs = readClockOffset(input)
@@ -347,8 +480,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                         Log.w(tag, "bogus frame length $length, stopping")
                         break
                     }
-                    val frameBytes = ByteArray(length)
-                    input.readFully(frameBytes)
+                    val frameBytes = input.readExact(length)
 
                     val inIndex = codec!!.dequeueInputBuffer(10_000)
                     if (inIndex >= 0) {

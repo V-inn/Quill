@@ -1,7 +1,8 @@
 //! Receives real S Pen input from the Android client and injects it into
 //! the virtual uinput tablet (`uinput_tablet.rs`). Runs on its own thread,
-//! reading from a cloned half of the same TCP socket video is sent on --
-//! independent read/write directions of one connection, no separate port.
+//! reading from the read half of whichever transport is active (adb-forward
+//! TCP or AOA USB, see `portal_capture::TransportConfig`) -- independent
+//! read/write directions of one connection, no separate port.
 //!
 //! Wire format (all big-endian, Android -> daemon):
 //!
@@ -30,9 +31,9 @@
 //!                     explicit button_down/button_up event types, not this
 //!                     bit; bit1 = tool is a finger, not the S Pen)
 
+use crate::portal_capture::TransportReader;
 use crate::uinput_tablet::{TabletRanges, UinputTablet};
 use std::io::{self, Read};
-use std::net::TcpStream;
 use std::sync::mpsc::Sender;
 
 fn read_u32(r: &mut impl Read) -> io::Result<u32> {
@@ -96,7 +97,7 @@ const EV_BUTTON_UP: u8 = 7;
 /// handshake's clock-sync ping is read, so the main thread (which owns the
 /// video-writing half of the socket) can complete Milestone 7's clock-offset
 /// calibration handshake -- see `clock_sync.rs`.
-pub fn run(mut stream: TcpStream, clock_tx: Sender<(i64, i64)>) {
+pub fn run(mut stream: TransportReader, clock_tx: Sender<(i64, i64)>) {
     let handshake = match read_handshake(&mut stream) {
         Ok(h) => h,
         Err(e) => {

@@ -937,9 +937,117 @@ every number gathered, not something independently proven via deeper profiling.
 (was ~144-150ms pre-VPP, ~300ms at the Milestone 4 baseline) -- roughly a **2.7x
 improvement over where Milestone 7 started**, confirmed by camera three times.
 
-## 8. (Optional v2) AOA transport
+## 8. AOA transport -- DONE (~107-112ms adb-forward -> min ~64-66ms steady-state)
 
-Swap adb transport for Android Open Accessory mode, drop the adb dependency entirely.
+User asked whether a custom USB protocol + custom decoding via adb would improve
+latency further after Milestone 7 landed at ~107-112ms. Rather than a full custom
+protocol, chose **Android Open Accessory (AOA) 2.0** first: talk to the tablet
+directly over raw USB bulk transfers via `rusb`/libusb, bypassing adb entirely (no
+adb-forward relay hop through the host's adb server and the device's adbd). Same
+downstream protocol (handshake, clock-sync, length-prefixed H.264 frames, input
+events) carried over a different transport -- `daemon/src/aoa.rs` implements
+`Read`/`Write` for the USB bulk endpoints so the rest of the daemon (`portal_capture.rs`,
+`input_receiver.rs`) is transport-agnostic via `Box<dyn Read + Send>` / `Box<dyn Write
++ Send>` trait objects, shared with the existing TCP/adb-forward path.
+
+**AOA handshake implemented generically, not hardcoded to this tablet:** scan every
+USB device for one that answers the standard `ACCESSORY_GET_PROTOCOL` vendor
+request, send the six identification strings (`Quill`/`Quill Virtual Display`/...),
+send `ACCESSORY_START`, then find and open the device again after it disconnects and
+re-enumerates under Google's AOA VID/PID (`18d1:2d00`/`2d01`) -- matches the
+project's no-hardcoding rule, any AOA-capable Android device should work here
+unmodified. Android side: `accessory_filter.xml` manifest resource matches
+manufacturer/model so Android routes `USB_ACCESSORY_ATTACHED` to the app, and
+`UsbManager.openAccessory()` hands back a `ParcelFileDescriptor` wrapping the same
+USB interface.
+
+**Four real bugs found and fixed getting the two sides talking reliably:**
+
+1. **Undersized-read `Overflow` on the daemon side.** `libusb`'s `read_bulk()` fails
+   outright (doesn't truncate) when the caller's buffer is smaller than the incoming
+   packet -- Android batches its whole 32-byte handshake into one `flush()`, but
+   `input_receiver.rs`'s helpers read 4-8 bytes at a time. Fixed by wrapping the AOA
+   reader in `std::io::BufReader::new(r)` before boxing it, giving `read_bulk()` an
+   8KB internal buffer to absorb any single incoming packet.
+
+2. **Connection race corrupting data.** The original clock-sync timeout (5s) was
+   treated as non-fatal -- on a real timeout the daemon started streaming video with
+   no clock-sync reply ever sent, and Android's first read landed mid-frame instead
+   of on the handshake reply, producing garbage on both sides. Fixed by making
+   `clock_sync_timeout` transport-dependent (120s for AOA, accounting for a human
+   needing to react to the accessory permission dialog vs 5s for TCP) and by making
+   `setup_transport()` return `None` on *any* clock-sync failure, so the daemon never
+   streams without a confirmed peer.
+
+3. **Device-reuse handshake failure.** `connect()` always attempted the full AOA
+   switch handshake even when the device was already in accessory mode from a
+   previous daemon run -- a device already switched won't answer
+   `ACCESSORY_GET_PROTOCOL` the same way. Fixed by trying to open an
+   already-enumerated `18d1:2d00`/`2d01` device first, before attempting any switch.
+
+4. **`FileInputStream.available()` throwing on the USB accessory fd.** Confirmed via
+   full stack trace that `BufferedInputStream.read()` calls `available()` as an
+   optimization, and that throws `IOException("Invalid argument")` on this fd type
+   (the `FIONREAD` ioctl isn't supported on it) -- matches Android's own official USB
+   accessory sample code, which reads these fds unbuffered for the same reason.
+
+**A fifth bug survived all of the above and took the longest to run down: garbage
+clock-sync values, byte-for-byte reproducible across independent sessions.** After
+every fix above, the handshake read correctly every time
+(`2560x1498px, pressure 0..4095, tilt -90..90`), but the very next read --
+`readClockOffset()`'s three `DataInputStream.readLong()` calls, 24 bytes total --
+consistently came back wrong starting at the *second* field:
+`offset=3788735529345...ms, round-trip sum=-7577471058690...ms`, then
+`bogus frame length 1053598660`. Identical magnitude, near-identical trailing digits,
+same bogus frame length, every time -- not random corruption, something deterministic.
+
+First hypothesis: a `FileInputStream.read(buf, off, len)` offset-handling bug on this
+device's USB accessory char device, corrupting `readFully`'s internal short-read
+loop past the first chunk. Rewrote the reads as an offset-0-only helper
+(`readExactBytes`, always reading into a fresh buffer at index 0 and copying into
+place manually) -- **rebuilt, retested, got the exact same garbage value
+(`1053598660`) again.** Ruled the offset theory out cleanly: whatever was wrong,
+buffer offset handling wasn't it.
+
+The real cause, worked out from the arithmetic: the first 8-byte field read
+correctly every single time; only the fields after it were wrong. USB bulk transfers
+are packet-oriented, not stream-oriented like a TCP socket -- confirmed this
+matters going the *other* direction back in bug #1 above (undersized daemon-side
+reads hard-fail with `Overflow`), but on the **Android** side the same undersized
+read instead *silently truncates*: requesting only 8 bytes out of a single 24-byte
+incoming packet returns those 8 bytes and **discards the rest of the packet**, rather
+than queuing it for the next `read()` call the way a stream socket would. Every
+`readLong()` call after the first was therefore reading from whatever arrived
+*next* (the leading bytes of the first video frame), not the rest of the reply --
+which explains both why it was deterministic (early frame sizes are similar between
+runs) and why plain unbuffered reads (fix #4 above) weren't enough on their own: not
+being unbuffered was the problem, being *undersized* was.
+
+Fixed with a small hand-rolled `BufferedAccessoryInput` class: refills from a 1MB
+internal buffer via full-size reads from the underlying `FileInputStream` (large
+enough to swallow a whole incoming packet, video frames included), and serves
+smaller reads out of that buffer -- effectively `BufferedInputStream` without the
+`available()` call that made it unusable here. Applied uniformly to both the
+adb-forward and AOA paths so `runDecodeLoop` stays transport-agnostic. Confirmed
+live: clock-sync reply now reads correctly every time
+(`offset=1697ms, round-trip sum=1ms` on a clean run with the daemon already waiting
+before the app opened the accessory), and video renders live and continuously on the
+tablet.
+
+**Result:** with real on-screen motion to capture (idle/static content produces no
+new PipeWire buffers at all -- expected portal behavior, not a bug), steady-state
+decode/render latency (same FIFO-based measurement as Milestone 7) came in at
+**min 64-66ms**, per-frame samples mostly 70-90ms, `pending=3` (same decoder queue
+depth as the adb-forward baseline) -- down from **~107-112ms** over adb-forward.
+That's a genuine **~40-45ms win**, consistent with the original hypothesis that the
+adb-forward relay hop (host adb server <-> device adbd <-> app socket) was adding
+real overhead beyond the H.264 encode/decode/transport work itself. Not yet
+formally re-measured with the camera readable-clock method for a full
+glass-to-glass number (this was decode/render latency from the Android-side FIFO
+instrumentation, same segment Milestone 7 tracked) -- worth doing before calling the
+AOA milestone fully closed out, but the transport itself, the handshake, and the
+input path (S Pen events observed flowing back to the daemon over the same
+connection during this test) are all confirmed working end to end.
 
 ## 9. (Not started) Multi-touch gestures
 

@@ -1,3 +1,4 @@
+mod aoa;
 mod clock_sync;
 mod ffi;
 mod h264_headers;
@@ -36,10 +37,17 @@ async fn main() {
     let out_path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "/tmp/daemon_capture.h264".to_string());
-    let transport_port: Option<u16> = std::env::args().nth(2).map(|s| {
-        s.parse()
-            .unwrap_or_else(|_| panic!("invalid port: {s}"))
-    });
+    // Second arg selects the transport: a bare port number means the
+    // original adb-forward path (Milestones 3-7); the literal "aoa" means
+    // Milestone 8's direct-USB path; omitted means no transport at all
+    // (capture-only, used for the latency diagnostics in MILESTONES.md).
+    let transport_config = match std::env::args().nth(2).as_deref() {
+        None => portal_capture::TransportConfig::None,
+        Some("aoa") => portal_capture::TransportConfig::Aoa,
+        Some(s) => portal_capture::TransportConfig::TcpForward(
+            s.parse().unwrap_or_else(|_| panic!("invalid port or mode: {s} (expected a port number or \"aoa\")")),
+        ),
+    };
 
     eprintln!("Opening portal ScreenCast session -- pick the virtual monitor in the dialog...");
     let (stream, fd) = portal_capture::open_portal()
@@ -52,7 +60,7 @@ async fn main() {
         stream.position()
     );
 
-    let stats = portal_capture::run_capture(node_id, fd, &out_path, transport_port)
+    let stats = portal_capture::run_capture(node_id, fd, &out_path, transport_config)
         .expect("capture failed");
 
     if stats.frame_count == 0 {
