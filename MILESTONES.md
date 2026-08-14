@@ -1348,3 +1348,46 @@ untested remaining variable is bit-level AOA transport corruption, considered
 unlikely given the artifact's clean, correctly-shaped appearance (typical transport
 corruption shows as block/macroblock artifacts, not two intact icons) -- not
 pursued further this session.
+
+## 13. Reverted attempt: automatic virtual-monitor sizing regressed FPS and display mode
+
+User asked why the tablet's display always showed as 1920x1080 in system
+settings, when it should be bigger. Tried teaching the daemon to
+create/resize the `krfb-virtualmonitor` output itself from the capability
+handshake's real panel resolution, before ever opening the portal, instead
+of relying on the hand-picked `--resolution` the project's test setup
+happened to start it with. Landed as a commit, then live-tested and found to
+regress two things at once: the display dropped from a smooth ~60fps to a
+laggy sub-10fps, and the tablet fell back to mirroring the primary display
+instead of extending it -- most likely because forcibly tearing down and
+recreating the KWin output on every daemon launch knocked the compositor out
+of whatever stable extended-output state it had settled into, onto a
+slower mirrored/software path. It also didn't end up fixing the original
+1920x1080-stuck complaint it was written for. Net negative on every axis, so
+reverted outright (`git reset` back to the prior commit) rather than kept
+around and patched -- the code is gone, not just disabled.
+
+Confirmed via `git bisect` against real hardware (FPS is only observable by
+eye on the tablet, not from daemon logs -- encode-side timings looked fine,
+~6-10ms/frame, even while the actual display was laggy, so the regression is
+downstream of the daemon's own encode pipeline, somewhere in the
+KWin/portal/compositor path the virtual-monitor recreation touches).
+
+**Worth keeping despite the revert: a real, still-unfixed bug was found
+during that work.** Manually running `quill` while the systemd auto-launch
+instance already owned the tablet raced `aoa::connect`'s "already in
+accessory mode, reusing it" fast path against a connection with leftover
+bytes still in flight -- the fresh handshake read landed on stale stream
+bytes instead, producing `handshake: 67108868x369098755 px, pressure
+-905969655..-2063597568, tilt 0..132096 deg`. uinput tablet creation
+rejected it safely (kernel ioctl validation, `Invalid argument`), but the
+reverted code had wired those same unvalidated dimensions into a
+`krfb-virtualmonitor --resolution ...` shell-out, and KWin accepted the
+literal garbage resolution with no bounds checking of its own --
+`kscreen-doctor -j` confirmed a real output at that insane size, and the
+terminal crashed (KWin itself survived; recovered with `pkill -f
+krfb-virtualmonitor`). The corrupted-handshake bug itself is independent of
+the reverted feature and still lives in `aoa::connect`'s connection-reuse
+path today, just with nothing downstream currently acting on the garbage
+values it can produce -- worth a bounds/sanity check on the handshake
+read in `input_receiver.rs` regardless of whatever uses width/height next.
