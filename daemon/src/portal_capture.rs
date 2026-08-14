@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 pub struct CaptureStats {
     pub frame_count: u64,
     pub durations: Vec<Duration>,
+    pub dropped_stale: u64,
 }
 
 /// Negotiates a ScreenCast session via the portal. Triggers KDE's native
@@ -176,9 +177,24 @@ pub fn run_capture(
         })
         .process(|stream, user_data| {
             let start = Instant::now();
+            // Milestone 4 root-caused ~300ms glass-to-glass latency to this
+            // pipeline being structurally slower than the source's refresh
+            // rate: with no staleness check, a backlog of queued buffers
+            // just grows and we always end up encoding an old one. Drain to
+            // the newest buffer available right now and let older ones drop
+            // (auto-requeued to PipeWire via `Buffer`'s Drop impl) unprocessed.
             let Some(mut buffer) = stream.dequeue_buffer() else {
                 return;
             };
+            let mut dropped = 0u32;
+            while let Some(newer) = stream.dequeue_buffer() {
+                buffer = newer;
+                dropped += 1;
+            }
+            if dropped > 0 {
+                let mut stats = user_data.stats.borrow_mut();
+                stats.dropped_stale += dropped as u64;
+            }
             let datas = buffer.datas_mut();
             if datas.is_empty() {
                 return;
@@ -219,10 +235,11 @@ pub fn run_capture(
                     stats.durations.push(elapsed);
                     if stats.frame_count == 1 || stats.frame_count % 30 == 0 {
                         eprintln!(
-                            "[capture] frame {}: {} bytes, {:?} (dequeue->encoded)",
+                            "[capture] frame {}: {} bytes, {:?} (dequeue->encoded), {} stale dropped so far",
                             stats.frame_count,
                             encoded.len(),
-                            elapsed
+                            elapsed,
+                            stats.dropped_stale
                         );
                     }
                     drop(stats);
@@ -310,6 +327,7 @@ pub fn run_capture(
 
     let frame_count = stats.borrow().frame_count;
     let durations = stats.borrow().durations.clone();
+    let dropped_stale = stats.borrow().dropped_stale;
     eprintln!("[pipewire] stats computed: {frame_count} frames, returning...");
-    Ok(CaptureStats { frame_count, durations })
+    Ok(CaptureStats { frame_count, durations, dropped_stale })
 }

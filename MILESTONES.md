@@ -445,9 +445,46 @@ drawn on the tablet appearing correctly in GIMP on the virtual monitor.
 but the receive loop doesn't act on them yet — declared as dead code, flagged as a
 follow-up rather than part of this milestone's exit criteria.
 
-## 7. Tuning pass
+## 7. Tuning pass — IN PROGRESS
 
-Encoder settings, buffer sizes, thread priorities to cut jitter.
+Encoder settings, buffer sizes, thread priorities to cut jitter. Three concrete items
+were recorded as Milestone 4's findings: (1) import DMA-BUF from PipeWire instead of
+`MAP_BUFFERS`+CPU color convert, (2) drop stale queued buffers instead of strict FIFO,
+(3) real GOP with P-frames instead of all-intra.
+
+**Item 2, drop-stale-frames — implemented.** `portal_capture.rs`'s `process` callback
+now drains all currently-available PipeWire buffers and only encodes the newest one;
+older ones are dropped unprocessed (auto-requeued to PipeWire via `Buffer`'s `Drop`
+impl — confirmed by reading `pipewire-0.10.0/src/buffer.rs` before relying on it).
+`CaptureStats` gained a `dropped_stale` counter, logged periodically and in the final
+summary.
+
+**Live re-measurement of glass-to-glass latency, same method as Milestone 4** (two
+`requestAnimationFrame`-driven clock windows, one on the main screen, one dragged onto
+the virtual monitor, both filmed together in slow-motion): **~150-170ms** (readings:
+170ms, 160ms, 150ms) versus Milestone 4's ~300-320ms — roughly halved. User also
+reported the tablet's effective framerate looked noticeably smoother than before.
+
+**Important honesty check, not just declaring victory:** the same run's own
+`dropped_stale` counter read **0** across 7452 frames — the drop-stale logic never
+actually triggered. `dequeue→encoded` averaged 14.7ms/frame (well under the 16.6ms
+60Hz budget), so this specific run was never backlogged on the capture/encode side
+to begin with. That means **the ~150ms improvement can't be cleanly attributed to
+this fix** from this run's evidence alone — it may be genuine (Milestone 4's baseline
+run could plausibly have hit backlog under different conditions) or it may be
+run-to-run variance (thermal/driver-cache state, background load, etc.) unrelated to
+the code change. Recorded honestly rather than overclaiming causation.
+
+**Re-scoping items 1 and 3 given this data:** with capture+encode already at ~14.7ms
+average and zero observed backlog, the CPU↔GPU round-trip that DMA-BUF import (item 1)
+would eliminate is only a fraction of that already-small number — its realistic upside
+on the *glass-to-glass* number looks smaller than Milestone 4's analysis assumed,
+though it would still cut CPU load. Frame sizes are already small (30-80KB), so P-frame
+GOP (item 3) mainly helps bandwidth, not latency. The remaining ~150ms most likely
+lives *outside* the daemon's own capture/encode stage — PipeWire's own internal
+buffering before a frame reaches us, the adb/USB transport hop, or (a well-known
+source of multi-frame latency on Android) `MediaCodec`/`SurfaceView`'s own buffer
+queueing on the decode+render side. None of that is instrumented yet.
 
 ## 8. (Optional v2) AOA transport
 

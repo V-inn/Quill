@@ -65,8 +65,9 @@ async fn main() {
     let min = stats.durations.iter().min().unwrap();
     let max = stats.durations.iter().max().unwrap();
 
-    println!("--- Milestone 2 summary ---");
+    println!("--- summary ---");
     println!("frames captured+encoded: {}", stats.frame_count);
+    println!("stale frames dropped: {}", stats.dropped_stale);
     println!("dequeue->encoded latency: avg={avg:?} min={min:?} max={max:?}");
     println!("output written to: {out_path}");
     // stdout is fully buffered (not line-buffered) once redirected to a file
