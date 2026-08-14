@@ -79,6 +79,15 @@ async fn main() {
     } else {
         println!("buffer age (pts->dequeue): no MetaHeader.pts available from this producer");
     }
+    if stats.capture_latency_samples > 0 {
+        println!(
+            "capture latency (barcode->dequeue) avg: {:.2}ms over {} samples",
+            stats.capture_latency_ms_sum / stats.capture_latency_samples as f64,
+            stats.capture_latency_samples
+        );
+    } else {
+        println!("capture latency (barcode->dequeue): no barcode probe detected");
+    }
     println!("output written to: {out_path}");
     // stdout is fully buffered (not line-buffered) once redirected to a file
     // or pipe -- flush explicitly so this isn't silently lost if the process

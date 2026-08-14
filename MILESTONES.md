@@ -495,7 +495,7 @@ event) — likely a real multitouch protocol (`ABS_MT_*` slots) or OS-level gest
 recognition, not a small extension of the current single-touch path. Worth its own
 milestone later, not a follow-up to this one.
 
-## 7. Tuning pass — PAUSED (real progress, not fully closed)
+## 7. Tuning pass — MOSTLY RESOLVED (real pipeline latency ~54ms, not ~150-180ms)
 
 Encoder settings, buffer sizes, thread priorities to cut jitter. Three concrete items
 were recorded as Milestone 4's findings: (1) import DMA-BUF from PipeWire instead of
@@ -606,15 +606,59 @@ is left in (harmless, just logs once if the condition ever changes) rather than
 ripped out, since it's cheap and correctly-implemented instrumentation for a
 question that's still open.
 
-**Session status:** two real, measured wins this milestone (drop-stale-frames +
-clock-offset-calibrated per-frame latency logging replacing camera measurement for
-future iteration), one ruled-out lever (`KEY_LOW_LATENCY`), and the root cause of
-the remaining ~150-180ms correctly localized to KWin/PipeWire's own screencast
-buffer delivery — which is outside this project's own code, and further
-localization there would need either instrumenting KWin itself or a burned-in-
-timestamp/OCR correlation trick, both bigger asks than this pass. Stopping here for
-now; the next lead is written above for whoever (or whichever future session)
-picks this back up.
+**Session status (superseded by the barcode-probe result below):** two real,
+measured wins this milestone (drop-stale-frames + clock-offset-calibrated per-frame
+latency logging), one ruled-out lever (`KEY_LOW_LATENCY`), and the root cause of the
+remaining ~150-180ms localized to KWin/PipeWire's own screencast buffer delivery.
+
+### Resumed: the burned-in-timestamp trick, implemented — big result
+
+Built the "next lead" noted above: `experiments/capture-latency-probe/` is a small
+native (X11-backed, see below) window that paints a live binary "barcode" of the
+local `CLOCK_MONOTONIC` nanosecond counter as 48 black/white bars. Positioned on the
+virtual monitor, the daemon decodes it straight out of the **raw PipeWire buffer**,
+before any color conversion or encoding (`decode_latency_barcode` in
+`portal_capture.rs`). Same machine as the probe, so the comparison against the
+daemon's own `CLOCK_MONOTONIC` needs no cross-device calibration and no camera —
+this is exactly "time from content changing on screen to the daemon having a buffer
+for it," the one segment nothing had measured yet.
+
+**Getting it positioned was its own detour.** `minifb`'s `set_position()` is a no-op
+under KWin's native Wayland windowing (Wayland deliberately doesn't let clients place
+their own top-level windows) — the probe first appeared centered on the main screen
+instead of on the virtual monitor. Fix: forced `minifb` onto its X11 backend
+(`default-features = false, features = ["x11", "dlopen"]` in Cargo.toml, since
+`xdotool`, an X11-only tool, was the only available way to move a window
+programmatically) and used `xdotool windowmove`. Even then, the first placement
+attempt (`x=1536`, matching `kscreen-doctor`'s reported *logical/scaled* geometry for
+the virtual monitor) landed mostly off-screen — XWayland's combined root window
+turned out to operate in **physical, unscaled pixels**, not KDE's logical/scaled
+coordinate space, so the correct X11 offset was `1920` (eDP-1's physical width), not
+`1536` (its logical width at 1.25x scale). Confirmed by adding a one-shot raw-frame
+dump (`QUILL_DUMP_FRAME=1` env var, writes a `.ppm` converted to `.png` for viewing)
+so the actual captured pixels could be inspected directly instead of reasoning about
+coordinate spaces blind — ground truth beat calculation here.
+
+**Result, live-tested, 4038 samples:** capture latency (barcode → dequeue) averaged
+**28.47ms**, individual samples mostly in the 19-33ms band (one 664ms first-frame
+outlier from VAAPI/encoder warmup, swamped by the sample count). Combined with the
+already-known `dequeue→encoded` (~10.5ms avg) and the Milestone-7 clock-sync
+`encode→render` number (~15ms avg), **the entire instrumented pipeline totals only
+~54ms** — nowhere near the ~150-180ms the camera method measured.
+
+**This means the ~150-180ms number was very likely never our pipeline's fault.**
+Leading hypothesis: the camera test's on-screen clock was rendered in Firefox (a
+`requestAnimationFrame`-driven canvas), and browser engines are well known to carry
+multiple frames of their own internal latency (main thread → compositor thread → GPU
+present) before a canvas update is actually handed to the window system for
+compositing/capture — a stage entirely outside this project's pipeline, invisible to
+`dequeue→encoded` or `encode→render` instrumentation, and plausibly large enough to
+account for the missing ~100ms. Not yet confirmed by re-running the camera test with
+the native barcode-probe's minimal renderer in place of Firefox's canvas (would be
+strong confirmation if the camera-measured number dropped to ~50-70ms) — a cheap
+follow-up if this needs closing out definitively, but the instrumented evidence
+already strongly suggests **this project's actual glass-to-glass latency is closer
+to 50-60ms, not 150-180ms.**
 
 ## 8. (Optional v2) AOA transport
 

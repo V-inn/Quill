@@ -1,5 +1,6 @@
 # Rust
 daemon/target/
+experiments/capture-latency-probe/target/
 
 # C build artifacts (experiments)
 experiments/**/*.o

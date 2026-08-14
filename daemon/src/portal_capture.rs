@@ -30,6 +30,33 @@ pub struct CaptureStats {
     pub dropped_stale: u64,
     pub buffer_age_ms_sum: f64,
     pub buffer_age_samples: u64,
+    pub capture_latency_ms_sum: f64,
+    pub capture_latency_samples: u64,
+}
+
+/// Decodes the 48-bit CLOCK_MONOTONIC barcode painted by
+/// `experiments/capture-latency-probe` (see that crate for the encoding:
+/// 48 bars, 10px wide each, MSB first, black=0/white=1, top-left corner of
+/// the virtual monitor). Reads directly from a raw BGRx-ish captured frame
+/// (see `color_convert.rs`'s note on BGRx byte order) -- no decoding of the
+/// H.264 stream involved, this runs on the same raw bytes the encoder
+/// itself is about to consume.
+fn decode_latency_barcode(bytes: &[u8], stride: usize) -> Option<u64> {
+    const BITS: u32 = 48;
+    const BAR_WIDTH: usize = 10;
+    const SAMPLE_Y: usize = 50;
+
+    let mut value: u64 = 0;
+    for bit in 0..BITS {
+        let x = bit as usize * BAR_WIDTH + BAR_WIDTH / 2;
+        let offset = SAMPLE_Y * stride + x * 4;
+        let b = *bytes.get(offset)? as u32;
+        let g = *bytes.get(offset + 1)? as u32;
+        let r = *bytes.get(offset + 2)? as u32;
+        let bright = (b + g + r) / 3 > 128;
+        value = (value << 1) | (bright as u64);
+    }
+    Some(value)
 }
 
 /// Negotiates a ScreenCast session via the portal. Triggers KDE's native
@@ -261,6 +288,55 @@ pub fn run_capture(
                 return;
             }
 
+            // One-shot calibration dump for the latency-barcode probe: lets
+            // us visually confirm exactly where the probe window landed in
+            // the actual captured pixels, sidestepping any X11-vs-Wayland
+            // coordinate-space mismatch entirely (ground truth, not a
+            // calculation). Delete once calibration is confirmed.
+            if std::env::var("QUILL_DUMP_FRAME").is_ok() {
+                let stats = user_data.stats.borrow();
+                if stats.frame_count == 0 {
+                    let height = chunk_size / stride;
+                    let width = stride / 4;
+                    if let Ok(mut f) = File::create("/tmp/quill_frame_dump.ppm") {
+                        let _ = writeln!(f, "P6\n{width} {height}\n255");
+                        for row in 0..height {
+                            for col in 0..width {
+                                let off = row * stride + col * 4;
+                                let _ = f.write_all(&[bytes[off + 2], bytes[off + 1], bytes[off]]);
+                            }
+                        }
+                        eprintln!("[debug] dumped frame to /tmp/quill_frame_dump.ppm ({width}x{height})");
+                    }
+                }
+            }
+
+            // Milestone 7 follow-up: `SPA_META_Header.pts` turned out
+            // unavailable from this producer (see the check above), so this
+            // is the working version of the same idea -- decode a 48-bit
+            // CLOCK_MONOTONIC barcode painted by
+            // experiments/capture-latency-probe directly out of the raw
+            // captured pixels, before any color conversion or encoding.
+            // Same machine as the probe, so no cross-device clock sync is
+            // needed; this is exactly "time from content changing on
+            // screen to the daemon having a buffer for it."
+            if let Some(barcode_ns) = decode_latency_barcode(bytes, stride) {
+                let now_ns = crate::clock_sync::monotonic_ns();
+                let latency_ms = (now_ns - barcode_ns as i64) as f64 / 1_000_000.0;
+                if latency_ms >= 0.0 && latency_ms < 60_000.0 {
+                    let mut stats = user_data.stats.borrow_mut();
+                    stats.capture_latency_ms_sum += latency_ms;
+                    stats.capture_latency_samples += 1;
+                    if stats.capture_latency_samples == 1 || stats.capture_latency_samples % 30 == 0 {
+                        eprintln!(
+                            "[pipewire] capture latency (barcode -> dequeue): {latency_ms:.2}ms (avg {:.2}ms over {} samples)",
+                            stats.capture_latency_ms_sum / stats.capture_latency_samples as f64,
+                            stats.capture_latency_samples
+                        );
+                    }
+                }
+            }
+
             let Some(encoder) = user_data.encoder.as_mut() else {
                 return;
             };
@@ -392,6 +468,8 @@ pub fn run_capture(
     let dropped_stale = stats.borrow().dropped_stale;
     let buffer_age_ms_sum = stats.borrow().buffer_age_ms_sum;
     let buffer_age_samples = stats.borrow().buffer_age_samples;
+    let capture_latency_ms_sum = stats.borrow().capture_latency_ms_sum;
+    let capture_latency_samples = stats.borrow().capture_latency_samples;
     eprintln!("[pipewire] stats computed: {frame_count} frames, returning...");
     Ok(CaptureStats {
         frame_count,
@@ -399,5 +477,7 @@ pub fn run_capture(
         dropped_stale,
         buffer_age_ms_sum,
         buffer_age_samples,
+        capture_latency_ms_sum,
+        capture_latency_samples,
     })
 }

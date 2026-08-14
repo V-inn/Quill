@@ -1,0 +1,11 @@
+[package]
+name = "capture-latency-probe"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libc = "0.2"
+# Wayland backend forced off: xdotool (X11-only) needs an X11/XWayland
+# window to position this on the virtual monitor, and KWin's native
+# Wayland windows can't be positioned by an external client at all.
+minifb = { version = "0.27", default-features = false, features = ["x11", "dlopen"] }
