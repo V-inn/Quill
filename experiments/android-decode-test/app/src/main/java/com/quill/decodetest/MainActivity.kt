@@ -252,11 +252,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 inputWriterThread = Thread { runInputWriterLoop(out) }.also { it.start() }
 
                 val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height)
-                // Re-verified with the corrected (FIFO-based) latency
-                // measurement (Milestone 7): genuinely no effect on this
-                // decoder (~85-115ms either way, same ~4-5 frame pipeline
-                // depth). Left enabled anyway -- harmless here, and other
-                // decoders/devices (e.g. the S10 FE+) may actually honor it.
+                // Standard KEY_LOW_LATENCY re-verified with the corrected
+                // (FIFO-based) latency measurement (Milestone 7): genuinely
+                // no effect on this decoder. Left enabled anyway -- harmless
+                // here, other decoders/devices may honor it.
                 format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
                 // Back to the device's default (hardware) decoder now that the
                 // daemon encodes Main profile/CABAC instead of Constrained
@@ -264,6 +263,16 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 // this tablet's hardware decoder specifically (see MILESTONES.md).
                 codec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
                 Log.i(tag, "using decoder: ${codec!!.name}")
+                // The standard KEY_LOW_LATENCY key is a no-op on Samsung's
+                // Exynos decoders -- they need a vendor-specific parameter
+                // instead. Confirmed against moonlight-android (a mature
+                // game-streaming app solving the exact same problem), which
+                // special-cases "c2.exynos"/"omx.exynos" decoder names with
+                // this exact key.
+                if (codec!!.name.startsWith("c2.exynos") || codec!!.name.startsWith("omx.exynos")) {
+                    Log.i(tag, "applying Exynos vendor low-latency parameter")
+                    format.setInteger("vendor.rtc-ext-dec-low-latency.enable", 1)
+                }
                 codec!!.configure(format, holder.surface, null, 0)
                 codec!!.start()
 

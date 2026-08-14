@@ -716,6 +716,25 @@ this decoder's ~4-5 frame pipeline depth is fixed regardless of the flag. Left
 `KEY_LOW_LATENCY` enabled in code anyway: harmless here, and other decoders/devices
 (e.g. the S10 FE+) may actually honor it, so no reason to remove a no-cost request.
 
+**Checked whether the standard key was even the right one for this hardware —
+it wasn't, but the real fix still didn't move the needle.** Researched real prior
+art: `moonlight-android` (a mature, production game-streaming app solving the exact
+same low-latency-decode problem) special-cases Samsung/Exynos decoders specifically
+because the standard `KEY_LOW_LATENCY` is a known no-op on them — it sets a vendor
+parameter, `"vendor.rtc-ext-dec-low-latency.enable"`, for any decoder name starting
+with `c2.exynos`/`omx.exynos` (our tablet's decoder, `c2.exynos.h264.decoder`,
+matches exactly). Implemented the same check-and-set in `MainActivity.kt`, confirmed
+live via logcat that it actually applied (`"applying Exynos vendor low-latency
+parameter"`). **Re-tested: no change** — individual frame latencies 84-130ms, same
+`pending=4-5` decoder queue depth as both earlier conditions. Left the vendor
+parameter in code anyway (same reasoning as `KEY_LOW_LATENCY`: harmless, might help
+a different Exynos generation/firmware). Moonlight's own code tries several vendor
+strings across up to 4 attempts for different SoC families — only the one matching
+our exact decoder-name prefix was tried here, not an exhaustive sweep. This
+tablet's ~5-frame decoder pipeline depth increasingly looks like a hardware/firmware
+floor not exposed to software configuration at all, at least not through any lever
+tried so far.
+
 ## 8. (Optional v2) AOA transport
 
 Swap adb transport for Android Open Accessory mode, drop the adb dependency entirely.
