@@ -445,7 +445,7 @@ drawn on the tablet appearing correctly in GIMP on the virtual monitor.
 but the receive loop doesn't act on them yet — declared as dead code, flagged as a
 follow-up rather than part of this milestone's exit criteria.
 
-## 7. Tuning pass — IN PROGRESS
+## 7. Tuning pass — PAUSED (real progress, not fully closed)
 
 Encoder settings, buffer sizes, thread priorities to cut jitter. Three concrete items
 were recorded as Milestone 4's findings: (1) import DMA-BUF from PipeWire instead of
@@ -542,6 +542,29 @@ redirects suspicion upstream, into PipeWire/KWin's own screencast buffer deliver
 whether PipeWire buffers carry their own generation-time metadata (e.g. an SPA
 `Header` meta with a PTS) so buffer age can be measured directly on dequeue,
 single-machine, no cross-device clock sync needed.
+
+**Checked immediately — negative result.** Added a `buffer.find_meta::<MetaHeader>()`
+check in the `process` callback (`portal_capture.rs`), comparing `pts()` against
+`CLOCK_MONOTONIC` via a new `clock_sync::monotonic_ns()` helper (same-machine
+comparison, no calibration needed, would have been the cleanest possible
+measurement). Live-tested: **`SPA_META_Header` is absent on every single buffer**
+(`"[pipewire] buffer has no MetaHeader"` logged for all 684 frames of the run) —
+this specific screencast producer (`krfb-virtualmonitor` + KWin's Wayland
+screencast implementation) doesn't populate a per-buffer generation timestamp.
+Dead end for this specific approach, ruled out rather than left unclear. The code
+is left in (harmless, just logs once if the condition ever changes) rather than
+ripped out, since it's cheap and correctly-implemented instrumentation for a
+question that's still open.
+
+**Session status:** two real, measured wins this milestone (drop-stale-frames +
+clock-offset-calibrated per-frame latency logging replacing camera measurement for
+future iteration), one ruled-out lever (`KEY_LOW_LATENCY`), and the root cause of
+the remaining ~150-180ms correctly localized to KWin/PipeWire's own screencast
+buffer delivery — which is outside this project's own code, and further
+localization there would need either instrumenting KWin itself or a burned-in-
+timestamp/OCR correlation trick, both bigger asks than this pass. Stopping here for
+now; the next lead is written above for whoever (or whichever future session)
+picks this back up.
 
 ## 8. (Optional v2) AOA transport
 

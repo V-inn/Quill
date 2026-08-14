@@ -28,6 +28,8 @@ pub struct CaptureStats {
     pub frame_count: u64,
     pub durations: Vec<Duration>,
     pub dropped_stale: u64,
+    pub buffer_age_ms_sum: f64,
+    pub buffer_age_samples: u64,
 }
 
 /// Negotiates a ScreenCast session via the portal. Triggers KDE's native
@@ -216,6 +218,35 @@ pub fn run_capture(
                 let mut stats = user_data.stats.borrow_mut();
                 stats.dropped_stale += dropped as u64;
             }
+
+            // Milestone 7 follow-up: the daemon's own encode+transport+
+            // decode+render instrumentation (clock_sync.rs) measured only
+            // ~15ms, far below the ~150-180ms camera-measured glass-to-
+            // glass latency -- meaning the gap lives upstream, before we
+            // even see a buffer. `SPA_META_Header.pts` (if the producer
+            // sets it) is a compositor-side generation timestamp on the
+            // *same machine* as this daemon, so it can be compared directly
+            // against CLOCK_MONOTONIC with no cross-device calibration.
+            if let Some(header) = buffer.find_meta::<pw::spa::buffer::meta::MetaHeader>() {
+                let pts_ns = header.pts();
+                if pts_ns > 0 {
+                    let now_ns = crate::clock_sync::monotonic_ns();
+                    let age_ms = (now_ns - pts_ns) as f64 / 1_000_000.0;
+                    let mut stats = user_data.stats.borrow_mut();
+                    stats.buffer_age_ms_sum += age_ms;
+                    stats.buffer_age_samples += 1;
+                    if stats.buffer_age_samples == 1 || stats.buffer_age_samples % 30 == 0 {
+                        eprintln!(
+                            "[pipewire] buffer age (pts -> dequeue): {age_ms:.2}ms (avg {:.2}ms over {} samples)",
+                            stats.buffer_age_ms_sum / stats.buffer_age_samples as f64,
+                            stats.buffer_age_samples
+                        );
+                    }
+                }
+            } else {
+                eprintln!("[pipewire] buffer has no MetaHeader (no pts available from this producer)");
+            }
+
             let datas = buffer.datas_mut();
             if datas.is_empty() {
                 return;
@@ -359,6 +390,14 @@ pub fn run_capture(
     let frame_count = stats.borrow().frame_count;
     let durations = stats.borrow().durations.clone();
     let dropped_stale = stats.borrow().dropped_stale;
+    let buffer_age_ms_sum = stats.borrow().buffer_age_ms_sum;
+    let buffer_age_samples = stats.borrow().buffer_age_samples;
     eprintln!("[pipewire] stats computed: {frame_count} frames, returning...");
-    Ok(CaptureStats { frame_count, durations, dropped_stale })
+    Ok(CaptureStats {
+        frame_count,
+        durations,
+        dropped_stale,
+        buffer_age_ms_sum,
+        buffer_age_samples,
+    })
 }

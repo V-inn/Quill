@@ -70,6 +70,15 @@ async fn main() {
     println!("frames captured+encoded: {}", stats.frame_count);
     println!("stale frames dropped: {}", stats.dropped_stale);
     println!("dequeue->encoded latency: avg={avg:?} min={min:?} max={max:?}");
+    if stats.buffer_age_samples > 0 {
+        println!(
+            "buffer age (pts->dequeue) avg: {:.2}ms over {} samples",
+            stats.buffer_age_ms_sum / stats.buffer_age_samples as f64,
+            stats.buffer_age_samples
+        );
+    } else {
+        println!("buffer age (pts->dequeue): no MetaHeader.pts available from this producer");
+    }
     println!("output written to: {out_path}");
     // stdout is fully buffered (not line-buffered) once redirected to a file
     // or pipe -- flush explicitly so this isn't silently lost if the process

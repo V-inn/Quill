@@ -37,3 +37,13 @@ pub fn now_millis() -> i64 {
         .expect("system clock before UNIX epoch")
         .as_millis() as i64
 }
+
+/// `CLOCK_MONOTONIC` nanoseconds -- comparable directly against PipeWire's
+/// `SPA_META_Header.pts` (same clock base, same machine), unlike
+/// `now_millis()` above which is only meaningful across the cross-device
+/// offset calibration.
+pub fn monotonic_ns() -> i64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as i64 * 1_000_000_000 + ts.tv_nsec as i64
+}
