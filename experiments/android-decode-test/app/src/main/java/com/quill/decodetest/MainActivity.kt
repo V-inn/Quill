@@ -13,6 +13,8 @@ import android.view.InputDevice
 import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
+import android.widget.FrameLayout
+import android.widget.TextView
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -57,6 +59,16 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private var inputWriterThread: Thread? = null
     private val eventQueue = LinkedBlockingQueue<PenEvent>()
 
+    // Visible connection-state overlay, not a silent retry: the daemon has
+    // no way to detect a stale AOA session and reset itself (confirmed
+    // live -- it just keeps reading/writing into a permanently desynced
+    // channel after a reconnect, corrupting every retry attempt until it's
+    // manually restarted too), so a fully invisible auto-reconnect isn't
+    // reliable yet. Telling the user plainly what's happening and what to
+    // do about it is more honest than a frozen or black screen that gives
+    // no indication anything is wrong.
+    private lateinit var statusText: TextView
+
     @Volatile
     private var output: DataOutputStream? = null
 
@@ -74,7 +86,21 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         usbAccessory = accessoryFromIntent(intent) ?: alreadyAttachedAccessory()
         hideSystemBars()
         val surfaceView = SurfaceView(this)
-        setContentView(surfaceView)
+        statusText = TextView(this).apply {
+            setTextColor(android.graphics.Color.WHITE)
+            textSize = 20f
+            gravity = android.view.Gravity.CENTER
+            setPadding(48, 48, 48, 48)
+        }
+        val root = FrameLayout(this).apply {
+            addView(surfaceView, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+            addView(
+                statusText,
+                FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, android.view.Gravity.CENTER)
+            )
+        }
+        setContentView(root)
+        showStatus("Waiting for connection...")
         surfaceView.holder.addCallback(this)
         surfaceView.setOnTouchListener { _, event -> handleMotionEvent(event, down = true) }
         surfaceView.setOnHoverListener { _, event -> handleMotionEvent(event, down = false) }
@@ -84,6 +110,17 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         // paths per MotionEvent, so all three listeners coexist safely with
         // no double-processing of the same event.
         surfaceView.setOnGenericMotionListener { _, event -> handleMotionEvent(event, down = false) }
+    }
+
+    private fun showStatus(message: String) {
+        runOnUiThread {
+            statusText.text = message
+            statusText.visibility = android.view.View.VISIBLE
+        }
+    }
+
+    private fun hideStatus() {
+        runOnUiThread { statusText.visibility = android.view.View.GONE }
     }
 
     /** Edge-to-edge immersive: hides both the status bar and navigation bar,
@@ -128,13 +165,80 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         return intent.getParcelableExtra(UsbManager.EXTRA_ACCESSORY)
     }
 
+    /** Retries indefinitely instead of running the decode loop once: this is
+     * meant to be an always-on second-monitor appliance, not something that
+     * needs a manual relaunch every time the connection drops. Two real
+     * scenarios that used to require exactly that (confirmed live): the
+     * daemon gets restarted (systemd, a manual `systemctl restart`, a USB
+     * drop/reconnect) while the app is sitting idle with nothing to retry
+     * with, or the app itself gets closed and reopened while an old daemon
+     * process is still mid-write on the now-stale connection -- the two
+     * sides briefly racing corrupts the fresh handshake (garbage
+     * clock-offset, garbage video-format-header, immediate MediaCodec
+     * crash) with no way to recover except a full manual relaunch. Retrying
+     * here fixes both: whichever side comes up second just waits/retries
+     * until the other side's next attempt lines up cleanly.
+     *
+     * Re-checks `alreadyAttachedAccessory()` fresh on every attempt rather
+     * than reusing the `usbAccessory` field captured once at `onCreate` --
+     * permission/attachment state is cheap to re-read and this is the
+     * actual ground truth for whether AOA is currently usable, not
+     * whatever was true when the activity was first created. */
     override fun surfaceCreated(holder: SurfaceHolder) {
+        // surfaceCreated can fire more than once per activity lifetime
+        // (surface destroyed+recreated on resume, multi-window changes,
+        // `am start` bringing an already-running instance back to front
+        // instead of spawning a fresh process) -- confirmed live, without
+        // this the retry loop below (now long-lived, unlike the original
+        // one-shot version) let two decode threads run concurrently
+        // against the same AOA connection, corrupting each other exactly
+        // like the stale-daemon-process race this whole retry loop was
+        // built to fix. Stop any previous thread and wait for it to
+        // actually exit before starting a new one -- only ever one
+        // decodeThread live at a time.
+        running = false
+        decodeThread?.interrupt()
+        decodeThread?.join(2000)
+        running = true
+
         decodeThread = Thread {
-            val accessory = usbAccessory
-            if (accessory != null) {
-                runAoaDecodeLoop(holder, accessory)
-            } else {
-                runAdbForwardDecodeLoop(holder)
+            var attempt = 0
+            while (running) {
+                attempt++
+                // After the first attempt, be explicit that a stuck
+                // connection needs a cable replug: the daemon has no way
+                // to detect and reset a stale AOA session on its own (see
+                // the class doc above), so silently retrying forever with
+                // no feedback would leave the user staring at a black
+                // screen with no idea what to do.
+                showStatus(
+                    if (attempt == 1) "Waiting for connection..."
+                    else "Waiting for connection... (attempt $attempt)\nIf this doesn't clear in a few seconds, unplug and replug the USB cable."
+                )
+                try {
+                    val accessory = alreadyAttachedAccessory() ?: usbAccessory
+                    if (accessory != null) {
+                        runAoaDecodeLoop(holder, accessory)
+                    } else {
+                        runAdbForwardDecodeLoop(holder)
+                    }
+                } catch (e: Exception) {
+                    // Belt-and-suspenders: runDecodeLoop already catches
+                    // its own errors, but openAccessory() itself and
+                    // alreadyAttachedAccessory() are outside that try/catch
+                    // -- confirmed live, an exception there silently killed
+                    // this whole retry loop with no further attempts and
+                    // no log line, worse than the bug this loop exists to
+                    // fix.
+                    Log.e(tag, "connection attempt failed", e)
+                }
+                if (!running) break
+                Log.i(tag, "connection ended, retrying in 1s...")
+                try {
+                    Thread.sleep(1000)
+                } catch (e: InterruptedException) {
+                    break
+                }
             }
         }.also { it.start() }
     }
@@ -319,6 +423,21 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         private var pos = 0
         private var limit = 0
 
+        /** Force-unblocks a read() that's currently stuck waiting for bytes
+         * that will never come (e.g. the daemon process died without the
+         * underlying USB transport itself signaling an error) -- closing
+         * the stream out from under a blocked read is the standard way to
+         * make it throw instead of hanging forever. Called only from the
+         * watchdog thread, never from the thread actually doing the
+         * reading. */
+        fun close() {
+            try {
+                underlying.close()
+            } catch (e: Exception) {
+                // Already closed/broken -- fine, that's the whole point.
+            }
+        }
+
         private fun fill() {
             val n = underlying.read(buf, 0, buf.size)
             if (n < 0) throw java.io.EOFException("accessory stream closed")
@@ -430,14 +549,46 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     /** Shared protocol logic -- handshake, clock-sync, video decode/render,
      * input writer thread -- identical regardless of which transport
      * carried the bytes in (`input`/`out` are already open and connected). */
+    // Confirmed live: a plain blocking InputStream.read() has no timeout at
+    // all, and when the daemon process dies without the underlying USB
+    // transport itself signaling an error (it doesn't, reliably), the read
+    // just hangs forever -- frozen on the last frame, no exception, so the
+    // retry loop in surfaceCreated never even gets a chance to fire (it's
+    // gated on runDecodeLoop actually returning). This watchdog force-closes
+    // the stream after too long without any data, which does unblock a
+    // pending read with an IOException the existing retry/status-overlay
+    // machinery already handles correctly. Needs the daemon's periodic
+    // heartbeat (portal_capture.rs's run_capture, ~800ms interval) to avoid
+    // false-positiving during a legitimately idle screen (no motion = no
+    // new video frames at all, expected -- see MILESTONES.md) -- the
+    // timeout here just needs to be comfortably longer than that interval.
+    private val WATCHDOG_TIMEOUT_MS = 3000L
+
     private fun runDecodeLoop(holder: SurfaceHolder, input: BufferedAccessoryInput, out: DataOutputStream) {
         var codec: MediaCodec? = null
+        val lastDataAtMs = java.util.concurrent.atomic.AtomicLong(System.currentTimeMillis())
+        val watchdogRunning = java.util.concurrent.atomic.AtomicBoolean(true)
+        val watchdogThread = Thread {
+            while (watchdogRunning.get()) {
+                if (System.currentTimeMillis() - lastDataAtMs.get() > WATCHDOG_TIMEOUT_MS) {
+                    Log.w(tag, "no data for ${WATCHDOG_TIMEOUT_MS}ms, forcing reconnect")
+                    input.close()
+                    return@Thread
+                }
+                try {
+                    Thread.sleep(500)
+                } catch (e: InterruptedException) {
+                    return@Thread
+                }
+            }
+        }.also { it.start() }
         try {
             run {
                 output = out
                 sendHandshake(out)
                 val clockOffsetMs = readClockOffset(input)
                 val (width, height) = readVideoFormat(input)
+                lastDataAtMs.set(System.currentTimeMillis())
                 inputWriterThread = Thread { runInputWriterLoop(out) }.also { it.start() }
 
                 // Diagnostic: enumerate every AVC decoder this device offers,
@@ -531,9 +682,18 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                         break
                     }
                     val length = input.readInt()
-                    if (length <= 0 || length > 16 * 1024 * 1024) {
+                    if (length > 16 * 1024 * 1024) {
                         Log.w(tag, "bogus frame length $length, stopping")
                         break
+                    }
+                    lastDataAtMs.set(System.currentTimeMillis())
+                    if (length == 0) {
+                        // Heartbeat (portal_capture.rs's run_capture, ~800ms
+                        // interval) -- no payload, just proof the daemon is
+                        // still alive during a legitimately idle screen
+                        // (no motion = no new video frames at all,
+                        // expected). Nothing to decode, just keep looping.
+                        continue
                     }
                     val frameBytes = input.readExact(length)
 
@@ -560,6 +720,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                             outIndex >= 0 -> {
                                 codec!!.releaseOutputBuffer(outIndex, true)
                                 renderedCount++
+                                if (renderedCount == 1L) hideStatus()
                                 // Milestone 7 fix: match this render to the
                                 // send-timestamp of the frame that actually
                                 // fed it (FIFO, oldest pending), not
@@ -602,6 +763,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         } catch (e: Exception) {
             Log.e(tag, "decode loop error", e)
         } finally {
+            watchdogRunning.set(false)
+            watchdogThread.interrupt()
             codec?.stop()
             codec?.release()
             output = null

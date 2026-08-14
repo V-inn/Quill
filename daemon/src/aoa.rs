@@ -43,7 +43,19 @@ const VERSION: &str = "1.0";
 // much longer. Writes don't have this problem -- if nobody's reading,
 // failing reasonably fast is fine (and is what actually happened safely).
 const READ_TIMEOUT: Duration = Duration::from_secs(90);
-const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+// Tightened from 5s: confirmed live, a stale write (old daemon process
+// still mid-write when the Android app reopens its accessory after a
+// relaunch) sat blocked for the full timeout before this process noticed
+// and exited -- during that window the app's fresh handshake read landed
+// on leftover video-frame bytes instead of the real reply, corrupting the
+// new session (garbage clock-offset, garbage video-format header,
+// immediate crash). 2s is still far more generous than any real frame
+// write needs (steady-state frames go out every ~15-30ms) while cutting
+// that race window roughly in half; the real fix is the Android side now
+// retrying instead of requiring a second manual relaunch (see
+// MainActivity.kt's surfaceCreated), this just shrinks how often the
+// corruption happens in the first place.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
 const REENUMERATE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -228,6 +240,18 @@ fn try_open_accessory() -> Option<AoaTransport> {
         if handle.claim_interface(interface_num).is_err() {
             continue;
         }
+
+        // Flush any stale queued data left over from a previous session --
+        // confirmed live, reconnecting (daemon restart, app relaunch, or
+        // both) without this intermittently corrupted the fresh session's
+        // very first handshake read/write with leftover bytes from the
+        // prior connection (garbage clock-offset, garbage capability
+        // handshake, "Invalid argument" on uinput tablet creation from
+        // nonsense pressure/tilt ranges). Claiming the interface fresh
+        // doesn't by itself guarantee the endpoints are clear -- clearing
+        // the halt/data-toggle state on both bulk endpoints does.
+        let _ = handle.clear_halt(ep_in);
+        let _ = handle.clear_halt(ep_out);
 
         eprintln!(
             "[aoa] connected: bus {} addr {}, interface {interface_num}, bulk in=0x{ep_in:02x} out=0x{ep_out:02x}",

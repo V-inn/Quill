@@ -156,7 +156,12 @@ struct CaptureData {
     format: spa::param::video::VideoInfoRaw,
     encoder: Option<VaapiEncoder>,
     out_file: File,
-    transport: Option<TransportWriter>,
+    // Shared with the outer main loop (see run_capture's heartbeat check)
+    // rather than owned outright -- both need to write to the same
+    // transport, and the heartbeat needs to fire even when this stream's
+    // own process() callback isn't (a legitimately idle screen produces no
+    // new pipewire buffers at all, so nothing here would ever run).
+    transport: Rc<RefCell<Option<TransportWriter>>>,
     stats: Rc<RefCell<CaptureStats>>,
 }
 
@@ -282,13 +287,13 @@ pub fn run_capture(
     crate::set_up_sigint_handler();
 
     let out_file = File::create(out_path).expect("create output file");
-    let transport = setup_transport(transport_config, remote_input);
+    let transport = Rc::new(RefCell::new(setup_transport(transport_config, remote_input)));
     let stats = Rc::new(RefCell::new(CaptureStats::default()));
     let data = CaptureData {
         format: Default::default(),
         encoder: None,
         out_file,
-        transport,
+        transport: transport.clone(),
         stats: stats.clone(),
     };
 
@@ -347,7 +352,7 @@ pub fn run_capture(
             // Sent once, right after the clock-sync reply and before any
             // video frame, so the client can size its decoder correctly
             // before the first frame arrives.
-            if let Some(sock) = user_data.transport.as_mut() {
+            if let Some(sock) = user_data.transport.borrow_mut().as_mut() {
                 let mut header = Vec::with_capacity(8);
                 header.extend_from_slice(&width.to_be_bytes());
                 header.extend_from_slice(&height.to_be_bytes());
@@ -513,7 +518,7 @@ pub fn run_capture(
                     }
                     drop(stats);
                     let _ = user_data.out_file.write_all(&encoded);
-                    if let Some(sock) = user_data.transport.as_mut() {
+                    if let Some(sock) = user_data.transport.borrow_mut().as_mut() {
                         // Milestone 7: prefix every frame with the daemon's
                         // send time (its own clock) so Android can compute a
                         // per-frame latency estimate using the offset from
@@ -619,8 +624,33 @@ pub fn run_capture(
 
     eprintln!("[pipewire] connected, running (Ctrl+C to stop)...");
     let loop_ = mainloop.loop_();
+    // Confirmed live: a genuinely idle screen produces zero new pipewire
+    // buffers at all (expected -- see MILESTONES.md), so process() above
+    // never runs and nothing gets written to the transport for as long as
+    // that lasts. On the Android side, a plain blocking read has no way to
+    // tell "still connected, just idle" apart from "peer died without the
+    // USB transport itself signaling an error" (confirmed live: it
+    // doesn't, reliably) -- it just hangs forever with no exception, frozen
+    // on the last frame. This periodic heartbeat (a frame with length=0,
+    // MainActivity.kt's per-frame read loop already special-cases it) gives
+    // the Android-side watchdog something to time out against that's
+    // distinct from a legitimate idle stretch.
+    const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(800);
+    let mut last_heartbeat = Instant::now();
     while !crate::sigint_received() {
         loop_.iterate(pw::loop_::Timeout::Finite(Duration::from_millis(100)));
+        if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
+            last_heartbeat = Instant::now();
+            if let Some(sock) = transport.borrow_mut().as_mut() {
+                let mut hb = Vec::with_capacity(12);
+                hb.extend_from_slice(&crate::clock_sync::now_millis().to_be_bytes());
+                hb.extend_from_slice(&0u32.to_be_bytes());
+                if let Err(e) = sock.write_all(&hb) {
+                    eprintln!("[transport] heartbeat write failed ({e}), exiting so systemd can retry");
+                    std::process::exit(1);
+                }
+            }
+        }
     }
     eprintln!("[pipewire] SIGINT received, stopping...");
 

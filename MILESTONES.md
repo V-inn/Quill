@@ -1227,3 +1227,64 @@ not one:
   needs its own research pass (does mutter expose any virtual-output mechanism at all,
   stable or not; would a different approach be needed entirely) before any code gets
   written -- not started.
+
+## 11. (Partially fixed) Reconnect robustness
+
+User reported two related bugs live: reopening the app while the daemon was already
+connected didn't reconnect, and restarting the daemon while the app was open broke it
+the same way -- both needed a full manual app relaunch (and often a cable replug) to
+recover, no matter which side came back first.
+
+**Root-caused three distinct, stacked bugs, fixed the first two cleanly:**
+
+1. **The app never retried at all.** `runAoaDecodeLoop`/`runAdbForwardDecodeLoop` ran
+   once per `surfaceCreated`; any disconnect just ended the decode thread silently.
+   Fixed: `surfaceCreated` now loops indefinitely, re-checking
+   `alreadyAttachedAccessory()` fresh each attempt, with a 1s retry delay and a
+   try/catch around the whole attempt (an uncaught exception outside `runDecodeLoop`'s
+   own try/catch -- confirmed live, `openAccessory()` itself can throw -- was silently
+   killing the retry loop for good, worse than the bug it was fixing).
+2. **No visible feedback.** Confirmed live: even with the retry loop working, a stuck
+   connection just showed a black or frozen screen with no indication anything was
+   wrong or what to do about it. Added a status overlay ("Waiting for connection...",
+   escalating to "...unplug and replug the USB cable" after the first failed attempt),
+   hidden only once the first real frame actually renders -- the user's own suggested
+   fix, simpler and more honest than chasing a fully invisible auto-reconnect.
+3. **A plain blocking read has no timeout.** Confirmed live: when the daemon dies
+   without the USB transport itself signaling an error (it doesn't, reliably), Android's
+   `InputStream.read()` just hangs forever -- frozen on the last frame, no exception, so
+   the retry loop above never even got a chance to fire. Fixed with a daemon-side
+   heartbeat (a zero-length "frame" sent every ~800ms whenever no real video frame went
+   out, so a legitimately idle screen -- no motion, no new PipeWire buffers at all,
+   expected -- doesn't get mistaken for a dead connection) and an Android-side watchdog
+   thread that force-closes the stream after 3s of total silence, unblocking the read
+   with an `IOException` the existing retry machinery already handles.
+4. **Two decode threads racing on the same connection.** Confirmed live: `am start` on
+   an already-running single-instance activity doesn't spawn a fresh process, it just
+   resumes the existing one -- re-firing `surfaceCreated()` without the old (now
+   long-lived, retrying) decode thread ever having been told to stop. Fixed:
+   `surfaceCreated` now interrupts and joins any previous `decodeThread` (2s bound)
+   before starting a new one.
+5. **Daemon write-timeout tightened 5s -> 2s** (`aoa.rs`) and **`clear_halt()` added on
+   both bulk endpoints right after claiming the interface** -- confirmed live, stale
+   queued USB data from a previous session was intermittently corrupting a fresh
+   session's very first handshake read (garbage clock-offset, garbage capability
+   handshake -- wrong pressure/tilt/coordinate ranges, `uinput` tablet creation failing
+   outright on some reconnects with "Invalid argument"). This measurably shrank the
+   race window but did **not** fully close it.
+
+**Known remaining gap, not resolved this session:** stress-testing with rapid repeated
+daemon restarts (an artificially aggressive test, not representative of real usage --
+a user doesn't restart the daemon every few seconds) still reproduced the handshake
+corruption occasionally even with `clear_halt()` in place (one run logged a garbage
+event type, `type=51`, outside the valid 0-7 range). Video usually keeps working
+through this (its own framing wasn't corrupted that time); input can end up silently
+wrong for that session (nonsense coordinates/pressure, or `uinput` creation failing
+outright) until the next reconnect cycles it out on its own. This is a genuine
+USB-level race -- stale queued bulk-transfer data surviving a reconnect somewhere
+`clear_halt()` doesn't reach -- not a protocol logic bug; closing it further likely
+needs either a full USB device handle close+reopen (not just re-claim) on every
+reconnect, or a resync marker/checksum in the handshake itself so corruption can be
+*detected* and the attempt retried rather than silently accepted. Not attempted this
+session -- a real scoping decision given the size of the fix already shipped, not an
+oversight.
