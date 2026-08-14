@@ -273,6 +273,14 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                     Log.i(tag, "applying Exynos vendor low-latency parameter")
                     format.setInteger("vendor.rtc-ext-dec-low-latency.enable", 1)
                 }
+                // KEY_PRIORITY=0 (realtime) -- another moonlight-android
+                // lever: asks the codec to guarantee real-time performance
+                // rather than optimizing for throughput/power. They gate
+                // KEY_OPERATING_RATE to Qualcomm specifically (official docs
+                // agree: "some Qualcomm platforms"), so not tried here on
+                // this Exynos decoder, but KEY_PRIORITY is applied more
+                // broadly on their side and is worth testing on its own.
+                format.setInteger(MediaFormat.KEY_PRIORITY, 0)
                 codec!!.configure(format, holder.surface, null, 0)
                 codec!!.start()
 

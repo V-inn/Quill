@@ -735,6 +735,29 @@ tablet's ~5-frame decoder pipeline depth increasingly looks like a hardware/firm
 floor not exposed to software configuration at all, at least not through any lever
 tried so far.
 
+**Deeper web search, two more real levers tried, one ruled out on documentation
+alone.** `KEY_OPERATING_RATE=Short.MAX_VALUE`: moonlight-android gates this to
+Qualcomm specifically, and Android's own official docs agree ("can lower latency on
+*some Qualcomm platforms*") — not applicable to this Exynos decoder, not tried live.
+`KEY_PRIORITY=0` (realtime): moonlight applies this more broadly (their fallback for
+non-Qualcomm devices), so tried live here too — confirmed no crash (a real risk
+noted in Android's own docs when combined with an unsatisfiable operating rate, not
+applicable since operating rate wasn't set). **Result: no change** — 90-126ms, same
+`pending=4-5` queue depth as every other condition tested. Also checked whether
+MediaCodec's async callback mode (vs. this app's synchronous dequeue-loop pattern)
+could help: concluded no — async mode only changes how the *client* is notified
+(callback vs. polling), not how many frames the codec *itself* buffers internally
+before emitting output, which is what's actually costing the ~100ms. Not
+implemented, since the reasoning rules it out without needing a live test.
+
+**Five real, researched levers now tried (`KEY_LOW_LATENCY`, Exynos vendor
+parameter, `KEY_PRIORITY`, plus `KEY_OPERATING_RATE` and async mode ruled out on
+solid documentation/reasoning grounds), all converging on the same conclusion: this
+tablet's ~85-115ms decoder pipeline depth is a firmware/silicon floor, not reachable
+from app-level `MediaCodec` configuration.** Stopping the decoder-latency search
+here — further progress would need either a different decoder entirely (unlikely to
+exist on this hardware) or work outside this project's reach (SoC vendor firmware).
+
 ## 8. (Optional v2) AOA transport
 
 Swap adb transport for Android Open Accessory mode, drop the adb dependency entirely.
