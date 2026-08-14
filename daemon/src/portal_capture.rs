@@ -225,6 +225,15 @@ fn setup_transport(config: TransportConfig) -> Option<TransportWriter> {
     // regardless) -- with no peer confirmed ready, video bytes would just
     // corrupt whatever the real handshake turns out to be once someone
     // finally does connect.
+    // Past this point `config` was guaranteed to be `Aoa` or `TcpForward`
+    // (the `None` case already returned above) -- a real transport was
+    // requested, so a failure here means the daemon is useless as-is, not a
+    // legitimate "run with no client" mode. Exit non-zero rather than
+    // degrading to silently running capture-only forever: confirmed live,
+    // that left the daemon "running" but functionally dead after a USB drop
+    // mid-handshake, and systemd's `Restart=on-failure` (see
+    // `packaging/quill-daemon.service`) never got a chance to retry the AOA
+    // connect because the process never actually exited.
     match clock_rx.recv_timeout(clock_sync_timeout) {
         Ok((android_send_ms, daemon_recv_ms)) => {
             let daemon_send_ms = crate::clock_sync::now_millis();
@@ -234,12 +243,12 @@ fn setup_transport(config: TransportConfig) -> Option<TransportWriter> {
             reply.extend_from_slice(&daemon_recv_ms.to_be_bytes());
             if let Err(e) = writer.write_all(&reply) {
                 eprintln!("[clock-sync] failed to send calibration reply: {e}");
-                return None;
+                std::process::exit(1);
             }
         }
         Err(e) => {
-            eprintln!("[clock-sync] never received clock ping: {e} -- not streaming, no confirmed peer");
-            return None;
+            eprintln!("[clock-sync] never received clock ping: {e} -- exiting so systemd can retry");
+            std::process::exit(1);
         }
     }
 
@@ -339,8 +348,8 @@ pub fn run_capture(
                 header.extend_from_slice(&width.to_be_bytes());
                 header.extend_from_slice(&height.to_be_bytes());
                 if let Err(e) = sock.write_all(&header) {
-                    eprintln!("[transport] failed to send video format header: {e}");
-                    user_data.transport = None;
+                    eprintln!("[transport] failed to send video format header ({e}), exiting so systemd can retry");
+                    std::process::exit(1);
                 }
             }
         })
@@ -517,8 +526,24 @@ pub fn run_capture(
                         frame_buf.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
                         frame_buf.extend_from_slice(&encoded);
                         if let Err(e) = sock.write_all(&frame_buf) {
-                            eprintln!("[transport] write failed ({e}), dropping connection");
-                            user_data.transport = None;
+                            // Same reasoning as the two startup failure paths
+                            // in `setup_transport`: this closure only runs
+                            // with `Some(sock)` in the first place when a
+                            // real transport connected successfully, so a
+                            // write failure here means a mid-session drop
+                            // (app force-stopped/relaunched, USB unplugged,
+                            // etc.), not `TransportConfig::None`'s
+                            // legitimate no-client mode. Previously this just
+                            // set `transport = None` and kept running --
+                            // confirmed live, that left the daemon "running"
+                            // but permanently unable to reconnect (the AOA
+                            // USB interface claim and the input thread's read
+                            // half are both already gone, a relaunched
+                            // Android app has nothing to talk to). Exiting
+                            // lets systemd's `Restart=on-failure` re-run the
+                            // whole connect sequence from scratch instead.
+                            eprintln!("[transport] write failed ({e}), exiting so systemd can retry");
+                            std::process::exit(1);
                         }
                     }
                 }

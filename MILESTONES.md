@@ -1148,6 +1148,53 @@ propagate normally. Confirmed live: input survives idle periods now, both pen an
 finger events flowing correctly (`[input] event 600: type=1 ...`) well past the
 90s mark.
 
+### Auto-launch follow-up: surviving a USB drop/reconnect
+
+Found live: a tablet USB cable drop (loose connection, screen off, whatever) left
+the auto-launched daemon "running" but functionally dead -- the AOA handshake read
+failed, `setup_transport` logged the failure and returned `None` for the transport,
+and the daemon just carried on capturing forever with no client and no way to
+reconnect. Since the process never exited, `systemd`'s `Restart=on-failure` (see
+`packaging/quill-daemon.service`) never got a chance to fire, and the udev rule's
+`SYSTEMD_USER_WANTS` on the tablet reappearing was a no-op against an
+already-"active" unit. Only a manual `systemctl --user restart` recovered it.
+
+First fix -- `setup_transport`'s two post-connection failure paths (clock-sync
+reply write failure, and the clock-sync ping never arriving) now call
+`std::process::exit(1)` instead of returning `None`, once past the point where
+`TransportConfig::None` (the legitimate no-client debug mode) was ruled out. Rebuilt
+and tested the exact live scenario: daemon waiting for the handshake, unplugged and
+replugged the cable mid-wait. Confirmed the process now exits cleanly on the drop
+(`AOA bulk read: No such device`) -- but the very next systemd-triggered restart
+immediately failed too (`no AOA-capable USB device found`), because
+`aoa::connect()`'s initial device scan was a single instant attempt with no retry,
+and the tablet hadn't finished re-enumerating as MTP yet by the time the restart
+fired barely a second later. Three such retries in quick succession burned through
+`StartLimitBurst`, and the unit ended up permanently `failed` -- worse than the
+original bug, needing a manual `systemctl --user reset-failed` to recover.
+
+Second fix -- wrapped `connect()`'s initial device scan in a 20-second bounded
+retry (500ms poll interval) instead of scanning once and failing immediately,
+absorbing the few seconds a real replug takes to re-enumerate internally rather
+than relying on systemd's restart cadence to paper over it. Re-tested the identical
+drop/replug live: daemon exited on the drop, systemd restarted it once
+(`RestartSec=2`), the retrying scan found the tablet a few seconds later, and the
+full handshake/stream came back up on its own -- no crash loop, no manual
+intervention, unit never entered `failed` state.
+
+Third fix, found immediately after: the first two fixes only covered failures
+*before* streaming starts. Re-testing by force-stopping and relaunching the Android
+app mid-session (daemon already streaming) hit the exact same zombie state again --
+the frame-write and video-format-header write failure paths still just set
+`transport = None` and kept the process running forever, unable to reconnect (the
+AOA USB interface claim and the input thread's read half are both already gone by
+that point; a relaunched app has nothing left to talk to). Same fix, same
+reasoning: both now `std::process::exit(1)` instead of degrading silently.
+Confirmed live: force-stopped and reopened the app against an already-streaming
+daemon, the write failure now exits the process, systemd restarts it, and the app
+reconnects on its own -- no manual `systemctl restart` needed at any point in the
+whole plug-in-to-video chain anymore, mid-session drops included.
+
 ## 9. (Not started) Multi-touch gestures
 
 Pinch-to-zoom, two-finger scroll, and similar — deferred from the Milestone 6b finger

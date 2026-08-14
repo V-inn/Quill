@@ -104,54 +104,78 @@ fn send_string(
 /// (matches the project's no-hardcoding rule: any AOA-capable Android
 /// device should work here unmodified).
 pub fn connect() -> Result<AoaTransport, String> {
-    // Already switched from a previous run (device stays in accessory mode
-    // across daemon restarts until physically replugged) -- use it
-    // directly instead of trying the switch handshake again, which a
-    // device already in accessory mode won't answer the same way.
-    if let Some(t) = try_open_accessory() {
-        eprintln!("[aoa] device already in accessory mode, reusing it");
-        return Ok(t);
-    }
+    // Bounded retry, not a single instant scan-and-fail: confirmed live,
+    // this matters. A USB replug takes the tablet a few seconds to work
+    // through disconnect -> re-enumerate-as-MTP before it's visible here at
+    // all, and now that a failed connect() is fatal (see `setup_transport`
+    // in portal_capture.rs -- exits so systemd can retry, rather than
+    // silently running forever with a dead transport), an instant failure
+    // right after a replug raced systemd's restart against the tablet still
+    // mid-enumeration, burned through `StartLimitBurst` in a few hundred
+    // milliseconds, and left the unit permanently `failed`, needing a
+    // manual `systemctl --user reset-failed`. Retrying the scan here for a
+    // while first absorbs that normal enumeration delay internally instead
+    // of turning it into a crash loop.
+    const DEVICE_SCAN_TIMEOUT: Duration = Duration::from_secs(20);
+    let scan_deadline = Instant::now() + DEVICE_SCAN_TIMEOUT;
 
-    let devices = rusb::devices().map_err(|e| format!("rusb::devices: {e}"))?;
-
-    let mut switched_any = false;
-    for device in devices.iter() {
-        let Ok(handle) = device.open() else { continue };
-
-        let mut protocol_buf = [0u8; 2];
-        let protocol = handle.read_control(0xC0, ACCESSORY_GET_PROTOCOL, 0, 0, &mut protocol_buf, CONTROL_TIMEOUT);
-        let Ok(n) = protocol else { continue };
-        if n != 2 {
-            continue;
+    loop {
+        // Already switched from a previous run (device stays in accessory
+        // mode across daemon restarts until physically replugged) -- use it
+        // directly instead of trying the switch handshake again, which a
+        // device already in accessory mode won't answer the same way.
+        if let Some(t) = try_open_accessory() {
+            eprintln!("[aoa] device already in accessory mode, reusing it");
+            return Ok(t);
         }
-        let version = u16::from_le_bytes(protocol_buf);
-        if version == 0 {
-            continue; // doesn't support AOA
+
+        let devices = rusb::devices().map_err(|e| format!("rusb::devices: {e}"))?;
+
+        let mut switched_any = false;
+        for device in devices.iter() {
+            let Ok(handle) = device.open() else { continue };
+
+            let mut protocol_buf = [0u8; 2];
+            let protocol = handle.read_control(0xC0, ACCESSORY_GET_PROTOCOL, 0, 0, &mut protocol_buf, CONTROL_TIMEOUT);
+            let Ok(n) = protocol else { continue };
+            if n != 2 {
+                continue;
+            }
+            let version = u16::from_le_bytes(protocol_buf);
+            if version == 0 {
+                continue; // doesn't support AOA
+            }
+            eprintln!(
+                "[aoa] found AOA-capable device (protocol v{version}) at bus {} addr {}, switching to accessory mode...",
+                device.bus_number(),
+                device.address()
+            );
+
+            send_string(&handle, 0, MANUFACTURER).map_err(|e| format!("send manufacturer: {e}"))?;
+            send_string(&handle, 1, MODEL).map_err(|e| format!("send model: {e}"))?;
+            send_string(&handle, 2, DESCRIPTION).map_err(|e| format!("send description: {e}"))?;
+            send_string(&handle, 3, VERSION).map_err(|e| format!("send version: {e}"))?;
+            send_string(&handle, 4, "").map_err(|e| format!("send uri: {e}"))?;
+            send_string(&handle, 5, "").map_err(|e| format!("send serial: {e}"))?;
+
+            handle
+                .write_control(0x40, ACCESSORY_START, 0, 0, &[], CONTROL_TIMEOUT)
+                .map_err(|e| format!("ACCESSORY_START: {e}"))?;
+
+            switched_any = true;
+            break;
         }
-        eprintln!(
-            "[aoa] found AOA-capable device (protocol v{version}) at bus {} addr {}, switching to accessory mode...",
-            device.bus_number(),
-            device.address()
-        );
 
-        send_string(&handle, 0, MANUFACTURER).map_err(|e| format!("send manufacturer: {e}"))?;
-        send_string(&handle, 1, MODEL).map_err(|e| format!("send model: {e}"))?;
-        send_string(&handle, 2, DESCRIPTION).map_err(|e| format!("send description: {e}"))?;
-        send_string(&handle, 3, VERSION).map_err(|e| format!("send version: {e}"))?;
-        send_string(&handle, 4, "").map_err(|e| format!("send uri: {e}"))?;
-        send_string(&handle, 5, "").map_err(|e| format!("send serial: {e}"))?;
+        if switched_any {
+            break;
+        }
 
-        handle
-            .write_control(0x40, ACCESSORY_START, 0, 0, &[], CONTROL_TIMEOUT)
-            .map_err(|e| format!("ACCESSORY_START: {e}"))?;
-
-        switched_any = true;
-        break;
-    }
-
-    if !switched_any {
-        return Err("no AOA-capable USB device found (is the tablet connected and USB debugging/accessory mode available?)".into());
+        if Instant::now() > scan_deadline {
+            return Err(format!(
+                "no AOA-capable USB device found within {DEVICE_SCAN_TIMEOUT:?} (is the tablet connected and USB debugging/accessory mode available?)"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(500));
     }
 
     eprintln!("[aoa] waiting for device to re-enumerate as an accessory...");
