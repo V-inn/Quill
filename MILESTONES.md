@@ -1349,29 +1349,34 @@ unlikely given the artifact's clean, correctly-shaped appearance (typical transp
 corruption shows as block/macroblock artifacts, not two intact icons) -- not
 pursued further this session.
 
-## 13. Reverted attempt: automatic virtual-monitor sizing regressed FPS and display mode
+## 13. Reverted attempt: automatic virtual-monitor sizing regressed FPS
 
 User asked why the tablet's display always showed as 1920x1080 in system
 settings, when it should be bigger. Tried teaching the daemon to
 create/resize the `krfb-virtualmonitor` output itself from the capability
 handshake's real panel resolution, before ever opening the portal, instead
 of relying on the hand-picked `--resolution` the project's test setup
-happened to start it with. Landed as a commit, then live-tested and found to
-regress two things at once: the display dropped from a smooth ~60fps to a
-laggy sub-10fps, and the tablet fell back to mirroring the primary display
-instead of extending it -- most likely because forcibly tearing down and
-recreating the KWin output on every daemon launch knocked the compositor out
-of whatever stable extended-output state it had settled into, onto a
-slower mirrored/software path. It also didn't end up fixing the original
-1920x1080-stuck complaint it was written for. Net negative on every axis, so
-reverted outright (`git reset` back to the prior commit) rather than kept
-around and patched -- the code is gone, not just disabled.
+happened to start it with. Landed as a commit, then live-tested and found it
+dropped the display from a smooth ~60fps to a laggy sub-10fps -- most likely
+because forcibly tearing down and recreating the KWin output on every daemon
+launch knocked the compositor out of whatever stable state it had settled
+into, onto a slower path. It also didn't end up fixing the original
+1920x1080-stuck complaint it was written for. Net negative, so reverted
+outright (`git reset` back to the prior commit) rather than kept around and
+patched -- the code is gone, not just disabled.
 
 Confirmed via `git bisect` against real hardware (FPS is only observable by
 eye on the tablet, not from daemon logs -- encode-side timings looked fine,
 ~6-10ms/frame, even while the actual display was laggy, so the regression is
 downstream of the daemon's own encode pipeline, somewhere in the
-KWin/portal/compositor path the virtual-monitor recreation touches).
+KWin/portal/compositor path the virtual-monitor recreation touches). Live
+re-test after the revert confirmed the fix: back to a smooth 60fps.
+
+The tablet also shows as mirroring the primary display rather than
+extending it -- initially suspected as a second regression from this same
+commit, but the post-revert re-test still shows mirroring, so it's a
+separate, pre-existing issue unrelated to virtual-monitor sizing. Not
+investigated further this session.
 
 **Worth keeping despite the revert: a real, still-unfixed bug was found
 during that work.** Manually running `quill` while the systemd auto-launch
