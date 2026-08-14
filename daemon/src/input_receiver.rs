@@ -25,7 +25,10 @@
 //!   i32 pressure
 //!   i32 tilt_x_deg
 //!   i32 tilt_y_deg
-//!   u8  buttons      (bit0 = stylus primary button)
+//!   u8  buttons      (bit0 = stylus primary button state, informational --
+//!                     the actual BTN_STYLUS toggle is driven by the
+//!                     explicit button_down/button_up event types, not this
+//!                     bit; bit1 = tool is a finger, not the S Pen)
 
 use crate::uinput_tablet::{TabletRanges, UinputTablet};
 use std::io::{self, Read};
@@ -158,15 +161,13 @@ pub fn run(mut stream: TcpStream, clock_tx: Sender<(i64, i64)>) {
             Ok(v) => v,
             Err(_) => break,
         };
-        let _buttons = match read_u8(&mut stream) {
+        let buttons = match read_u8(&mut stream) {
             Ok(v) => v,
             Err(_) => break,
         };
+        let is_finger = buttons & 0b10 != 0;
 
         let in_contact = matches!(event_type, EV_DOWN | EV_MOVE);
-        // Button events carry no fresh position; re-emit the last known
-        // pose is out of scope for v0 -- just forward position/pressure/
-        // tilt as given, contact state derived from the event type.
         if matches!(
             event_type,
             EV_HOVER_ENTER | EV_HOVER_MOVE | EV_HOVER_EXIT | EV_DOWN | EV_MOVE | EV_UP
@@ -174,16 +175,16 @@ pub fn run(mut stream: TcpStream, clock_tx: Sender<(i64, i64)>) {
             if let Err(e) = tablet.emit(x, y, pressure.max(0), tilt_x, tilt_y, in_contact) {
                 eprintln!("[input] emit failed: {e}");
             }
+        } else if matches!(event_type, EV_BUTTON_DOWN | EV_BUTTON_UP) {
+            if let Err(e) = tablet.set_button(event_type == EV_BUTTON_DOWN) {
+                eprintln!("[input] set_button failed: {e}");
+            }
         }
-        // EV_BUTTON_DOWN/UP (S Pen side button) handling is a real gap for
-        // v0: BTN_STYLUS is declared on the device but this loop doesn't
-        // toggle it yet. Noted as follow-up, not blocking the core
-        // pen-tracking path.
 
         event_count += 1;
         if event_count == 1 || event_count % 100 == 0 {
             eprintln!(
-                "[input] event {event_count}: type={event_type} x={x} y={y} pressure={pressure}"
+                "[input] event {event_count}: type={event_type} x={x} y={y} pressure={pressure} finger={is_finger}"
             );
         }
     }

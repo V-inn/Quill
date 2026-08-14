@@ -445,6 +445,56 @@ drawn on the tablet appearing correctly in GIMP on the virtual monitor.
 but the receive loop doesn't act on them yet — declared as dead code, flagged as a
 follow-up rather than part of this milestone's exit criteria.
 
+### 6b. Follow-up — S Pen side button + finger click/drag — DONE
+
+**S Pen side button.** `uinput_tablet.rs` gained `set_button()`: an independent,
+edge-triggered `BTN_STYLUS` toggle decoupled from position updates (side button state
+can change while hovering or drawing, unrelated to x/y). `input_receiver.rs`'s receive
+loop now actually acts on `EV_BUTTON_DOWN`/`EV_BUTTON_UP` instead of ignoring them.
+Android side: first tried `MotionEvent.ACTION_BUTTON_PRESS`/`ACTION_BUTTON_RELEASE`
+(added a `setOnGenericMotionListener`, since those actions arrive via the
+generic-motion stream, not touch or hover — confirmed Android dispatches touch/
+hover/other-generic-motion as three disjoint per-event paths, so all three listeners
+coexist safely with no double-processing). **Live-tested: no effect at all.** Switched
+to a more robust approach — diff `event.buttonState and MotionEvent.BUTTON_STYLUS_PRIMARY`
+on *every* event instead of trusting a dedicated action to ever fire, since some
+digitizers (this Samsung EMR pen, `sec_e-pen`, apparently included) only ever fold the
+button bit into regular move/hover events rather than synthesizing a standalone
+button action. Live-tested again: **works.**
+
+**Finger click/drag — a real multi-step debugging arc.** Initial attempt added a
+distinct `BTN_TOOL_FINGER` proximity path (real Wacom hardware distinguishes pen vs.
+finger this way) alongside skipping the pressure/tilt axes for finger touches (not
+meaningful for a finger). Live-tested: Android correctly captured and sent full finger
+down/move/up sequences (confirmed via a temporary unconditional diagnostic log, `adb
+logcat`), the daemon received them and called `emit()` with no errors (confirmed via a
+matching daemon-side diagnostic) — but nothing moved on screen. Root-caused to
+`BTN_TOOL_FINGER` itself: it's also the standard capability bit real touchpads use, and
+it's plausible libinput reclassified this device into touchpad (relative-motion)
+semantics for finger-tagged events instead of tablet (absolute-positioning) ones — the
+`BTN_TOOL_PEN` path is the one already confirmed working (Milestone 5), so **reverted
+finger touches to report via `BTN_TOOL_PEN` too**, same as the pen.
+
+Live-tested again: cursor still didn't move. The only remaining structural difference
+between the confirmed-working pen path and the finger path was skipping the
+pressure/tilt axis writes — tried always sending them (pressure pinned to whatever
+Android computed, ~max for a finger's default ~1.0 pressure reading; tilt to 0).
+**This fixed cursor movement** — apparently this device's tablet-tool motion handling
+in libinput gates on nonzero `ABS_PRESSURE`, not just `BTN_TOUCH`, undocumented but
+confirmed empirically. One bug remained: touch never released (pointer stuck "down").
+Root cause: `ABS_PRESSURE` was carrying whatever value came in on the release event
+(not necessarily 0), and a stale nonzero pressure at release apparently keeps libinput
+thinking contact is still active independent of `BTN_TOUCH`. **Fix:** `emit()` now
+forces `ABS_PRESSURE` to exactly 0 whenever `in_contact` is false, regardless of what's
+passed in. Live-tested: **tap, click, and drag all confirmed working.**
+
+**Not attempted, explicitly deferred (user's own scoping):** multi-touch gestures —
+pinch-to-zoom, two-finger scroll, and similar. These need a genuinely different device
+model (the current protocol and uinput device are single-pointer only, one x/y per
+event) — likely a real multitouch protocol (`ABS_MT_*` slots) or OS-level gesture
+recognition, not a small extension of the current single-touch path. Worth its own
+milestone later, not a follow-up to this one.
+
 ## 7. Tuning pass — PAUSED (real progress, not fully closed)
 
 Encoder settings, buffer sizes, thread priorities to cut jitter. Three concrete items
@@ -569,3 +619,9 @@ picks this back up.
 ## 8. (Optional v2) AOA transport
 
 Swap adb transport for Android Open Accessory mode, drop the adb dependency entirely.
+
+## 9. (Not started) Multi-touch gestures
+
+Pinch-to-zoom, two-finger scroll, and similar — deferred from the Milestone 6b finger
+click/drag follow-up (see there for why: needs a real multitouch device model, not a
+small extension of the current single-pointer protocol).

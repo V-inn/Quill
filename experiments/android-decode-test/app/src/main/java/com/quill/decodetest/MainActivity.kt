@@ -65,6 +65,12 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         surfaceView.holder.addCallback(this)
         surfaceView.setOnTouchListener { _, event -> handleMotionEvent(event, down = true) }
         surfaceView.setOnHoverListener { _, event -> handleMotionEvent(event, down = false) }
+        // ACTION_BUTTON_PRESS/RELEASE (S Pen side button) arrive via the
+        // generic-motion stream, not the touch or hover stream -- Android
+        // dispatches touch/hover/other-generic-motion as three disjoint
+        // paths per MotionEvent, so all three listeners coexist safely with
+        // no double-processing of the same event.
+        surfaceView.setOnGenericMotionListener { _, event -> handleMotionEvent(event, down = false) }
     }
 
     override fun surfaceCreated(holder: SurfaceHolder) {
@@ -97,10 +103,26 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         return tiltX to tiltY
     }
 
+    // Diffed on every event rather than trusting ACTION_BUTTON_PRESS/RELEASE
+    // to ever fire on their own -- some digitizers only ever expose the
+    // side-button bit via buttonState on regular move/hover events and
+    // never synthesize a standalone button action. UI-thread only, no
+    // synchronization needed.
+    private var lastStylusButtonState = false
+
     private fun handleMotionEvent(event: MotionEvent, down: Boolean): Boolean {
         if (output == null) return false
-        val (tiltX, tiltY) = tiltXY(event)
-        val pressureRaw = (event.pressure * pressureMax).roundToInt()
+
+        val stylusButtonNow = event.buttonState and MotionEvent.BUTTON_STYLUS_PRIMARY != 0
+        if (stylusButtonNow != lastStylusButtonState) {
+            lastStylusButtonState = stylusButtonNow
+            eventQueue.offer(
+                PenEvent(
+                    if (stylusButtonNow) EV_BUTTON_DOWN else EV_BUTTON_UP,
+                    event.x.roundToInt(), event.y.roundToInt(), 0, 0, 0, 1
+                )
+            )
+        }
 
         val type: Int = when (event.action) {
             MotionEvent.ACTION_HOVER_ENTER -> EV_HOVER_ENTER
@@ -109,10 +131,21 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             MotionEvent.ACTION_DOWN -> EV_DOWN
             MotionEvent.ACTION_MOVE -> EV_MOVE
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> EV_UP
-            else -> return down // unhandled action, let the view keep default handling
+            else -> return down // button-only or otherwise unhandled action, already handled above
         }
 
-        val buttons = if (event.buttonState and MotionEvent.BUTTON_STYLUS_PRIMARY != 0) 1 else 0
+        val (tiltX, tiltY) = tiltXY(event)
+        val pressureRaw = (event.pressure * pressureMax).roundToInt()
+        val isFinger = event.getToolType(0) == MotionEvent.TOOL_TYPE_FINGER
+        val buttons = (if (stylusButtonNow) 1 else 0) or (if (isFinger) 2 else 0)
+
+        if (isFinger) {
+            // Diagnostic: confirms Android is actually delivering finger
+            // touches to this listener at all (vs. e.g. S Pen palm
+            // rejection suppressing them device-side before we ever see
+            // them).
+            Log.d(tag, "finger event: action=${event.action} at (${event.x}, ${event.y})")
+        }
 
         // Cheap, non-blocking enqueue on the UI thread; the actual socket
         // write happens on inputWriterThread.
@@ -331,5 +364,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         private const val EV_DOWN = 3
         private const val EV_MOVE = 4
         private const val EV_UP = 5
+        private const val EV_BUTTON_DOWN = 6
+        private const val EV_BUTTON_UP = 7
     }
 }
