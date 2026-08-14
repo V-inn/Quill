@@ -1049,6 +1049,51 @@ AOA milestone fully closed out, but the transport itself, the handshake, and the
 input path (S Pen events observed flowing back to the daemon over the same
 connection during this test) are all confirmed working end to end.
 
+### Auto-launch: plug in the tablet, nothing else to do
+
+User asked whether AOA made it possible for the app to trigger the daemon on
+connect. Not directly -- AOA requires the *host* to initiate the accessory-mode
+switch (it sends `ACCESSORY_START`; the device can't put itself into accessory
+mode), so nothing on the USB wire can reach the daemon before the daemon already
+exists and is scanning for it. The actual fix is automating the host side instead,
+which had two real blockers:
+
+1. **The portal ScreenCast dialog.** Every daemon launch popped an interactive
+   "pick your monitor" dialog -- fine for manual testing, a hard blocker for
+   anything unattended. `ashpd` (the portal crate already in use) supports
+   `PersistMode::ExplicitlyRevoked` plus a restore token: `open_portal()`
+   (`portal_capture.rs`) now saves the token xdg-desktop-portal returns after the
+   first successful pick to `~/.config/quill/portal_restore_token`, and passes it
+   back in on every subsequent call. Confirmed live: first run still shows the
+   picker and writes the token file; every run after that goes straight to
+   `[portal] got stream: ...` with no dialog at all. Falls back to a fresh
+   interactive pick if the saved token is ever rejected (revoked, virtual monitor
+   recreated, etc.) rather than failing outright.
+
+2. **Nothing was launching the daemon.** Added a udev rule
+   (`daemon/packaging/99-quill-daemon.rules`) matching Samsung's USB vendor ID
+   (`04e8`, generic across Samsung Android devices in normal MTP mode -- not
+   hardcoded to this one tablet, matches the project's no-hardcoding rule) that
+   tags `SYSTEMD_USER_WANTS+="quill-daemon.service"` -- the standard mechanism for
+   reaching a logged-in user's systemd session from udev's root context, rather
+   than a fragile `su`/`DISPLAY`-guessing script. The user unit
+   (`daemon/packaging/quill-daemon.service`) runs the daemon in AOA mode with
+   `Restart=on-failure`, capped via `StartLimitBurst` so a persistent failure
+   doesn't spin-restart forever.
+
+   First cut hardcoded the repo checkout path (`%h/Projects/Quill/daemon/target/...`)
+   directly in the unit's `ExecStart` -- caught before merging: that only works on
+   this machine, this exact clone location, not portable to anyone else picking up
+   the project. Fixed with `daemon/packaging/install.sh`, which symlinks the built
+   release binary to the checkout-independent `~/.local/bin/quill-daemon` and
+   points the unit there instead -- works regardless of where the repo lives.
+
+**Confirmed live end to end:** tablet unplugged and replugged, with nothing
+manually started beforehand -- portal negotiation skipped the dialog via the saved
+restore token, the daemon auto-launched via the udev rule + systemd user unit, AOA
+handshake completed, and video appeared on the tablet automatically. Full plug-in
+to on-screen-video chain now requires zero manual steps on the host side.
+
 ## 9. (Not started) Multi-touch gestures
 
 Pinch-to-zoom, two-finger scroll, and similar — deferred from the Milestone 6b finger

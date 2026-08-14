@@ -77,23 +77,70 @@ fn decode_latency_barcode(bytes: &[u8], stride: usize) -> Option<u64> {
     Some(value)
 }
 
-/// Negotiates a ScreenCast session via the portal. Triggers KDE's native
-/// screen-picker dialog -- the user must select a monitor and confirm.
+/// Where the portal's restore token (see below) is cached between runs.
+/// Plain `$HOME`-relative path rather than pulling in a `dirs` crate for one
+/// file.
+fn restore_token_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").expect("HOME not set");
+    std::path::Path::new(&home).join(".config/quill/portal_restore_token")
+}
+
+/// Negotiates a ScreenCast session via the portal. First run ever (or after
+/// the token's been revoked/invalidated) triggers KDE's native screen-picker
+/// dialog -- the user selects a monitor and confirms, same as before. Every
+/// run after that reuses the saved `PersistMode::ExplicitlyRevoked` restore
+/// token, so the portal skips the dialog entirely -- required for the daemon
+/// to be auto-launched (e.g. from a udev rule) with no one at the keyboard
+/// to click through it.
 pub async fn open_portal() -> ashpd::Result<(PortalStream, OwnedFd)> {
     let proxy = Screencast::new().await?;
     let session = proxy.create_session().await?;
-    proxy
+
+    let token_path = restore_token_path();
+    let saved_token = std::fs::read_to_string(&token_path).ok();
+
+    let select_result = proxy
         .select_sources(
             &session,
             CursorMode::Embedded, // bake the cursor into frames, simplest for v0
             SourceType::Monitor.into(),
             false,
-            None,
-            PersistMode::DoNot,
+            saved_token.as_deref(),
+            PersistMode::ExplicitlyRevoked,
         )
-        .await?;
+        .await;
+
+    if let (Err(e), Some(_)) = (&select_result, &saved_token) {
+        // Saved token no longer valid (virtual monitor was recreated,
+        // permission revoked, etc.) -- fall back to a fresh interactive
+        // pick rather than failing outright.
+        eprintln!("[portal] saved restore token rejected ({e}), falling back to picker...");
+        let _ = std::fs::remove_file(&token_path);
+        proxy
+            .select_sources(
+                &session,
+                CursorMode::Embedded,
+                SourceType::Monitor.into(),
+                false,
+                None,
+                PersistMode::ExplicitlyRevoked,
+            )
+            .await?;
+    } else {
+        select_result?;
+    }
 
     let response = proxy.start(&session, None).await?.response()?;
+
+    if let Some(token) = response.restore_token() {
+        if let Some(parent) = token_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(e) = std::fs::write(&token_path, token) {
+            eprintln!("[portal] failed to save restore token: {e}");
+        }
+    }
+
     let stream = response
         .streams()
         .first()

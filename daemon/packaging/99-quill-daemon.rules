@@ -1,0 +1,13 @@
+# Auto-launches the Quill daemon (as a systemd --user unit, see
+# quill-daemon.service) whenever a Samsung Android device is plugged in over
+# USB in its normal MTP mode -- i.e. before the daemon's own AOA handshake
+# switches it into accessory mode. Vendor ID 04e8 is Samsung's, not specific
+# to any one device (S9 FE+, S10 FE+, etc. should all match).
+#
+# SYSTEMD_USER_WANTS reaches into the logged-in graphical session's systemd
+# --user instance from udev's root context -- the standard mechanism for
+# this (used by e.g. game controllers, docks), rather than a fragile
+# su/DISPLAY-guessing shell script. Requires the unit to exist at
+# ~/.config/systemd/user/quill-daemon.service and the user session to
+# already be active (or lingering enabled).
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="04e8", ENV{SYSTEMD_USER_WANTS}+="quill-daemon.service", TAG+="systemd"

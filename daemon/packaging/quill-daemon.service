@@ -1,0 +1,12 @@
+[Unit]
+Description=Quill daemon (AOA transport, auto-launched on tablet USB attach)
+# Caps rapid-restart loops if the daemon keeps failing right after launch
+# (e.g. portal token got revoked and no one's at the keyboard to re-pick).
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/quill-daemon %h/.local/share/quill/output.h264 aoa
+Restart=on-failure
+RestartSec=2
