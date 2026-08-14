@@ -43,10 +43,17 @@ pub struct VaapiEncoder {
     height: u32,
     aligned_width: u32,
     aligned_height: u32,
+    // Milestone 16: KWin's rotation property has no effect on what a
+    // krfb-virtualmonitor output's screencast producer actually exports --
+    // confirmed live, toggling it (even via System Settings directly, not
+    // just our own automation) changed kscreen-doctor's reported metadata
+    // but never the captured pixels. VPP's own rotation_state is the
+    // GPU-accelerated place that does work, applied here instead.
+    flip_180: bool,
 }
 
 impl VaapiEncoder {
-    pub fn new(width: u32, height: u32) -> VaResult<Self> {
+    pub fn new(width: u32, height: u32, flip_180: bool) -> VaResult<Self> {
         let render_fd = unsafe {
             libc::open(
                 c"/dev/dri/renderD128".as_ptr(),
@@ -249,6 +256,7 @@ impl VaapiEncoder {
             height,
             aligned_width,
             aligned_height,
+            flip_180,
         })
     }
 
@@ -564,6 +572,7 @@ impl VaapiEncoder {
 
         let mut pipeline_param: ffi::VAProcPipelineParameterBuffer = Default::default();
         pipeline_param.surface = self.src_surface;
+        pipeline_param.rotation_state = if self.flip_180 { ffi::VA_ROTATION_180 } else { ffi::VA_ROTATION_NONE };
 
         let mut pipeline_buf: ffi::VABufferID = 0;
         check(

@@ -1436,3 +1436,83 @@ Milestone 12, not drops), stable ~71-77ms per-frame latency, smooth on the
 tablet by eye. Milestone 7's original hardware-vs-software measurement was
 correct for the resolution it was measured at; it just stopped applying once
 the pipeline started running at 3x the pixel count.
+
+## 15-16. Portrait support: launch-time orientation, two failed attempts, working fix
+
+User asked whether the tablet could be used in portrait instead of landscape.
+Design settled on launch-time-only (not live mid-session rotation, matching
+Milestone 13's lesson that live-reconfiguring an already-open portal/
+PipeWire session is the risky part): the Android app locks
+`requestedOrientation` once in `onCreate` to whatever the tablet's physical
+orientation already is at that moment (manifest changed from hardcoded
+`landscape` to `unspecified` to allow this), and the daemon reads the
+resulting handshake dimensions to configure everything else before ever
+opening the portal.
+
+**Attempt 1 (Milestone 15), reverted: live `kscreen-doctor` rotation of an
+already-created output.** Reordered `main.rs` the same way Milestone 13 did
+(transport connect + handshake wait before the portal call, this time
+justified since Milestone 14 already proved that reordering was never the
+actual cause of the earlier FPS regression), then rotated the existing
+landscape `krfb-virtualmonitor` output via `kscreen-doctor
+output.NAME.rotation.left/none` to match. Looked correct at the KScreen
+metadata level (`kscreen-doctor -j` reported the swapped logical size
+correctly) but broke two different things live: the captured video was
+black except for a cursor trail that never cleared, and tablet touch input
+didn't track the rotated geometry either. Root cause never fully isolated
+at the pixel level, but both symptoms are consistent with the screencast
+capture and libinput's tablet-to-output mapping not actually following a
+runtime rotation transform on this headless output type, even though KWin's
+own bookkeeping says it rotated.
+
+**Attempt 2, working for video: recreate the output at the native
+resolution instead of rotating it.** Landscape had worked flawlessly all
+session because it's always been *created* at its exact real resolution
+from the start (Milestone 10's reverted-then-partially-revived idea, see
+below) -- so portrait got the same treatment: `orientation::ensure()`
+(`daemon/src/orientation.rs`, reusing most of Milestone 13's reverted
+create/resize logic, safe to bring back now that Milestone 14 cleared it of
+the FPS regression) tears down and recreates `krfb-virtualmonitor` at the
+handshake's exact width x height whenever they don't already match, no-op
+otherwise (same restore-token-preservation reasoning as Milestone 13). This
+alone fixed the black-screen/cursor-trail/touch-mapping bugs -- confirmed
+live, clean single connection, zero decoder starvation, correct touch
+tracking.
+
+**Recreate exposed a second, unrelated timing bug: the Android watchdog
+raced the daemon's own setup time.** `krfb-virtualmonitor` teardown+respawn
++ portal renegotiation takes a real ~3-4s, during which no heartbeat exists
+yet (heartbeats only start once PipeWire is actually streaming). The
+Android app's inactivity watchdog (`MainActivity.kt`, `WATCHDOG_TIMEOUT_MS`)
+was sized for the old always-fast landscape path and only tolerated 3000ms
+-- it fired mid-setup, forced a reconnect while the daemon's original
+connection was still legitimately mid-negotiation, and that collision
+produced garbage handshake/video-format reads: the exact same connection-
+reuse framing desync already flagged as unfixed in Milestone 13/14, just
+newly reachable because recreate legitimately takes longer than 3 seconds.
+Fixed by bumping `WATCHDOG_TIMEOUT_MS` to 15000ms, comfortably past
+recreate's worst case.
+
+**180-degree flip for this machine's cable position: KWin rotation is a
+dead end for this output type, full stop.** Live-tested directly (not just
+via this daemon's own automation, but manually through System Settings'
+Display and Monitor panel too): setting `Virtual-QuillDisplay`'s rotation
+to `inverted` or `none` changed `kscreen-doctor -j`'s reported metadata but
+had *zero* effect on what actually got captured -- confirmed by testing
+both settings back to back with no visible difference either time. Real
+monitors get the rotation transform applied at scanout; this headless
+output's screencast producer apparently reads a pre-transform buffer
+regardless. Fixed at the two places that actually touch pixels instead:
+`vaapi_encoder.rs` now takes a `flip_180: bool` and sets
+`VAProcPipelineParameterBuffer.rotation_state = VA_ROTATION_180` in the
+existing GPU color-conversion VPP pass (the struct already had the field --
+`bindgen`'s generated bindings confirmed `VA_ROTATION_180` and
+`rotation_state` exist, no new FFI surface needed), and
+`input_receiver.rs` reflects touch/pen `x,y` (`width - x, height - y`)
+before uinput injection whenever `height > width`, computed independently
+of the encoder's own flip decision (same formula, same handshake dims,
+different thread -- no cross-thread plumbing needed since it's a pure
+function of data each side already has). Both driven by the same
+`height > width` condition, kept in sync without a shared flag. Live-
+confirmed working after this: correct orientation, correct touch tracking,
+smooth.

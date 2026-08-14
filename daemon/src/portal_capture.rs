@@ -155,6 +155,7 @@ pub async fn open_portal() -> ashpd::Result<(PortalStream, OwnedFd)> {
 struct CaptureData {
     format: spa::param::video::VideoInfoRaw,
     encoder: Option<VaapiEncoder>,
+    flip_180: bool,
     out_file: File,
     // Shared with the outer main loop (see run_capture's heartbeat check)
     // rather than owned outright -- both need to write to the same
@@ -167,13 +168,22 @@ struct CaptureData {
 
 /// Connects whichever transport `config` selects, spawns the input-receiver
 /// thread on the read half, runs the Milestone 7 clock-offset calibration
-/// exchange, and returns the write half for video frames -- identical
-/// downstream handling regardless of which transport actually carried the
-/// bytes.
-fn setup_transport(
+/// exchange, and returns the write half for video frames plus the
+/// capability handshake's `(width, height)` -- identical downstream
+/// handling regardless of which transport actually carried the bytes.
+///
+/// Called from `main.rs` *before* any portal negotiation (Milestone 15):
+/// the resulting `(width, height)` is what `orientation::set_rotation`
+/// rotates the `krfb-virtualmonitor` output to match, and that needs to
+/// happen before the portal picker runs so it sees the right-shaped output.
+///
+/// `remote_input_rx`: forwarded as-is to `input_receiver::run` -- see that
+/// function's doc for why the `RemoteDesktop` portal handle can only arrive
+/// later, after this call already returned.
+pub fn setup_transport(
     config: TransportConfig,
-    remote_input: Option<crate::remote_desktop_input::RemoteDesktopInput>,
-) -> Option<TransportWriter> {
+    remote_input_rx: Option<std::sync::mpsc::Receiver<crate::remote_desktop_input::RemoteDesktopInput>>,
+) -> Option<(TransportWriter, u32, u32)> {
     // AOA needs a much longer clock-sync wait than TCP: adb-forward's
     // ServerSocket::accept() already guarantees a connected, ready peer by
     // the time we get here, but AOA's USB_ACCESSORY_ATTACHED flow involves
@@ -222,7 +232,7 @@ fn setup_transport(
     };
 
     let (clock_tx, clock_rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || crate::input_receiver::run(reader, clock_tx, remote_input));
+    std::thread::spawn(move || crate::input_receiver::run(reader, clock_tx, remote_input_rx));
 
     // Milestone 7 clock-offset calibration (see clock_sync.rs) doubles as
     // Milestone 8's "is the peer actually ready" signal: block for the
@@ -242,8 +252,8 @@ fn setup_transport(
     // mid-handshake, and systemd's `Restart=on-failure` (see
     // `packaging/quill-daemon.service`) never got a chance to retry the AOA
     // connect because the process never actually exited.
-    match clock_rx.recv_timeout(clock_sync_timeout) {
-        Ok((android_send_ms, daemon_recv_ms)) => {
+    let (width, height) = match clock_rx.recv_timeout(clock_sync_timeout) {
+        Ok((android_send_ms, daemon_recv_ms, width, height)) => {
             let daemon_send_ms = crate::clock_sync::now_millis();
             let mut reply = Vec::with_capacity(24);
             reply.extend_from_slice(&daemon_send_ms.to_be_bytes());
@@ -253,25 +263,27 @@ fn setup_transport(
                 eprintln!("[clock-sync] failed to send calibration reply: {e}");
                 std::process::exit(1);
             }
+            (width, height)
         }
         Err(e) => {
             eprintln!("[clock-sync] never received clock ping: {e} -- exiting so systemd can retry");
             std::process::exit(1);
         }
-    }
+    };
 
-    Some(writer)
+    Some((writer, width, height))
 }
 
-/// `transport_config`: which transport (if any) carries video frames out to
-/// the Android client and reads S Pen input back, as a 4-byte big-endian
-/// length prefix followed by the frame bytes -- see `TransportConfig`.
+/// `transport`: the already-connected write half from `setup_transport`,
+/// called by `main.rs` before the portal was ever opened (see that
+/// function's doc) -- `None` only for the capture-only diagnostic mode
+/// (`TransportConfig::None`).
 pub fn run_capture(
     node_id: u32,
     fd: OwnedFd,
     out_path: &str,
-    transport_config: TransportConfig,
-    remote_input: Option<crate::remote_desktop_input::RemoteDesktopInput>,
+    transport: Option<TransportWriter>,
+    flip_180: bool,
 ) -> Result<CaptureStats, pw::Error> {
     pw::init();
 
@@ -287,11 +299,12 @@ pub fn run_capture(
     crate::set_up_sigint_handler();
 
     let out_file = File::create(out_path).expect("create output file");
-    let transport = Rc::new(RefCell::new(setup_transport(transport_config, remote_input)));
+    let transport = Rc::new(RefCell::new(transport));
     let stats = Rc::new(RefCell::new(CaptureStats::default()));
     let data = CaptureData {
         format: Default::default(),
         encoder: None,
+        flip_180,
         out_file,
         transport: transport.clone(),
         stats: stats.clone(),
@@ -341,7 +354,7 @@ pub fn run_capture(
                 user_data.format.framerate().denom
             );
 
-            let encoder = VaapiEncoder::new(width, height).expect("VAAPI encoder init failed");
+            let encoder = VaapiEncoder::new(width, height, user_data.flip_180).expect("VAAPI encoder init failed");
             user_data.encoder = Some(encoder);
 
             // Milestone 9 follow-up: the video resolution comes from

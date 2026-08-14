@@ -3,6 +3,7 @@ mod clock_sync;
 mod ffi;
 mod h264_headers;
 mod input_receiver;
+mod orientation;
 mod portal_capture;
 mod remote_desktop_input;
 mod uinput_tablet;
@@ -57,12 +58,35 @@ async fn main() {
     // and remote_desktop_input.rs. The two paths need different,
     // mutually-exclusive portal sessions, so this has to be decided before
     // either one starts, not worked around after the fact.
-    let (stream, fd, remote_input) = if uinput_tablet::uinput_accessible() {
+    let use_uinput = uinput_tablet::uinput_accessible();
+
+    // Connects the transport and blocks for the tablet's capability
+    // handshake *before* any portal call (Milestone 15): the virtual
+    // monitor's rotation needs to match the tablet's aspect before the
+    // portal picker can select it. `remote_input_rx`/`_tx`: only the
+    // RemoteDesktop fallback needs this -- its `RemoteDesktopInput` handle
+    // can't exist until *after* the portal opens, so `input_receiver::run`
+    // blocks on the receiver once it's done with the handshake, and the
+    // sender end gets fed once that portal session negotiates below.
+    let (remote_input_tx, remote_input_rx) =
+        std::sync::mpsc::channel::<remote_desktop_input::RemoteDesktopInput>();
+    let transport_setup =
+        portal_capture::setup_transport(transport_config, if use_uinput { None } else { Some(remote_input_rx) });
+
+    // Portrait needs a 180-degree flip on this machine (USB cable position)
+    // -- applied GPU-side by the encoder and mirrored in the uinput touch
+    // mapping (see vaapi_encoder.rs / input_receiver.rs), not via KWin
+    // rotation, which Milestone 16 found has no effect on this output type
+    // at all.
+    let flip_180 = transport_setup.as_ref().is_some_and(|(_, w, h)| h > w);
+
+    if let Some((_, width, height)) = &transport_setup {
+        orientation::ensure(*width, *height);
+    }
+
+    let (stream, fd) = if use_uinput {
         eprintln!("Opening portal ScreenCast session -- pick the virtual monitor in the dialog...");
-        let (stream, fd) = portal_capture::open_portal()
-            .await
-            .expect("portal negotiation failed");
-        (stream, fd, None)
+        portal_capture::open_portal().await.expect("portal negotiation failed")
     } else {
         eprintln!(
             "[input] /dev/uinput not accessible (no root-granted permission on this machine) \
@@ -72,7 +96,10 @@ async fn main() {
         let (stream, fd, remote_input) = remote_desktop_input::open_portal_with_input()
             .await
             .expect("portal negotiation failed");
-        (stream, fd, Some(remote_input))
+        // Hands off to the input thread, which has been blocked waiting for
+        // this since right after it read the capability handshake above.
+        let _ = remote_input_tx.send(remote_input);
+        (stream, fd)
     };
     let node_id = stream.pipe_wire_node_id();
     eprintln!(
@@ -81,8 +108,9 @@ async fn main() {
         stream.position()
     );
 
-    let stats = portal_capture::run_capture(node_id, fd, &out_path, transport_config, remote_input)
-        .expect("capture failed");
+    let transport = transport_setup.map(|(writer, _, _)| writer);
+    let stats =
+        portal_capture::run_capture(node_id, fd, &out_path, transport, flip_180).expect("capture failed");
 
     if stats.frame_count == 0 {
         println!("No frames captured.");

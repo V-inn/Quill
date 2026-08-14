@@ -2,6 +2,8 @@ package com.quill.decodetest
 
 import android.app.Activity
 import android.content.Intent
+import android.content.pm.ActivityInfo
+import android.content.res.Configuration
 import android.hardware.usb.UsbAccessory
 import android.hardware.usb.UsbManager
 import android.media.MediaCodec
@@ -83,6 +85,18 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Launch-time orientation choice, not live-switchable (MILESTONES.md
+        // Milestone 15): lock to whichever way the tablet is physically
+        // held right now, before any connection/handshake activity starts
+        // below. The manifest's `configChanges` already tells Android not
+        // to recreate this activity on a later physical rotation, so this
+        // lock holds for the whole session -- rotating the tablet after
+        // this point does nothing, by design.
+        requestedOrientation = if (resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT) {
+            ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+        } else {
+            ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+        }
         usbAccessory = accessoryFromIntent(intent) ?: alreadyAttachedAccessory()
         hideSystemBars()
         val surfaceView = SurfaceView(this)
@@ -572,7 +586,18 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     // false-positiving during a legitimately idle screen (no motion = no
     // new video frames at all, expected -- see MILESTONES.md) -- the
     // timeout here just needs to be comfortably longer than that interval.
-    private val WATCHDOG_TIMEOUT_MS = 3000L
+    //
+    // Confirmed live (MILESTONES.md, Milestone 16): 3000ms was too tight
+    // once orientation::ensure() (daemon side) could recreate the virtual
+    // monitor -- a real ~3-4s of silence before the portal/heartbeat loop
+    // even starts, since no heartbeat exists until PipeWire is actually
+    // streaming. The watchdog firing mid-setup forced a reconnect that
+    // raced the daemon's still-in-progress connection, producing garbage
+    // handshake/video-format reads (the same connection-reuse framing
+    // desync already flagged elsewhere in MILESTONES.md) instead of a
+    // clean retry. Bumped well past worst-case recreate time (teardown
+    // timeout + ready timeout + portal renegotiation, ~8-10s worst case).
+    private val WATCHDOG_TIMEOUT_MS = 15000L
 
     private fun runDecodeLoop(holder: SurfaceHolder, input: BufferedAccessoryInput, out: DataOutputStream) {
         var codec: MediaCodec? = null

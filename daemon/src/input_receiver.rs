@@ -35,7 +35,7 @@ use crate::portal_capture::TransportReader;
 use crate::remote_desktop_input::RemoteDesktopInput;
 use crate::uinput_tablet::{TabletRanges, UinputTablet};
 use std::io::{self, Read};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Receiver, Sender};
 
 fn read_u32(r: &mut impl Read) -> io::Result<u32> {
     let mut b = [0u8; 4];
@@ -94,17 +94,29 @@ const EV_BUTTON_UP: u8 = 7;
 /// reported ranges, then loops injecting input events until the stream
 /// closes. Meant to run on its own thread.
 ///
-/// `clock_tx`: sends `(android_send_ms, daemon_recv_ms)` the instant the
-/// handshake's clock-sync ping is read, so the main thread (which owns the
+/// `clock_tx`: sends `(android_send_ms, daemon_recv_ms, width, height)` the
+/// instant the handshake is read, so the main thread (which owns the
 /// video-writing half of the socket) can complete Milestone 7's clock-offset
-/// calibration handshake -- see `clock_sync.rs`.
+/// calibration handshake -- see `clock_sync.rs` -- and, separately, rotate
+/// the virtual monitor to match the tablet's aspect before ever opening the
+/// portal (see `orientation.rs`, Milestone 15). The clock fields aren't a
+/// capability, just piggybacking on the same channel.
 ///
-/// `remote_input`: `None` selects the normal full-fidelity uinput tablet
-/// path; `Some` means uinput wasn't accessible (see
+/// `remote_input_rx`: `None` selects the normal full-fidelity uinput tablet
+/// path immediately. `Some` means uinput wasn't accessible (see
 /// `uinput_tablet::uinput_accessible`) and this session is running the
 /// reduced-fidelity `RemoteDesktop` portal fallback instead (position +
-/// click, no pressure/tilt) -- see `remote_desktop_input.rs`.
-pub fn run(mut stream: TransportReader, clock_tx: Sender<(i64, i64)>, remote_input: Option<RemoteDesktopInput>) {
+/// click, no pressure/tilt) -- see `remote_desktop_input.rs`. That portal
+/// session can't be negotiated until *after* the virtual monitor is
+/// rotated (which needs this handshake first), so in that case this call
+/// blocks here until `main.rs` sends the negotiated `RemoteDesktopInput`
+/// handle down the channel -- nothing useful to do before that exists
+/// anyway.
+pub fn run(
+    mut stream: TransportReader,
+    clock_tx: Sender<(i64, i64, u32, u32)>,
+    remote_input_rx: Option<Receiver<RemoteDesktopInput>>,
+) {
     let handshake = match read_handshake(&mut stream) {
         Ok(h) => h,
         Err(e) => {
@@ -112,8 +124,32 @@ pub fn run(mut stream: TransportReader, clock_tx: Sender<(i64, i64)>, remote_inp
             return;
         }
     };
+
+    // Sanity bounds, not a real capability limit: reusing an
+    // already-in-accessory-mode device (see `aoa::connect`'s "already in
+    // accessory mode, reusing it" path) can desync framing if Android
+    // doesn't resend a fresh handshake at the same instant this side starts
+    // reading -- confirmed live (Milestone 13), this landed leftover stream
+    // bytes here and produced `handshake: 67108868x369098755 px`. Harmless
+    // on its own (uinput's ioctl validation clamps it), but width/height
+    // now also drive `orientation::set_rotation`, which shells out to
+    // `kscreen-doctor` and directly reconfigures the real KWin output with
+    // no validation of its own. No real tablet panel is anywhere near this
+    // range in either direction.
+    const MIN_DIM: u32 = 64;
+    const MAX_DIM: u32 = 16384;
+    if !(MIN_DIM..=MAX_DIM).contains(&handshake.width) || !(MIN_DIM..=MAX_DIM).contains(&handshake.height) {
+        eprintln!(
+            "[input] handshake reports {}x{} px -- outside the sane {MIN_DIM}..={MAX_DIM} range, \
+             almost certainly a corrupted/stale read rather than a real panel size. Refusing to act \
+             on it (dropping this connection so the client reconnects with a fresh handshake).",
+            handshake.width, handshake.height
+        );
+        return;
+    }
+
     let daemon_recv_ms = crate::clock_sync::now_millis();
-    let _ = clock_tx.send((handshake.android_send_ms, daemon_recv_ms));
+    let _ = clock_tx.send((handshake.android_send_ms, daemon_recv_ms, handshake.width, handshake.height));
     eprintln!(
         "[input] handshake: {}x{} px, pressure {}..{}, tilt {}..{} deg",
         handshake.width,
@@ -132,10 +168,22 @@ pub fn run(mut stream: TransportReader, clock_tx: Sender<(i64, i64)>, remote_inp
         tilt_max: handshake.tilt_max,
     };
 
+    let remote_input = match remote_input_rx {
+        None => None,
+        Some(rx) => {
+            eprintln!("[input] waiting for the portal RemoteDesktop session to negotiate...");
+            match rx.recv() {
+                Ok(ri) => Some(ri),
+                Err(e) => {
+                    eprintln!("[input] never received the RemoteDesktop input handle: {e}");
+                    return;
+                }
+            }
+        }
+    };
+
     // Mutually exclusive: either a real uinput tablet, or the reduced-
-    // fidelity portal fallback -- never both, decided once by `main.rs`
-    // before any portal negotiation happened (the two need different,
-    // incompatible portal sessions).
+    // fidelity portal fallback -- never both.
     let tablet = match &remote_input {
         None => match UinputTablet::create(&ranges) {
             Ok(t) => Some(t),
@@ -162,6 +210,14 @@ pub fn run(mut stream: TransportReader, clock_tx: Sender<(i64, i64)>, remote_inp
     // it to do this for us.
     let mut remote_prev_contact = false;
 
+    // Mirrors vaapi_encoder.rs's flip_180: this machine's USB cable
+    // position needs portrait video flipped 180 degrees, applied GPU-side
+    // since KWin's own rotation property does nothing for this output type
+    // (Milestone 16). Reflecting touch/pen x,y here keeps the two in sync
+    // -- computed independently, same formula, same handshake dims, since
+    // this thread reads the handshake before main.rs even knows them.
+    let flip_180 = ranges.height > ranges.width;
+
     let mut event_count = 0u64;
     loop {
         let event_type = match read_u8(&mut stream) {
@@ -179,6 +235,7 @@ pub fn run(mut stream: TransportReader, clock_tx: Sender<(i64, i64)>, remote_inp
             Ok(v) => v,
             Err(_) => break,
         };
+        let (x, y) = if flip_180 { (ranges.width - x, ranges.height - y) } else { (x, y) };
         let pressure = match read_i32(&mut stream) {
             Ok(v) => v,
             Err(_) => break,
