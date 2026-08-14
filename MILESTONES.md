@@ -495,7 +495,7 @@ event) — likely a real multitouch protocol (`ABS_MT_*` slots) or OS-level gest
 recognition, not a small extension of the current single-touch path. Worth its own
 milestone later, not a follow-up to this one.
 
-## 7. Tuning pass — ROOT CAUSE FOUND (Android decoder pipeline depth, ~100ms of ~145ms total)
+## 7. Tuning pass — DONE (~145ms → ~110-125ms, switched to software decoder)
 
 Encoder settings, buffer sizes, thread priorities to cut jitter. Three concrete items
 were recorded as Milestone 4's findings: (1) import DMA-BUF from PipeWire instead of
@@ -773,6 +773,34 @@ buffering policy at all.
 Stopping the decoder-latency search here — further progress would need either a
 different decoder entirely (unlikely to exist on this hardware) or work outside
 this project's reach (SoC vendor firmware/silicon).
+
+### "A different decoder entirely" turned out to already exist on-device — real win found
+
+User pushback, correctly: hadn't actually checked what decoders this device *offers*
+before concluding the hardware ASIC's floor was the end of the line. Researched
+prior art first (couldn't find SuperDisplay's own technical approach — their site
+has zero technical disclosure, and the XDA/BlurBusters forum threads discussing it
+both blocked automated fetching; literature confirms MJPEG is a dead end, "inefficient,
+slow, large files" vs H.264, so not an alternative worth pursuing). Then just
+enumerated: `MediaCodecList(ALL_CODECS)` shows this tablet has two *software* AVC
+decoders alongside the hardware one — `c2.android.avc.decoder` (Google's Codec2
+software decoder) and the older `OMX.google.h264.decoder`. Software decoding has no
+ASIC pipeline architecture to impose a fixed multi-frame floor the way the hardware
+decoder's did.
+
+**Live-tested `c2.android.avc.decoder`: real, measured win.** Individual frame
+latencies 56-86ms (vs. the hardware decoder's 84-130ms), decoder queue depth
+`pending=3-4` (vs. 4-5) — roughly a 25-30% cut on the decode/render segment, and
+confirmed visually smooth with no artifacts over a 4539-frame run (daemon-side
+capture ~30ms and encode ~15ms unchanged, as expected, confirming this is purely a
+decode-side improvement). **Total pipeline now ~110-125ms, down from ~145ms.**
+
+**Made the permanent default**, deliberately, with the trade-off stated plainly: a
+software decoder costs meaningfully more CPU/battery/heat than the hardware ASIC
+that's specifically built for this job, and that cost hasn't been measured over a
+real long session (this test ran a few minutes). If sustained use turns out to be a
+real battery/thermal problem, revert to `MediaCodec.createDecoderByType(...)` (picks
+the hardware decoder by default) — a one-line change, not a design commitment.
 
 ## 8. (Optional v2) AOA transport
 

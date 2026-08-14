@@ -252,17 +252,33 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 val clockOffsetMs = readClockOffset(input)
                 inputWriterThread = Thread { runInputWriterLoop(out) }.also { it.start() }
 
+                // Diagnostic: enumerate every AVC decoder this device offers,
+                // hardware and software, so we know what alternatives even
+                // exist before assuming the default hardware one is the
+                // only option.
+                for (info in android.media.MediaCodecList(android.media.MediaCodecList.ALL_CODECS).codecInfos) {
+                    if (!info.isEncoder && info.supportedTypes.contains(MediaFormat.MIMETYPE_VIDEO_AVC)) {
+                        Log.i(tag, "available AVC decoder: ${info.name} hw=${info.isHardwareAccelerated} sw=${info.isSoftwareOnly}")
+                    }
+                }
+
                 val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height)
                 // Standard KEY_LOW_LATENCY re-verified with the corrected
                 // (FIFO-based) latency measurement (Milestone 7): genuinely
                 // no effect on this decoder. Left enabled anyway -- harmless
                 // here, other decoders/devices may honor it.
                 format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
-                // Back to the device's default (hardware) decoder now that the
-                // daemon encodes Main profile/CABAC instead of Constrained
-                // Baseline/CAVLC -- the latter caused a solid-green render on
-                // this tablet's hardware decoder specifically (see MILESTONES.md).
-                codec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+                // Deliberately the software decoder, not the device default
+                // hardware one (c2.exynos.h264.decoder). The hardware ASIC's
+                // internal pipeline depth turned out to be a fixed ~85-115ms
+                // floor no MediaCodec configuration could touch (Milestone
+                // 7); live-tested this software decoder at ~56-86ms with no
+                // visible quality loss -- a real, measured ~20-30ms win.
+                // Trade-off accepted deliberately: software decode costs far
+                // more CPU/battery/heat than the hardware ASIC, unverified
+                // over long sessions -- worth watching if this becomes a
+                // real-world battery/thermal problem later.
+                codec = MediaCodec.createByCodecName("c2.android.avc.decoder")
                 Log.i(tag, "using decoder: ${codec!!.name}")
                 // Definitive answer, not inference from behavior: per
                 // source.android.com's own low-latency-media doc, SoC
