@@ -8,7 +8,6 @@
 //! for now); this module just captures whatever monitor the user picks in
 //! the portal's screen-selection dialog.
 
-use crate::color_convert::bgrx_to_nv12;
 use crate::vaapi_encoder::VaapiEncoder;
 use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType, Stream as PortalStream};
 use ashpd::desktop::PersistMode;
@@ -23,7 +22,7 @@ use std::os::fd::OwnedFd;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct CaptureStats {
     pub frame_count: u64,
     pub durations: Vec<Duration>,
@@ -32,6 +31,8 @@ pub struct CaptureStats {
     pub buffer_age_samples: u64,
     pub capture_latency_ms_sum: f64,
     pub capture_latency_samples: u64,
+    pub encode_ms_sum: f64,
+    pub convert_encode_samples: u64,
 }
 
 /// Decodes the 48-bit CLOCK_MONOTONIC barcode painted by
@@ -90,8 +91,6 @@ pub async fn open_portal() -> ashpd::Result<(PortalStream, OwnedFd)> {
 struct CaptureData {
     format: spa::param::video::VideoInfoRaw,
     encoder: Option<VaapiEncoder>,
-    y_plane: Vec<u8>,
-    uv_plane: Vec<u8>,
     out_file: File,
     transport: Option<TcpStream>,
     stats: Rc<RefCell<CaptureStats>>,
@@ -167,8 +166,6 @@ pub fn run_capture(
     let data = CaptureData {
         format: Default::default(),
         encoder: None,
-        y_plane: Vec::new(),
-        uv_plane: Vec::new(),
         out_file,
         transport,
         stats: stats.clone(),
@@ -219,10 +216,6 @@ pub fn run_capture(
             );
 
             let encoder = VaapiEncoder::new(width, height).expect("VAAPI encoder init failed");
-            let aw = encoder.aligned_width() as usize;
-            let ah = encoder.aligned_height() as usize;
-            user_data.y_plane = vec![0u8; aw * ah];
-            user_data.uv_plane = vec![0u8; aw * (ah / 2)];
             user_data.encoder = Some(encoder);
         })
         .process(|stream, user_data| {
@@ -340,23 +333,32 @@ pub fn run_capture(
             let Some(encoder) = user_data.encoder.as_mut() else {
                 return;
             };
-            let width = encoder.width() as usize;
-            let height = encoder.height() as usize;
-            let aligned_width = encoder.aligned_width() as usize;
 
-            bgrx_to_nv12(
-                bytes,
-                width,
-                height,
-                stride,
-                &mut user_data.y_plane,
-                aligned_width,
-                &mut user_data.uv_plane,
-                aligned_width,
-            );
-
-            match encoder.encode_frame(&user_data.y_plane, &user_data.uv_plane) {
+            // Milestone 7 follow-up: color conversion moved off the CPU.
+            // The old path here was `bgrx_to_nv12` (color_convert.rs, a
+            // scalar per-pixel loop) writing into `y_plane`/`uv_plane`
+            // before handing them to the encoder -- measured at ~10.4ms
+            // average, more expensive than the hardware VAAPI encode step
+            // itself (~4.2ms). `encode_frame` now takes the raw captured
+            // BGRX bytes directly and does the conversion via VAAPI's own
+            // GPU Video Post-Processing entrypoint instead (see
+            // `vaapi_encoder.rs`'s `run_vpp_conversion`).
+            let encode_start = Instant::now();
+            match encoder.encode_frame(bytes, stride) {
                 Ok(encoded) => {
+                    let encode_elapsed = encode_start.elapsed();
+                    {
+                        let mut stats = user_data.stats.borrow_mut();
+                        stats.encode_ms_sum += encode_elapsed.as_secs_f64() * 1000.0;
+                        stats.convert_encode_samples += 1;
+                        if stats.convert_encode_samples == 1 || stats.convert_encode_samples % 30 == 0 {
+                            eprintln!(
+                                "[timing] upload+VPP+encode avg={:.2}ms (this frame: {:.2}ms)",
+                                stats.encode_ms_sum / stats.convert_encode_samples as f64,
+                                encode_elapsed.as_secs_f64() * 1000.0,
+                            );
+                        }
+                    }
                     let elapsed = start.elapsed();
                     let mut stats = user_data.stats.borrow_mut();
                     stats.frame_count += 1;
@@ -415,7 +417,7 @@ pub fn run_capture(
             pw::spa::param::format::MediaSubtype::Raw
         ),
         // BGRx matches evdi's XR24 byte order exactly (B,G,R,X in memory) --
-        // reuses color_convert::bgrx_to_nv12 unchanged.
+        // matches VA_FOURCC_BGRX in vaapi_encoder.rs's GPU conversion path.
         pw::spa::pod::property!(
             pw::spa::param::format::FormatProperties::VideoFormat,
             Choice,
@@ -467,21 +469,7 @@ pub fn run_capture(
     }
     eprintln!("[pipewire] SIGINT received, stopping...");
 
-    let frame_count = stats.borrow().frame_count;
-    let durations = stats.borrow().durations.clone();
-    let dropped_stale = stats.borrow().dropped_stale;
-    let buffer_age_ms_sum = stats.borrow().buffer_age_ms_sum;
-    let buffer_age_samples = stats.borrow().buffer_age_samples;
-    let capture_latency_ms_sum = stats.borrow().capture_latency_ms_sum;
-    let capture_latency_samples = stats.borrow().capture_latency_samples;
-    eprintln!("[pipewire] stats computed: {frame_count} frames, returning...");
-    Ok(CaptureStats {
-        frame_count,
-        durations,
-        dropped_stale,
-        buffer_age_ms_sum,
-        buffer_age_samples,
-        capture_latency_ms_sum,
-        capture_latency_samples,
-    })
+    let final_stats = stats.borrow().clone();
+    eprintln!("[pipewire] stats computed: {} frames, returning...", final_stats.frame_count);
+    Ok(final_stats)
 }

@@ -30,6 +30,15 @@ pub struct VaapiEncoder {
     config_id: ffi::VAConfigID,
     context_id: ffi::VAContextID,
     surface: ffi::VASurfaceID,
+    // GPU color conversion (Milestone 7 follow-up): a BGRX source surface,
+    // uploaded via a straight memcpy (no per-pixel math), converted to the
+    // NV12 `surface` above by VAAPI's own Video Post-Processing (VPP)
+    // entrypoint instead of the CPU scalar BT.601 loop in color_convert.rs.
+    // Replaced ~10ms of CPU time (more than the hardware encode itself
+    // took) -- see MILESTONES.md for the measured before/after.
+    src_surface: ffi::VASurfaceID,
+    vpp_config_id: ffi::VAConfigID,
+    vpp_context_id: ffi::VAContextID,
     width: u32,
     height: u32,
     aligned_width: u32,
@@ -162,8 +171,69 @@ impl VaapiEncoder {
             "vaCreateContext",
         )?;
 
+        // GPU color conversion setup: a second surface in the source BGRX
+        // format, and a VPP (Video Post-Processing) config/context to
+        // convert it into the NV12 `surface` above entirely on the iGPU.
+        let mut bgrx_format_attrib = ffi::VASurfaceAttrib {
+            type_: ffi::VASurfaceAttribType_VASurfaceAttribPixelFormat,
+            flags: ffi::VA_SURFACE_ATTRIB_SETTABLE,
+            value: ffi::VAGenericValue {
+                type_: ffi::VAGenericValueType_VAGenericValueTypeInteger,
+                value: ffi::_VAGenericValue__bindgen_ty_1 { i: ffi::VA_FOURCC_BGRX as i32 },
+            },
+        };
+        let mut src_surface: ffi::VASurfaceID = 0;
+        check(
+            unsafe {
+                ffi::vaCreateSurfaces(
+                    dpy,
+                    ffi::VA_RT_FORMAT_RGB32,
+                    aligned_width,
+                    aligned_height,
+                    &mut src_surface,
+                    1,
+                    &mut bgrx_format_attrib,
+                    1,
+                )
+            },
+            "vaCreateSurfaces(BGRX source)",
+        )?;
+
+        let mut vpp_config_id: ffi::VAConfigID = 0;
+        check(
+            unsafe {
+                ffi::vaCreateConfig(
+                    dpy,
+                    ffi::VAProfile_VAProfileNone,
+                    ffi::VAEntrypoint_VAEntrypointVideoProc,
+                    ptr::null_mut(),
+                    0,
+                    &mut vpp_config_id,
+                )
+            },
+            "vaCreateConfig(VPP)",
+        )?;
+
+        let mut vpp_context_id: ffi::VAContextID = 0;
+        let mut vpp_render_targets = [surface];
+        check(
+            unsafe {
+                ffi::vaCreateContext(
+                    dpy,
+                    vpp_config_id,
+                    aligned_width as i32,
+                    aligned_height as i32,
+                    0,
+                    vpp_render_targets.as_mut_ptr(),
+                    1,
+                    &mut vpp_context_id,
+                )
+            },
+            "vaCreateContext(VPP)",
+        )?;
+
         eprintln!(
-            "[vaapi] encoder ready: {width}x{height} (aligned {aligned_width}x{aligned_height})"
+            "[vaapi] encoder ready: {width}x{height} (aligned {aligned_width}x{aligned_height}), GPU color conversion via VPP"
         );
 
         Ok(Self {
@@ -172,6 +242,9 @@ impl VaapiEncoder {
             config_id,
             context_id,
             surface,
+            src_surface,
+            vpp_config_id,
+            vpp_context_id,
             width,
             height,
             aligned_width,
@@ -179,11 +252,13 @@ impl VaapiEncoder {
         })
     }
 
-    /// Uploads `nv12` (already-converted Y+UV planes, tightly packed at
-    /// aligned_width/aligned_height) into the surface and encodes it as a
-    /// standalone IDR frame. Returns the raw Annex-B H.264 bytes.
-    pub fn encode_frame(&mut self, y_plane: &[u8], uv_plane: &[u8]) -> VaResult<Vec<u8>> {
-        self.upload_surface(y_plane, uv_plane)?;
+    /// Uploads a raw BGRX frame (`src_stride` bytes/row, as captured --
+    /// untouched by any CPU color conversion), converts it to NV12 via
+    /// VAAPI's own GPU VPP entrypoint, and encodes it as a standalone IDR
+    /// frame. Returns the raw Annex-B H.264 bytes.
+    pub fn encode_frame(&mut self, bgrx: &[u8], src_stride: usize) -> VaResult<Vec<u8>> {
+        self.upload_bgrx_surface(bgrx, src_stride)?;
+        self.run_vpp_conversion()?;
 
         let mbs_w = self.aligned_width / 16;
         let mbs_h = self.aligned_height / 16;
@@ -442,46 +517,84 @@ impl VaapiEncoder {
         Ok(())
     }
 
-    fn upload_surface(&mut self, y_plane: &[u8], uv_plane: &[u8]) -> VaResult<()> {
+    /// Straight memcpy of raw BGRX rows into the source surface -- no
+    /// per-pixel math, that's VPP's job now (see `run_vpp_conversion`).
+    fn upload_bgrx_surface(&mut self, bgrx: &[u8], src_stride: usize) -> VaResult<()> {
         let mut image: ffi::VAImage = unsafe { std::mem::zeroed() };
         check(
-            unsafe { ffi::vaDeriveImage(self.dpy, self.surface, &mut image) },
-            "vaDeriveImage",
+            unsafe { ffi::vaDeriveImage(self.dpy, self.src_surface, &mut image) },
+            "vaDeriveImage(src)",
         )?;
 
         let mut buf_ptr: *mut c_void = ptr::null_mut();
         check(
             unsafe { ffi::vaMapBuffer(self.dpy, image.buf, &mut buf_ptr) },
-            "vaMapBuffer",
+            "vaMapBuffer(src)",
         )?;
 
         unsafe {
             let base = buf_ptr as *mut u8;
-            let y_dst = std::slice::from_raw_parts_mut(
+            let dst = std::slice::from_raw_parts_mut(
                 base.add(image.offsets[0] as usize),
                 (image.pitches[0] as usize) * (self.aligned_height as usize),
             );
+            let row_bytes = self.width as usize * 4;
             for row in 0..self.height as usize {
-                let src = &y_plane[row * self.aligned_width as usize..][..self.width as usize];
-                let dst = &mut y_dst[row * image.pitches[0] as usize..][..self.width as usize];
-                dst.copy_from_slice(src);
-            }
-
-            let uv_dst = std::slice::from_raw_parts_mut(
-                base.add(image.offsets[1] as usize),
-                (image.pitches[1] as usize) * (self.aligned_height as usize / 2),
-            );
-            for row in 0..(self.height as usize / 2) {
-                let src = &uv_plane[row * self.aligned_width as usize..][..self.width as usize];
-                let dst = &mut uv_dst[row * image.pitches[1] as usize..][..self.width as usize];
-                dst.copy_from_slice(src);
+                let src = &bgrx[row * src_stride..][..row_bytes];
+                let d = &mut dst[row * image.pitches[0] as usize..][..row_bytes];
+                d.copy_from_slice(src);
             }
         }
 
-        check(unsafe { ffi::vaUnmapBuffer(self.dpy, image.buf) }, "vaUnmapBuffer")?;
+        check(unsafe { ffi::vaUnmapBuffer(self.dpy, image.buf) }, "vaUnmapBuffer(src)")?;
         check(
             unsafe { ffi::vaDestroyImage(self.dpy, image.image_id) },
-            "vaDestroyImage",
+            "vaDestroyImage(src)",
+        )?;
+        Ok(())
+    }
+
+    /// Converts `src_surface` (BGRX) into `surface` (NV12) entirely on the
+    /// GPU via VAAPI's Video Post-Processing entrypoint.
+    fn run_vpp_conversion(&mut self) -> VaResult<()> {
+        check(
+            unsafe { ffi::vaBeginPicture(self.dpy, self.vpp_context_id, self.surface) },
+            "vaBeginPicture(VPP)",
+        )?;
+
+        let mut pipeline_param: ffi::VAProcPipelineParameterBuffer = Default::default();
+        pipeline_param.surface = self.src_surface;
+
+        let mut pipeline_buf: ffi::VABufferID = 0;
+        check(
+            unsafe {
+                ffi::vaCreateBuffer(
+                    self.dpy,
+                    self.vpp_context_id,
+                    ffi::VABufferType_VAProcPipelineParameterBufferType,
+                    std::mem::size_of::<ffi::VAProcPipelineParameterBuffer>() as u32,
+                    1,
+                    &mut pipeline_param as *mut _ as *mut c_void,
+                    &mut pipeline_buf,
+                )
+            },
+            "vaCreateBuffer(VPP pipeline)",
+        )?;
+        check(
+            unsafe { ffi::vaRenderPicture(self.dpy, self.vpp_context_id, &mut pipeline_buf, 1) },
+            "vaRenderPicture(VPP)",
+        )?;
+        check(
+            unsafe { ffi::vaEndPicture(self.dpy, self.vpp_context_id) },
+            "vaEndPicture(VPP)",
+        )?;
+        check(
+            unsafe { ffi::vaSyncSurface(self.dpy, self.surface) },
+            "vaSyncSurface(VPP)",
+        )?;
+        check(
+            unsafe { ffi::vaDestroyBuffer(self.dpy, pipeline_buf) },
+            "vaDestroyBuffer(VPP pipeline)",
         )?;
         Ok(())
     }
@@ -507,24 +620,15 @@ impl VaapiEncoder {
         check(unsafe { ffi::vaUnmapBuffer(self.dpy, coded_buf) }, "vaUnmapBuffer(coded)")?;
         Ok(out)
     }
-
-    pub fn width(&self) -> u32 {
-        self.width
-    }
-    pub fn height(&self) -> u32 {
-        self.height
-    }
-    pub fn aligned_width(&self) -> u32 {
-        self.aligned_width
-    }
-    pub fn aligned_height(&self) -> u32 {
-        self.aligned_height
-    }
 }
 
 impl Drop for VaapiEncoder {
     fn drop(&mut self) {
         unsafe {
+            ffi::vaDestroyContext(self.dpy, self.vpp_context_id);
+            ffi::vaDestroyConfig(self.dpy, self.vpp_config_id);
+            let mut src = self.src_surface;
+            ffi::vaDestroySurfaces(self.dpy, &mut src, 1);
             ffi::vaDestroyContext(self.dpy, self.context_id);
             ffi::vaDestroyConfig(self.dpy, self.config_id);
             let mut s = self.surface;

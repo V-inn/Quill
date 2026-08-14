@@ -1,5 +1,4 @@
 mod clock_sync;
-mod color_convert;
 mod ffi;
 mod h264_headers;
 mod input_receiver;
@@ -87,6 +86,13 @@ async fn main() {
         );
     } else {
         println!("capture latency (barcode->dequeue): no barcode probe detected");
+    }
+    if stats.convert_encode_samples > 0 {
+        println!(
+            "upload+VPP+encode avg: {:.2}ms (over {} samples)",
+            stats.encode_ms_sum / stats.convert_encode_samples as f64,
+            stats.convert_encode_samples
+        );
     }
     println!("output written to: {out_path}");
     // stdout is fully buffered (not line-buffered) once redirected to a file

@@ -848,6 +848,45 @@ raw USB/AOA, Milestone 8 below) and Android's own `SurfaceView`/`SurfaceFlinger`
 presentation path — both real, but each a substantially bigger lift than anything
 tried this session, not a quick lever.
 
+### Real win found: unaccelerated CPU color conversion was costing more than the hardware encode itself
+
+User asked directly: are we using hardware acceleration to its fullest? Answer: no
+— `bgrx_to_nv12` (`color_convert.rs`) was a scalar, pure-CPU per-pixel BT.601 loop,
+never touched since Milestone 2, explicitly flagged back then as "not optimized" and
+never revisited. Added split timing (`dequeue→encoded` had always bundled color
+convert and encode together) to find out how much it actually cost: **color-convert
+averaged 10.36ms, more than the hardware VAAPI encode itself (4.24ms)** — the
+supposedly-cheap CPU step was the bigger of the two.
+
+**Rewrote color conversion to run on the GPU via VAAPI's own Video Post-Processing
+(VPP) entrypoint** instead of a SIMD-accelerated CPU rewrite (the lower-risk, smaller
+option) — user chose the bigger rewrite. `vaapi_encoder.rs` gained a second surface
+(BGRX format, `VA_FOURCC_BGRX`/`VA_RT_FORMAT_RGB32`) and a VPP config/context
+(`VAProfile_VAProfileNone` + `VAEntrypoint_VAEntrypointVideoProc`). Each frame: the
+raw captured BGRX bytes are uploaded to the source surface via a straight memcpy (no
+per-pixel math — that's VPP's job now), then a `VAProcPipelineParameterBuffer`
+naming that surface is submitted to the VPP context, writing directly into the same
+NV12 surface the H.264 encode context already uses. `color_convert.rs` deleted
+entirely once confirmed working (not kept as a fallback — git history is the
+fallback).
+
+Needed `va/va_vpp.h` added to the bindgen wrapper header (the type/entrypoint/fourcc
+*constants* were already generated without it, misleadingly suggesting VPP was
+available, but the actual `VAProcPipelineParameterBuffer` struct definition lives in
+that header specifically and wasn't generated until it was added).
+
+**Live-tested, colors confirmed correct, full pipeline confirmed working end to end
+(video + real S Pen input in GIMP) after the rewrite.** Result, clean run over 3443
+frames: **upload+VPP+encode averaged 5.13ms, down from ~14.6ms (10.36 + 4.24) for
+the old CPU-convert-then-encode path — a ~65% cut on this segment**, capture latency
+unaffected as expected (~30ms, a separate upstream stage). Daemon-side pipeline
+total now ~35ms (was ~45ms). Given decode/render still dominates the full pipeline
+(~70-110ms depending on hardware vs. software decoder), this doesn't change the
+*overall* glass-to-glass number by a huge margin, but it's a genuine, free win —
+real hardware offload, no quality or battery trade-off unlike the software-decoder
+switch, and it answers the user's question directly: no, hardware acceleration
+wasn't being used to its fullest before this, and now it is for this stage.
+
 ## 8. (Optional v2) AOA transport
 
 Swap adb transport for Android Open Accessory mode, drop the adb dependency entirely.
