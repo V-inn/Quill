@@ -486,6 +486,26 @@ buffering before a frame reaches us, the adb/USB transport hop, or (a well-known
 source of multi-frame latency on Android) `MediaCodec`/`SurfaceView`'s own buffer
 queueing on the decode+render side. None of that is instrumented yet.
 
+**Tried `MediaFormat.KEY_LOW_LATENCY` — no measurable effect.** Set unconditionally
+before `codec.configure()` (a documented Android API for reducing a hardware
+decoder's internal buffering; harmless no-op if unsupported). Re-measured with the
+same clock method: 150ms, 170ms, 180ms — statistically the same as the ~150-170ms
+before this change, not the ~300ms pre-Milestone-7 baseline. `adb logcat` confirms
+the decoder is still `c2.exynos.h264.decoder` and shows no error/acknowledgment
+either way for the key, consistent with the flag being silently ignored on this
+decoder. **Negative result, recorded rather than discarded** — rules out the
+cheapest lever on the decode side.
+
+**Where this leaves latency investigation:** two independent changes (drop-stale-
+frames, low-latency decode flag) moved the number from ~300ms to ~150-180ms and then
+plateaued — both re-measurements after Milestone 7's changes cluster tightly around
+150-180ms, suggesting a real, fairly constant floor rather than one specific
+bottleneck being incrementally shaved. Localizing it further would need actual
+instrumentation (e.g. per-frame timestamps propagated through the wire protocol,
+which requires a clock-offset calibration step since daemon and tablet are separate
+devices with independently-clocked systems) rather than more guess-and-film cycles.
+Not attempted yet — a real scoping decision, not a small next step.
+
 ## 8. (Optional v2) AOA transport
 
 Swap adb transport for Android Open Accessory mode, drop the adb dependency entirely.
