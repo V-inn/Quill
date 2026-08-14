@@ -1094,6 +1094,28 @@ restore token, the daemon auto-launched via the udev rule + systemd user unit, A
 handshake completed, and video appeared on the tablet automatically. Full plug-in
 to on-screen-video chain now requires zero manual steps on the host side.
 
+### App polish: edge-to-edge immersive fullscreen
+
+User asked for two things: fullscreen on the tablet, and the host's taskbar
+showing up in the captured video. The second turned out to be a KDE Plasma
+desktop-config issue, not an app bug -- `krfb-virtualmonitor`'s virtual output
+starts blank with no panel assigned to it by default (per-screen panel assignment
+is a Plasma setting, not something the capture pipeline controls) -- left for the
+user to fix via Plasma's panel edit mode rather than scripted, since it touches
+the live desktop shell's config and a `plasmashell` reload.
+
+Fullscreen: the app's theme was already `Theme.Black.NoTitleBar.Fullscreen`, but
+that legacy theme flag only ever hid the status bar, not Android's navigation bar
+-- and mixes poorly with the modern edge-to-edge APIs. Switched the manifest theme
+to plain `Theme.Black.NoTitleBar` and did the rest properly in code:
+`WindowCompat.setDecorFitsSystemWindows(window, false)` plus
+`WindowInsetsControllerCompat.hide(WindowInsetsCompat.Type.systemBars())` with
+`BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE` (both bars hidden, swipe from an edge
+reveals them temporarily -- standard "immersive sticky" pattern). Re-asserted on
+every `onWindowFocusChanged(true)`, since the transient reveal (or a permission
+dialog stealing focus) doesn't hide itself again on its own. Confirmed live: both
+system bars gone, video fills the screen edge to edge.
+
 ## 9. (Not started) Multi-touch gestures
 
 Pinch-to-zoom, two-finger scroll, and similar — deferred from the Milestone 6b finger

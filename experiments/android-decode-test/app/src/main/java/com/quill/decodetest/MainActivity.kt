@@ -13,6 +13,9 @@ import android.view.InputDevice
 import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import java.io.BufferedOutputStream
 import java.io.DataOutputStream
 import java.io.FileInputStream
@@ -71,6 +74,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         usbAccessory = accessoryFromIntent(intent) ?: alreadyAttachedAccessory()
+        hideSystemBars()
         val surfaceView = SurfaceView(this)
         setContentView(surfaceView)
         surfaceView.holder.addCallback(this)
@@ -82,6 +86,26 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         // paths per MotionEvent, so all three listeners coexist safely with
         // no double-processing of the same event.
         surfaceView.setOnGenericMotionListener { _, event -> handleMotionEvent(event, down = false) }
+    }
+
+    /** Edge-to-edge immersive: hides both the status bar and navigation bar,
+     * swipe-from-edge brings them back temporarily (standard "immersive
+     * sticky" behavior) -- this is a second-screen monitor replacement, not
+     * a phone app, so Android's own chrome should stay out of the way. */
+    private fun hideSystemBars() {
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        val controller = WindowInsetsControllerCompat(window, window.decorView)
+        controller.hide(WindowInsetsCompat.Type.systemBars())
+        controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+    }
+
+    /** The system bars Android brings back on an edge-swipe (or after a
+     * dialog/permission prompt steals focus) don't hide themselves again on
+     * their own once the transient reveal times out -- re-assert on every
+     * focus regain, the standard pattern for sticky immersive mode. */
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) hideSystemBars()
     }
 
     /** Fallback for a manual relaunch (tapping the app icon after the decode
