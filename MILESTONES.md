@@ -1516,3 +1516,122 @@ function of data each side already has). Both driven by the same
 `height > width` condition, kept in sync without a shared flag. Live-
 confirmed working after this: correct orientation, correct touch tracking,
 smooth.
+
+## 17. GOP with P-frames (Milestone 7's deferred item 3), implemented
+
+User asked whether LZ4 (seen referenced in a SuperDisplay-adjacent repo) could help
+latency. Checked first: the wire payload is already H.264, so compressing an
+already-high-entropy encoded bitstream buys ~nothing and just adds CPU -- ruled out
+without writing code. That look pointed back at Milestone 7's three original tuning
+items instead: item 3, real GOP with P-frames instead of all-intra, had sat
+unimplemented since then (`vaapi_encoder.rs`'s top comment still said "tuning-pass
+work (Milestone 7)"). Implemented it: a 2-surface ping-pong DPB, one IDR every
+`GOP_SIZE` (60) frames, single-reference P slices (`max_num_ref_frames=1`,
+`ip_period=1`, no B-frames) in between, referencing only the immediately preceding
+frame. SPS/PPS packed headers now only get injected on IDR frames -- previously
+resent every single frame, since every frame used to be an IDR.
+
+**Bitstream correctness validated first, no live capture needed.** The daemon has
+no lib target (only bin crates), so drove `VaapiEncoder` directly from a throwaway
+`src/bin/gop_bitstream_test.rs` diagnostic (same `#[path = "../..."]` pattern as
+`uinput_test.rs`) with synthetic moving-content BGRX frames -- avoided both the
+interactive portal picker and the already-running production `quill-daemon` systemd
+service entirely. **Result, 150 synthetic frames:** IDR avg 7168 bytes vs P avg 723
+bytes (~10x smaller), GOP boundary landed exactly at frame 60/120 as designed,
+**88.1% total bitstream reduction** vs a hypothetical all-intra encode of the same
+content. `ffprobe`/`ffmpeg -f null -` confirmed clean decode, 150/150 frames, zero
+errors or warnings -- the P-frames decode correctly against their reference, not
+just VAAPI-accepted them. Deleted the diagnostic bin afterward (throwaway, not a
+milestone artifact).
+
+**Live test: the already-running production daemon picked up the new binary for
+free.** `~/.local/bin/quill-daemon` symlinks straight to the release build; the
+systemd service was already crash-looping on `[clock-sync] never received clock
+ping` (waiting for the Android app to reopen the accessory), so the next normal
+app-open picked up the rebuilt GOP binary with zero manual restart needed. Confirmed
+live in the journal: `encoder ready: ... GOP 60`, frame sizes 380-810 bytes during
+normal desktop use, well under the old ~7KB/frame all-intra floor.
+
+**User's live by-eye impression: no difference, maybe slightly worse.** Expected
+going in, not a red flag: Milestone 7 already concluded frame sizes were small
+enough that GOP "mainly helps bandwidth, not latency," and this project's own
+history (Milestone 7's `KEY_LOW_LATENCY`/vendor-parameter tests) shows unaided
+by-eye impressions of this pipeline aren't reliable without instrumentation.
+
+**Camera glass-to-glass re-measurement, same readable-clock method as Milestone 7**
+(`experiments/capture-latency-probe/src/bin/readable_clock.rs`: one window on the
+real screen, one moved onto `Virtual-QuillDisplay` via `xdotool windowmove` at
+physical offset `1920,0` -- exact recipe already worked out in Milestone 7's
+barcode-probe section, still correct). Three readings: .723/.589 (134ms),
+.421/.287 (134ms), .488/.388 (100ms) -- **avg ~123ms**.
+
+**Honesty check: not a clean isolate.** Milestone 7's ~144ms reference figure
+(151/145/135ms) was measured over **adb-forward**; this run was over **AOA** (the
+production daemon's configured transport, `aoa` arg). Milestone 8 already found AOA
+saves ~40-45ms over adb-forward on the decode/render segment alone (FIFO log
+instrumentation) and explicitly flagged that it was "not yet formally re-measured
+with the camera readable-clock method" for a full glass-to-glass number -- so no
+clean pre-GOP *AOA* camera baseline exists yet. Today's ~123ms is really the
+**first AOA-era camera glass-to-glass measurement**, not a controlled GOP-only A/B:
+it's confounded with the already-known, separately-attributed transport win. Can't
+attribute the 144ms-to-123ms delta to GOP from this data alone -- three readings
+per side is also too small a sample to lean on hard either way. A real A/B needs
+the same AOA transport, same camera method, GOP code checked out vs the pre-GOP
+commit (`856cffb`, current HEAD at the time this milestone's change was made) --
+planned as the next test.
+
+### The real A/B, same session -- GOP does not help glass-to-glass, and may cost a hair
+
+Built the clean comparison right away rather than leaving it planned: `856cffb`
+(pre-GOP) checked out into a throwaway `git worktree`, built release there too, both
+binaries (`quill-daemon-pregop-856cffb`, `quill-daemon-gop`) copied out to
+`~/quill-ab-test/` so the worktree itself could be torn down immediately. Stopped the
+systemd-managed production daemon (`systemctl --user stop quill-daemon.service`,
+frees the AOA USB handle -- only one process can hold it), ran each binary manually
+against the real tablet with identical args (`aoa` transport, same two
+`readable_clock` windows already positioned from the earlier test), filmed both back
+to back in the same sitting -- same lighting, same camera, same person reading the
+frames, same few minutes of wall-clock time, about as controlled as this method gets
+without dedicated hardware.
+
+**Reconnect friction, expected and already-documented, not a new bug.** Swapping
+binaries hit the same stale-handshake race Milestone 13/14 already found and left
+unfixed (`[input] handshake reports <garbage>x<garbage> px ... dropping this
+connection`) three times in a row on the pregop->gop swap specifically. Force-closing
+and reopening the Android app (not just relaunching the daemon) cleared it every
+time -- consistent with the existing theory that leftover bytes from the *app's* side
+of the connection, not the daemon's, are the source.
+
+**Pre-GOP (`856cffb`), 4 readings:** .860/.726 (134ms), .877/.799 (78ms), .928/.810
+(118ms), 8.045/7.928 (117ms) -- **avg ~113ms**.
+
+**GOP, 4 readings, same method immediately after:** .364/.249 (115ms), .431/.300
+(131ms), .464/.338 (126ms), .531/.400 (131ms) -- **avg ~126ms**.
+
+**Result: GOP is not faster glass-to-glass here -- if anything, ~13ms slower.** This
+is the clean isolate the previous entry's confounded ~123ms number couldn't provide:
+same transport (AOA), same tablet, same camera method, same short window of time,
+only the encoder binary differs. It matches the user's own live by-eye impression
+from earlier in this milestone ("no difference, maybe slightly worse") rather than
+the noisier confounded-transport number. 8 total readings (4 per side) is still a
+small sample -- not proof of a real regression -- but it's now consistent evidence
+across three independent signals (by-eye, confounded camera test, clean camera A/B)
+pointing the same direction, not just one noisy number.
+
+**Plausible mechanism, not confirmed:** every P-frame's `vaRenderPicture` submission
+now carries live reference-picture-list bookkeeping (`ReferenceFrames[0]`,
+`RefPicList0[0]`, `frame_num`/`poc_lsb` tracking) that the old all-intra path never
+built, and the encoder now depends on the *other* ping-pong surface's reconstruction
+being finished before referencing it -- both are real, if small, added per-frame
+costs on the encode side that all-intra didn't pay. Consistent with, but not proof
+of, the ~13ms gap. Not instrumented further this session.
+
+**Where this leaves Milestone 17: bandwidth win confirmed (88.1% smaller
+bitstream, real and validated), latency win not confirmed -- likely a small net
+loss instead.** Matches Milestone 7's own original prediction almost exactly ("P-
+frame GOP mainly helps bandwidth, not latency") -- the surprise here isn't that GOP
+failed to help latency, it's that a controlled test was cheap enough to actually
+check rather than assume. Keeping the GOP change: bandwidth matters independently
+(lower USB traffic, more headroom before the pipeline itself becomes the
+bottleneck), and a ~13ms cost from 4 noisy readings isn't a strong enough signal to
+revert a validated bitstream win over.

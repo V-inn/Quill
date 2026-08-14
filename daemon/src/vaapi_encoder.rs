@@ -1,9 +1,10 @@
-//! Minimal VAAPI H.264 encoder: every frame is an independent IDR (all-intra).
-//!
-//! v0 scope (Milestone 2): correctness and latency measurement, not bitrate
-//! efficiency -- a real GOP structure with P-frames is tuning-pass work
-//! (Milestone 7). Encoding every frame independently also sidesteps
-//! reference-picture-list bookkeeping entirely, which keeps this small.
+//! VAAPI H.264 encoder with a real IPPP GOP: one IDR every `GOP_SIZE` frames,
+//! plain single-reference P slices in between. Each P slice references only
+//! the immediately preceding frame (`max_num_ref_frames = 1`), so a 2-surface
+//! ping-pong DPB is enough -- no long-term reference bookkeeping needed.
+//! SPS/PPS packed headers are only injected on IDR frames, matching normal
+//! Annex-B convention (a P slice's decoder already holds the active
+//! parameter sets from the last IDR).
 
 use crate::ffi;
 use crate::h264_headers::{self, H264Params};
@@ -24,12 +25,23 @@ fn align16(v: u32) -> u32 {
     (v + 15) & !15
 }
 
+/// Frames between IDRs (inclusive of the IDR itself). At the fixed 60fps
+/// hardware decode path (see MILESTONES.md), this is one IDR per second --
+/// tune down if the USB link needs faster recovery after a dropped frame,
+/// up for more bandwidth headroom. Must stay comfortably under the
+/// `log2_max_frame_num_minus4`/`log2_max_pic_order_cnt_lsb_minus4` wrap
+/// points set in `encode_frame` (256 / 512).
+const GOP_SIZE: u64 = 60;
+
 pub struct VaapiEncoder {
     dpy: ffi::VADisplay,
     render_fd: std::os::raw::c_int,
     config_id: ffi::VAConfigID,
     context_id: ffi::VAContextID,
-    surface: ffi::VASurfaceID,
+    // Ping-pong DPB: 2 NV12 surfaces is enough for max_num_ref_frames=1 --
+    // each P slice's sole reference is the other slot, which still holds
+    // the previous frame's reconstructed picture untouched.
+    surfaces: [ffi::VASurfaceID; 2],
     // GPU color conversion (Milestone 7 follow-up): a BGRX source surface,
     // uploaded via a straight memcpy (no per-pixel math), converted to the
     // NV12 `surface` above by VAAPI's own Video Post-Processing (VPP)
@@ -50,6 +62,15 @@ pub struct VaapiEncoder {
     // but never the captured pixels. VPP's own rotation_state is the
     // GPU-accelerated place that does work, applied here instead.
     flip_180: bool,
+    // GOP state: total frames encoded so far (drives the ping-pong slot and
+    // the IDR/P decision), a counter distinguishing successive IDRs
+    // (idr_pic_id must differ between them even though frame_num resets to
+    // 0 each time), and the previous frame's frame_num/POC -- needed to
+    // populate the P slice's single reference-picture entry.
+    frame_count: u64,
+    idr_count: u16,
+    prev_frame_num: u16,
+    prev_poc: i32,
 }
 
 impl VaapiEncoder {
@@ -143,7 +164,7 @@ impl VaapiEncoder {
                 value: ffi::_VAGenericValue__bindgen_ty_1 { i: ffi::VA_FOURCC_NV12 as i32 },
             },
         };
-        let mut surface: ffi::VASurfaceID = 0;
+        let mut surfaces: [ffi::VASurfaceID; 2] = [0, 0];
         check(
             unsafe {
                 ffi::vaCreateSurfaces(
@@ -151,8 +172,8 @@ impl VaapiEncoder {
                     ffi::VA_RT_FORMAT_YUV420,
                     aligned_width,
                     aligned_height,
-                    &mut surface,
-                    1,
+                    surfaces.as_mut_ptr(),
+                    surfaces.len() as u32,
                     &mut pixel_format_attrib,
                     1,
                 )
@@ -161,7 +182,7 @@ impl VaapiEncoder {
         )?;
 
         let mut context_id: ffi::VAContextID = 0;
-        let mut render_targets = [surface];
+        let mut render_targets = surfaces;
         check(
             unsafe {
                 ffi::vaCreateContext(
@@ -171,7 +192,7 @@ impl VaapiEncoder {
                     aligned_height as i32,
                     0, // no VA_PROGRESSIVE flag needed for encode
                     render_targets.as_mut_ptr(),
-                    1,
+                    render_targets.len() as i32,
                     &mut context_id,
                 )
             },
@@ -180,7 +201,8 @@ impl VaapiEncoder {
 
         // GPU color conversion setup: a second surface in the source BGRX
         // format, and a VPP (Video Post-Processing) config/context to
-        // convert it into the NV12 `surface` above entirely on the iGPU.
+        // convert it into whichever `surfaces` slot is the current target,
+        // entirely on the iGPU.
         let mut bgrx_format_attrib = ffi::VASurfaceAttrib {
             type_: ffi::VASurfaceAttribType_VASurfaceAttribPixelFormat,
             flags: ffi::VA_SURFACE_ATTRIB_SETTABLE,
@@ -222,7 +244,7 @@ impl VaapiEncoder {
         )?;
 
         let mut vpp_context_id: ffi::VAContextID = 0;
-        let mut vpp_render_targets = [surface];
+        let mut vpp_render_targets = surfaces;
         check(
             unsafe {
                 ffi::vaCreateContext(
@@ -232,7 +254,7 @@ impl VaapiEncoder {
                     aligned_height as i32,
                     0,
                     vpp_render_targets.as_mut_ptr(),
-                    1,
+                    vpp_render_targets.len() as i32,
                     &mut vpp_context_id,
                 )
             },
@@ -240,7 +262,7 @@ impl VaapiEncoder {
         )?;
 
         eprintln!(
-            "[vaapi] encoder ready: {width}x{height} (aligned {aligned_width}x{aligned_height}), GPU color conversion via VPP"
+            "[vaapi] encoder ready: {width}x{height} (aligned {aligned_width}x{aligned_height}), GPU color conversion via VPP, GOP {GOP_SIZE}"
         );
 
         Ok(Self {
@@ -248,7 +270,7 @@ impl VaapiEncoder {
             render_fd,
             config_id,
             context_id,
-            surface,
+            surfaces,
             src_surface,
             vpp_config_id,
             vpp_context_id,
@@ -257,6 +279,10 @@ impl VaapiEncoder {
             aligned_width,
             aligned_height,
             flip_180,
+            frame_count: 0,
+            idr_count: 0,
+            prev_frame_num: 0,
+            prev_poc: 0,
         })
     }
 
@@ -265,8 +291,16 @@ impl VaapiEncoder {
     /// VAAPI's own GPU VPP entrypoint, and encodes it as a standalone IDR
     /// frame. Returns the raw Annex-B H.264 bytes.
     pub fn encode_frame(&mut self, bgrx: &[u8], src_stride: usize) -> VaResult<Vec<u8>> {
+        let is_idr = self.frame_count % GOP_SIZE == 0;
+        let cur_idx = (self.frame_count % 2) as usize;
+        let cur_surface = self.surfaces[cur_idx];
+        // The other ping-pong slot: for a P slice this still holds the
+        // previous frame's reconstructed picture, untouched since we wrote
+        // it two calls ago (max_num_ref_frames=1 never looks further back).
+        let ref_surface = self.surfaces[1 - cur_idx];
+
         self.upload_bgrx_surface(bgrx, src_stride)?;
-        self.run_vpp_conversion()?;
+        self.run_vpp_conversion(cur_surface)?;
 
         let mbs_w = self.aligned_width / 16;
         let mbs_h = self.aligned_height / 16;
@@ -291,12 +325,21 @@ impl VaapiEncoder {
         let crop_bottom = (self.aligned_height - self.height) / 2;
         let crop_right = (self.aligned_width - self.width) / 2;
 
+        // Same frame_num/POC wrap points every frame regardless of IDR/P --
+        // these are sequence-wide constants, must match what the last IDR's
+        // packed SPS declared.
+        const LOG2_MAX_FRAME_NUM_MINUS4: u32 = 4; // frame_num wraps at 256
+        const LOG2_MAX_POC_LSB_MINUS4: u32 = 5; // poc_lsb wraps at 512
+
+        let frame_num = (self.frame_count % GOP_SIZE) as u16; // 0 at each IDR
+        let poc_lsb = frame_num.wrapping_mul(2);
+
         let mut seq: ffi::VAEncSequenceParameterBufferH264 = Default::default();
         seq.seq_parameter_set_id = 0;
         seq.level_idc = 41;
-        seq.intra_period = 1;
-        seq.intra_idr_period = 1;
-        seq.ip_period = 1;
+        seq.intra_period = GOP_SIZE as u32;
+        seq.intra_idr_period = GOP_SIZE as u32;
+        seq.ip_period = 1; // no B-frames: every non-I frame is a P
         seq.bits_per_second = 20_000_000;
         seq.max_num_ref_frames = 1;
         seq.picture_width_in_mbs = mbs_w as u16;
@@ -306,27 +349,38 @@ impl VaapiEncoder {
             seq.seq_fields.bits.set_chroma_format_idc(1);
             seq.seq_fields.bits.set_frame_mbs_only_flag(1);
             seq.seq_fields.bits.set_direct_8x8_inference_flag(1);
-            seq.seq_fields.bits.set_log2_max_frame_num_minus4(0);
+            seq.seq_fields.bits.set_log2_max_frame_num_minus4(LOG2_MAX_FRAME_NUM_MINUS4);
             seq.seq_fields.bits.set_pic_order_cnt_type(0);
-            seq.seq_fields.bits.set_log2_max_pic_order_cnt_lsb_minus4(0);
+            seq.seq_fields.bits.set_log2_max_pic_order_cnt_lsb_minus4(LOG2_MAX_POC_LSB_MINUS4);
         }
         seq.frame_cropping_flag = if crop_bottom > 0 || crop_right > 0 { 1 } else { 0 };
         seq.frame_crop_right_offset = crop_right;
         seq.frame_crop_bottom_offset = crop_bottom;
 
         let mut pic: ffi::VAEncPictureParameterBufferH264 = Default::default();
-        pic.CurrPic.picture_id = self.surface;
-        pic.CurrPic.frame_idx = 0;
+        pic.CurrPic.picture_id = cur_surface;
+        pic.CurrPic.frame_idx = frame_num as u32;
         pic.CurrPic.flags = 0;
+        pic.CurrPic.TopFieldOrderCnt = poc_lsb as i32;
+        pic.CurrPic.BottomFieldOrderCnt = poc_lsb as i32;
         for r in pic.ReferenceFrames.iter_mut() {
             r.picture_id = ffi::VA_INVALID_SURFACE;
             r.flags = ffi::VA_PICTURE_H264_INVALID;
+        }
+        if !is_idr {
+            // Sole reference for the P slice: the previous frame, still
+            // sitting in the other ping-pong slot.
+            pic.ReferenceFrames[0].picture_id = ref_surface;
+            pic.ReferenceFrames[0].frame_idx = self.prev_frame_num as u32;
+            pic.ReferenceFrames[0].flags = ffi::VA_PICTURE_H264_SHORT_TERM_REFERENCE;
+            pic.ReferenceFrames[0].TopFieldOrderCnt = self.prev_poc;
+            pic.ReferenceFrames[0].BottomFieldOrderCnt = self.prev_poc;
         }
         pic.coded_buf = coded_buf;
         pic.pic_parameter_set_id = 0;
         pic.seq_parameter_set_id = 0;
         pic.last_picture = 0;
-        pic.frame_num = 0;
+        pic.frame_num = frame_num;
         pic.pic_init_qp = 26;
         pic.num_ref_idx_l0_active_minus1 = 0;
         pic.num_ref_idx_l1_active_minus1 = 0;
@@ -334,8 +388,10 @@ impl VaapiEncoder {
         pic.second_chroma_qp_index_offset = 0;
         pic.pic_fields.bits = Default::default();
         unsafe {
-            pic.pic_fields.bits.set_idr_pic_flag(1);
-            pic.pic_fields.bits.set_reference_pic_flag(0);
+            pic.pic_fields.bits.set_idr_pic_flag(is_idr as u32);
+            // Both I(DR) and P frames here are referenced by the next P in
+            // the IPPP chain, so both are reference pictures.
+            pic.pic_fields.bits.set_reference_pic_flag(1);
             // CABAC + Main profile instead of CAVLC + Constrained Baseline: the
             // tablet's hardware decoder rendered solid green with CAVLC/Baseline
             // (confirmed decoding, just wrong colors) while both ffmpeg and
@@ -349,51 +405,60 @@ impl VaapiEncoder {
         slice.macroblock_address = 0;
         slice.num_macroblocks = mbs_w * mbs_h;
         slice.macroblock_info = ffi::VA_INVALID_ID;
-        slice.slice_type = 2; // I slice
+        slice.slice_type = if is_idr { 2 } else { 0 }; // I slice : P slice
         slice.pic_parameter_set_id = 0;
-        slice.idr_pic_id = 0;
-        slice.pic_order_cnt_lsb = 0;
+        slice.idr_pic_id = self.idr_count;
+        slice.pic_order_cnt_lsb = poc_lsb;
         slice.direct_spatial_mv_pred_flag = 0;
         slice.num_ref_idx_active_override_flag = 0;
         slice.slice_qp_delta = 0;
         slice.disable_deblocking_filter_idc = 0;
+        for r in slice.RefPicList0.iter_mut() {
+            r.picture_id = ffi::VA_INVALID_SURFACE;
+            r.flags = ffi::VA_PICTURE_H264_INVALID;
+        }
+        if !is_idr {
+            slice.RefPicList0[0] = pic.ReferenceFrames[0];
+        }
 
         // The iHD driver's low-power H.264 entrypoint only emits slice data
         // itself -- it does not synthesize SPS/PPS. Build them by hand and
-        // hand them over as "packed header" buffers so every frame (each an
-        // independent IDR) is standalone-decodable.
-        let h264_params = H264Params {
-            profile_idc: 77, // Main
-            level_idc: seq.level_idc,
-            mbs_width: mbs_w,
-            mbs_height: mbs_h,
-            max_num_ref_frames: seq.max_num_ref_frames,
-            log2_max_frame_num_minus4: 0,
-            log2_max_pic_order_cnt_lsb_minus4: 0,
-            frame_crop_right: seq.frame_crop_right_offset,
-            frame_crop_bottom: seq.frame_crop_bottom_offset,
-            pic_init_qp: pic.pic_init_qp,
-            deblocking_filter_control_present: true,
-        };
-        let sps_bytes = h264_headers::build_sps(&h264_params);
-        let pps_bytes = h264_headers::build_pps(&h264_params);
-
+        // hand them over as "packed header" buffers, only on IDR frames --
+        // P slices in between rely on the parameter sets already active on
+        // the decoder from the last IDR, standard Annex-B convention.
         let mut packed_seq_param_buf: ffi::VABufferID = 0;
         let mut packed_seq_data_buf: ffi::VABufferID = 0;
         let mut packed_pic_param_buf: ffi::VABufferID = 0;
         let mut packed_pic_data_buf: ffi::VABufferID = 0;
-        self.create_packed_header(
-            ffi::VAEncPackedHeaderType_VAEncPackedHeaderSequence,
-            &sps_bytes,
-            &mut packed_seq_param_buf,
-            &mut packed_seq_data_buf,
-        )?;
-        self.create_packed_header(
-            ffi::VAEncPackedHeaderType_VAEncPackedHeaderPicture,
-            &pps_bytes,
-            &mut packed_pic_param_buf,
-            &mut packed_pic_data_buf,
-        )?;
+        if is_idr {
+            let h264_params = H264Params {
+                profile_idc: 77, // Main
+                level_idc: seq.level_idc,
+                mbs_width: mbs_w,
+                mbs_height: mbs_h,
+                max_num_ref_frames: seq.max_num_ref_frames,
+                log2_max_frame_num_minus4: LOG2_MAX_FRAME_NUM_MINUS4,
+                log2_max_pic_order_cnt_lsb_minus4: LOG2_MAX_POC_LSB_MINUS4,
+                frame_crop_right: seq.frame_crop_right_offset,
+                frame_crop_bottom: seq.frame_crop_bottom_offset,
+                pic_init_qp: pic.pic_init_qp,
+                deblocking_filter_control_present: true,
+            };
+            let sps_bytes = h264_headers::build_sps(&h264_params);
+            let pps_bytes = h264_headers::build_pps(&h264_params);
+            self.create_packed_header(
+                ffi::VAEncPackedHeaderType_VAEncPackedHeaderSequence,
+                &sps_bytes,
+                &mut packed_seq_param_buf,
+                &mut packed_seq_data_buf,
+            )?;
+            self.create_packed_header(
+                ffi::VAEncPackedHeaderType_VAEncPackedHeaderPicture,
+                &pps_bytes,
+                &mut packed_pic_param_buf,
+                &mut packed_pic_data_buf,
+            )?;
+        }
 
         let mut seq_buf: ffi::VABufferID = 0;
         let mut pic_buf: ffi::VABufferID = 0;
@@ -442,18 +507,21 @@ impl VaapiEncoder {
         )?;
 
         check(
-            unsafe { ffi::vaBeginPicture(self.dpy, self.context_id, self.surface) },
+            unsafe { ffi::vaBeginPicture(self.dpy, self.context_id, cur_surface) },
             "vaBeginPicture",
         )?;
-        let named_buffers: [(&str, ffi::VABufferID); 7] = [
-            ("packed_seq_param", packed_seq_param_buf),
-            ("packed_seq_data", packed_seq_data_buf),
-            ("seq", seq_buf),
-            ("packed_pic_param", packed_pic_param_buf),
-            ("packed_pic_data", packed_pic_data_buf),
-            ("pic", pic_buf),
-            ("slice", slice_buf),
-        ];
+        let mut named_buffers: Vec<(&str, ffi::VABufferID)> = Vec::with_capacity(7);
+        if is_idr {
+            named_buffers.push(("packed_seq_param", packed_seq_param_buf));
+            named_buffers.push(("packed_seq_data", packed_seq_data_buf));
+        }
+        named_buffers.push(("seq", seq_buf));
+        if is_idr {
+            named_buffers.push(("packed_pic_param", packed_pic_param_buf));
+            named_buffers.push(("packed_pic_data", packed_pic_data_buf));
+        }
+        named_buffers.push(("pic", pic_buf));
+        named_buffers.push(("slice", slice_buf));
         for (name, mut id) in named_buffers {
             let status = unsafe { ffi::vaRenderPicture(self.dpy, self.context_id, &mut id, 1) };
             if status as u32 != ffi::VA_STATUS_SUCCESS {
@@ -465,7 +533,7 @@ impl VaapiEncoder {
             "vaEndPicture",
         )?;
         check(
-            unsafe { ffi::vaSyncSurface(self.dpy, self.surface) },
+            unsafe { ffi::vaSyncSurface(self.dpy, cur_surface) },
             "vaSyncSurface",
         )?;
 
@@ -475,6 +543,13 @@ impl VaapiEncoder {
             unsafe { ffi::vaDestroyBuffer(self.dpy, coded_buf) },
             "vaDestroyBuffer(coded)",
         )?;
+
+        self.prev_frame_num = frame_num;
+        self.prev_poc = poc_lsb as i32;
+        if is_idr {
+            self.idr_count = self.idr_count.wrapping_add(1);
+        }
+        self.frame_count += 1;
 
         Ok(out)
     }
@@ -564,9 +639,9 @@ impl VaapiEncoder {
 
     /// Converts `src_surface` (BGRX) into `surface` (NV12) entirely on the
     /// GPU via VAAPI's Video Post-Processing entrypoint.
-    fn run_vpp_conversion(&mut self) -> VaResult<()> {
+    fn run_vpp_conversion(&mut self, target_surface: ffi::VASurfaceID) -> VaResult<()> {
         check(
-            unsafe { ffi::vaBeginPicture(self.dpy, self.vpp_context_id, self.surface) },
+            unsafe { ffi::vaBeginPicture(self.dpy, self.vpp_context_id, target_surface) },
             "vaBeginPicture(VPP)",
         )?;
 
@@ -598,7 +673,7 @@ impl VaapiEncoder {
             "vaEndPicture(VPP)",
         )?;
         check(
-            unsafe { ffi::vaSyncSurface(self.dpy, self.surface) },
+            unsafe { ffi::vaSyncSurface(self.dpy, target_surface) },
             "vaSyncSurface(VPP)",
         )?;
         check(
@@ -640,8 +715,8 @@ impl Drop for VaapiEncoder {
             ffi::vaDestroySurfaces(self.dpy, &mut src, 1);
             ffi::vaDestroyContext(self.dpy, self.context_id);
             ffi::vaDestroyConfig(self.dpy, self.config_id);
-            let mut s = self.surface;
-            ffi::vaDestroySurfaces(self.dpy, &mut s, 1);
+            let mut s = self.surfaces;
+            ffi::vaDestroySurfaces(self.dpy, s.as_mut_ptr(), s.len() as i32);
             ffi::vaTerminate(self.dpy);
             libc::close(self.render_fd);
         }
