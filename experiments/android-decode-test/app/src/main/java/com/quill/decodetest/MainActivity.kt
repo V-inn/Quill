@@ -274,6 +274,16 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 var latencySumMs = 0L
                 var latencyMinMs = Long.MAX_VALUE
                 var latencyMaxMs = Long.MIN_VALUE
+                var latencySampleCount = 0L
+                // FIFO of send-timestamps for frames queued into the decoder
+                // but not yet rendered -- the decoder buffers several frames
+                // internally (confirmed live: `rendered` trailing `queued`
+                // by ~5-6 at steady state) before it starts producing
+                // output, so "the frame we just read this loop iteration" is
+                // NOT the frame that actually renders on this iteration. All
+                // frames are independent IDR with no reordering, so FIFO
+                // order is correct.
+                val pendingSentTimesMs = ArrayDeque<Long>()
 
                 while (running) {
                     val frameSentAtMs = try {
@@ -300,17 +310,33 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                             presentationTimeUs, MediaCodec.BUFFER_FLAG_KEY_FRAME
                         )
                         presentationTimeUs += 16_666 // ~60fps spacing, cosmetic only for v0
+                        pendingSentTimesMs.addLast(frameSentAtMs)
                         queuedCount++
                     } else {
                         Log.w(tag, "no input buffer available (dequeueInputBuffer=$inIndex)")
                     }
 
+                    var latencyMs = 0L
                     var outIndex = codec!!.dequeueOutputBuffer(bufferInfo, 10_000)
                     while (true) {
                         when {
                             outIndex >= 0 -> {
                                 codec!!.releaseOutputBuffer(outIndex, true)
                                 renderedCount++
+                                // Milestone 7 fix: match this render to the
+                                // send-timestamp of the frame that actually
+                                // fed it (FIFO, oldest pending), not
+                                // whatever frame this loop iteration just
+                                // happened to read off the socket -- the
+                                // decoder buffers several frames internally,
+                                // so those aren't the same frame.
+                                pendingSentTimesMs.removeFirstOrNull()?.let { sentAtMs ->
+                                    latencyMs = (System.currentTimeMillis() - clockOffsetMs) - sentAtMs
+                                    latencySumMs += latencyMs
+                                    if (latencyMs < latencyMinMs) latencyMinMs = latencyMs
+                                    if (latencyMs > latencyMaxMs) latencyMaxMs = latencyMs
+                                    latencySampleCount++
+                                }
                                 outIndex = codec!!.dequeueOutputBuffer(bufferInfo, 0)
                             }
                             outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
@@ -325,23 +351,13 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                         }
                     }
 
-                    // Milestone 7: per-frame glass-to-glass latency estimate,
-                    // converting the daemon's send timestamp into
-                    // android-clock terms via the calibrated offset -- see
-                    // clock_sync.rs. Approximate (doesn't isolate decode vs
-                    // transport vs render), but log-based instead of
-                    // camera-based, so it's cheap to sample continuously.
-                    val latencyMs = (System.currentTimeMillis() - clockOffsetMs) - frameSentAtMs
-                    latencySumMs += latencyMs
-                    if (latencyMs < latencyMinMs) latencyMinMs = latencyMs
-                    if (latencyMs > latencyMaxMs) latencyMaxMs = latencyMs
-
                     frameCount++
                     if (frameCount == 1L || frameCount % 30 == 0L) {
+                        val avg = if (latencySampleCount > 0) latencySumMs / latencySampleCount else 0
                         Log.i(
                             tag,
                             "frame $frameCount ($length bytes): queued=$queuedCount rendered=$renderedCount, " +
-                                "latency avg=${latencySumMs / frameCount}ms min=${latencyMinMs}ms max=${latencyMaxMs}ms (this frame: ${latencyMs}ms)"
+                                "pending=${pendingSentTimesMs.size} latency avg=${avg}ms min=${latencyMinMs}ms max=${latencyMaxMs}ms (this frame: ${latencyMs}ms)"
                         )
                     }
                 }

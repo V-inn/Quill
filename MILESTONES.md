@@ -495,7 +495,7 @@ event) — likely a real multitouch protocol (`ABS_MT_*` slots) or OS-level gest
 recognition, not a small extension of the current single-touch path. Worth its own
 milestone later, not a follow-up to this one.
 
-## 7. Tuning pass — MOSTLY RESOLVED (real pipeline latency ~54ms, not ~150-180ms)
+## 7. Tuning pass — ROOT CAUSE FOUND (Android decoder pipeline depth, ~100ms of ~145ms total)
 
 Encoder settings, buffer sizes, thread priorities to cut jitter. Three concrete items
 were recorded as Milestone 4's findings: (1) import DMA-BUF from PipeWire instead of
@@ -646,19 +646,67 @@ already-known `dequeue→encoded` (~10.5ms avg) and the Milestone-7 clock-sync
 `encode→render` number (~15ms avg), **the entire instrumented pipeline totals only
 ~54ms** — nowhere near the ~150-180ms the camera method measured.
 
-**This means the ~150-180ms number was very likely never our pipeline's fault.**
-Leading hypothesis: the camera test's on-screen clock was rendered in Firefox (a
-`requestAnimationFrame`-driven canvas), and browser engines are well known to carry
-multiple frames of their own internal latency (main thread → compositor thread → GPU
-present) before a canvas update is actually handed to the window system for
-compositing/capture — a stage entirely outside this project's pipeline, invisible to
-`dequeue→encoded` or `encode→render` instrumentation, and plausibly large enough to
-account for the missing ~100ms. Not yet confirmed by re-running the camera test with
-the native barcode-probe's minimal renderer in place of Firefox's canvas (would be
-strong confirmation if the camera-measured number dropped to ~50-70ms) — a cheap
-follow-up if this needs closing out definitively, but the instrumented evidence
-already strongly suggests **this project's actual glass-to-glass latency is closer
-to 50-60ms, not 150-180ms.**
+**Leading hypothesis at the time: the ~150-180ms was a Firefox-specific measurement
+artifact, not real.** Browser engines carry their own multi-frame compositor latency
+(main thread → compositor thread → GPU present) before a canvas update reaches the
+window system — external to this project's pipeline, invisible to any of the
+instrumentation above. Testable: swap the camera test's Firefox clock for a native
+renderer and see if the measured gap shrinks.
+
+### Confirming (or not) with a native clock — the hypothesis was wrong, but this found the real bug
+
+Built `experiments/capture-latency-probe/src/bin/readable_clock.rs`: a second minifb
+binary, hand-rolled 7-segment digit rendering (no browser, no text-rendering
+dependency), showing `epoch_seconds.milliseconds`. Ran two instances — one on the
+main screen, one on the virtual monitor (streamed to the tablet like anything else)
+— and repeated the exact same slow-motion filming method.
+
+**Result: ~144ms average (151ms, 145ms, 135ms) — statistically the same as the
+Firefox-based ~150-180ms.** Hypothesis refuted with a real controlled experiment, not
+just abandoned. The gap is real, and it isn't a browser artifact.
+
+**Second hypothesis, also tested and also refuted:** the video frame write to the
+transport socket did three separate `write_all()` calls (8-byte timestamp, 4-byte
+length, payload) with `TCP_NODELAY` set — each plausibly its own TCP segment / adb
+protocol packet, adding per-packet adb/USB overhead three times over for no reason.
+Combined into one buffer, one `write_all()` (`portal_capture.rs`). Re-ran the native-
+clock camera test: **~148ms average (152, 152, 136, 153ms) — no change.** Also not it.
+
+**Third attempt found the real bug, in the measurement itself, not the pipeline.**
+Cross-checked against a detail that had been visible in the logs the whole time but
+not connected: `queued=N rendered=N-5` (or so) at every steady-state log line — the
+hardware decoder buffers several frames internally (~5 in flight) before it starts
+producing output. But `MainActivity.kt`'s per-frame latency calculation used
+`frameSentAtMs` — the timestamp of whatever frame had *just been read off the socket
+this loop iteration* — regardless of whether a render actually happened that
+iteration, or which of the ~5 in-flight frames it was. With a ~20ms/frame arrival
+cadence and ~5 frames of decoder pipeline depth, that's exactly ~100ms of real
+latency the old calculation structurally could not see, no matter how long it ran.
+
+**Fix:** track an explicit FIFO (`ArrayDeque<Long>`) of pending send-timestamps, one
+pushed per frame queued into the decoder, one popped and used *only* when a render
+actually happens (`outIndex >= 0`) — correct because all frames are independent IDR
+with no reordering, so decode/render order matches encode order. Live-tested:
+individual frame latencies now read **87-146ms** (steady state, excluding one large
+early-connection outlier from the pipeline still filling) — averaging toward
+**~100-110ms**, not the old measurement's ~17-20ms.
+
+**Final accounting, all four numbers now trustworthy and pointing the same
+direction:** barcode capture latency (~28ms) + `dequeue→encoded` (~10-12ms) +
+corrected decode/render latency (~100-110ms) ≈ **~140-150ms total — matches the
+camera-measured ~144-150ms almost exactly.** Milestone 4's original ~300ms number,
+Milestone 7's ~150-180ms re-measurements, and this final instrumented total now all
+agree, and the earlier ~15ms "encode→render" figure (Milestone 7, before this fix)
+is retroactively known to have been wrong — an artifact of the same FIFO bug, not a
+real measurement of a fast pipeline.
+
+**Where the latency actually lives:** overwhelmingly in the Android hardware
+decoder's own internal pipeline depth (~100ms, ~5 buffered frames), not in this
+project's capture (~28ms) or encode (~10-12ms) stages, which are both fast.
+`KEY_LOW_LATENCY` was tried earlier (Milestone 7) and showed "no measurable effect"
+— but that test used the *buggy* latency measurement, so that negative result should
+be treated as unverified, not confirmed, and would be worth re-checking against this
+corrected measurement if this is picked up again. Not re-tested this session.
 
 ## 8. (Optional v2) AOA transport
 

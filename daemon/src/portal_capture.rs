@@ -377,14 +377,18 @@ pub fn run_capture(
                         // send time (its own clock) so Android can compute a
                         // per-frame latency estimate using the offset from
                         // the earlier clock-sync exchange -- see clock_sync.rs.
-                        let ts = crate::clock_sync::now_millis().to_be_bytes();
-                        let len = (encoded.len() as u32).to_be_bytes();
-                        if sock
-                            .write_all(&ts)
-                            .and_then(|_| sock.write_all(&len))
-                            .and_then(|_| sock.write_all(&encoded))
-                            .is_err()
-                        {
+                        //
+                        // Combined into one buffer and one write_all() call
+                        // rather than three separate ones: with TCP_NODELAY
+                        // set, each write_all was its own TCP segment / adb
+                        // protocol packet -- three small packets (8, 4 bytes)
+                        // ahead of the real payload adds per-packet adb/USB
+                        // overhead three times over for no reason.
+                        let mut frame_buf = Vec::with_capacity(12 + encoded.len());
+                        frame_buf.extend_from_slice(&crate::clock_sync::now_millis().to_be_bytes());
+                        frame_buf.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+                        frame_buf.extend_from_slice(&encoded);
+                        if sock.write_all(&frame_buf).is_err() {
                             eprintln!("[transport] write failed, dropping connection");
                             user_data.transport = None;
                         }
