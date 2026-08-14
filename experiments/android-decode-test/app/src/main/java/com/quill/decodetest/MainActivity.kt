@@ -2,6 +2,7 @@ package com.quill.decodetest
 
 import android.app.Activity
 import android.media.MediaCodec
+import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.os.Bundle
 import android.util.Log
@@ -263,6 +264,21 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 // this tablet's hardware decoder specifically (see MILESTONES.md).
                 codec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
                 Log.i(tag, "using decoder: ${codec!!.name}")
+                // Definitive answer, not inference from behavior: per
+                // source.android.com's own low-latency-media doc, SoC
+                // partners must implement decoder-driver support for this
+                // feature -- if they haven't, the flag is simply ignored.
+                // Ask the OS directly whether this decoder's driver claims
+                // support at all.
+                val lowLatencySupported = try {
+                    codec!!.codecInfo
+                        .getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC)
+                        .isFeatureSupported(MediaCodecInfo.CodecCapabilities.FEATURE_LowLatency)
+                } catch (e: Exception) {
+                    Log.w(tag, "failed to query FEATURE_LowLatency support", e)
+                    null
+                }
+                Log.i(tag, "decoder FEATURE_LowLatency supported: $lowLatencySupported")
                 // The standard KEY_LOW_LATENCY key is a no-op on Samsung's
                 // Exynos decoders -- they need a vendor-specific parameter
                 // instead. Confirmed against moonlight-android (a mature

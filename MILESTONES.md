@@ -754,9 +754,25 @@ implemented, since the reasoning rules it out without needing a live test.
 parameter, `KEY_PRIORITY`, plus `KEY_OPERATING_RATE` and async mode ruled out on
 solid documentation/reasoning grounds), all converging on the same conclusion: this
 tablet's ~85-115ms decoder pipeline depth is a firmware/silicon floor, not reachable
-from app-level `MediaCodec` configuration.** Stopping the decoder-latency search
-here — further progress would need either a different decoder entirely (unlikely to
-exist on this hardware) or work outside this project's reach (SoC vendor firmware).
+from app-level `MediaCodec` configuration.**
+
+**Correction, worth getting precise rather than leaving an assumption unchecked:**
+`source.android.com`'s own low-latency-media doc states the feature requires SoC
+partners to have implemented decoder-driver support — prompting a direct check
+instead of continuing to infer support from behavior. Added a query of
+`MediaCodecInfo.CodecCapabilities.isFeatureSupported(FEATURE_LowLatency)` right
+after creating the decoder. **Result: `true`** — this decoder's driver *does* claim
+low-latency support. That sharpens the conclusion rather than reopening it: the
+feature is implemented and enabling it demonstrably changes nothing measurable, so
+the ~5-frame pipeline depth isn't a missing driver capability — it's inherent even
+in this decoder's fastest advertised mode, most plausibly a real hardware pipeline-
+stage depth (parse → entropy-decode → reconstruct → deblock → output, each
+plausibly a pipeline stage in a streaming ASIC design) rather than a configurable
+buffering policy at all.
+
+Stopping the decoder-latency search here — further progress would need either a
+different decoder entirely (unlikely to exist on this hardware) or work outside
+this project's reach (SoC vendor firmware/silicon).
 
 ## 8. (Optional v2) AOA transport
 
