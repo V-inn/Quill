@@ -1288,3 +1288,63 @@ reconnect, or a resync marker/checksum in the handshake itself so corruption can
 *detected* and the attempt retried rather than silently accepted. Not attempted this
 session -- a real scoping decision given the size of the fix already shipped, not an
 oversight.
+
+## 12. Investigated: double-cursor "ghosting" on stop-motion -- likely a hardware
+## panel characteristic, not a Quill bug
+
+User reported: after a drag/motion stops, the tablet briefly (and sometimes
+persistently, in a still screenshot) shows two crisp, non-blurred cursor icons
+side by side, offset by a small amount -- not a blur/smear, two distinct copies of
+the same icon. Confirmed live via real tablet screenshots (not a hypothetical).
+
+**Methodically eliminated every stage of the pipeline Quill actually controls,**
+each with direct evidence, not inference:
+
+- **Raw captured frame (KWin's own compositor output, before any encoding):**
+  dumped directly via a temporary continuous-frame-dump diagnostic
+  (`portal_capture.rs`'s existing one-shot `QUILL_DUMP_FRAME` debug path, briefly
+  modified to dump every frame instead of just the first -- reverted after use, not
+  kept). Clean, single cursor, for a real reproducing motion+stop test.
+- **Our own encoded H.264 bitstream** (VAAPI + VPP color conversion, the daemon's own
+  work): extracted and decoded every frame from the daemon's own `.h264` output file
+  via `ffmpeg` for a real reproducing test, inspected the frames right at the stop
+  transition. Clean.
+- **Android's own system pointer icon:** hypothesized Android might be drawing its
+  own hover-pointer overlay on top of the video (a real, separate mechanism from
+  video content) -- suppressed it (`surfaceView.pointerIcon = PointerIcon.TYPE_NULL`,
+  kept, harmless either way). **No change** -- also, the user confirmed the artifact
+  reproduces with plain desktop mouse movement, not just S Pen hover, ruling this
+  mechanism out on its own logic before the live test even confirmed it.
+- **Decode/render frame pacing:** the per-frame output-draining loop
+  (`runDecodeLoop` in `MainActivity.kt`) used to call `releaseOutputBuffer(index,
+  render=true)` on every ready output buffer with zero pacing -- multiple real
+  frames landing in a burst (exactly what happens right as motion stops) would all
+  render back to back. Fixed to only render the newest buffer in a burst, discarding
+  (not rendering) the rest -- same principle as the daemon's own capture-side
+  drop-stale-frames logic. **Kept** (a real correctness improvement regardless), but
+  **no change** to the artifact.
+- **Decoder implementation:** swapped from the deliberately-chosen software decoder
+  (`c2.android.avc.decoder`, Milestone 7's latency win) to the hardware one
+  (`c2.exynos.h264.decoder`) as a diagnostic, reverted after. **No change** -- rules
+  out a decoder-implementation-specific bug.
+- **Screenshot-capture-timing artifact** (i.e. not a real bug, just an unlucky still
+  captured mid-transition): ruled out -- user confirmed the artifact is visible live,
+  watching the tablet with their own eyes, not only in screenshots taken to document
+  it.
+
+**Conclusion:** every stage of the pipeline this project controls -- compositor
+capture, VAAPI encode, transport framing (indirectly, via the clean decoded
+bitstream), MediaCodec decode (both implementations), and render-buffer pacing --
+was individually verified clean or shown to make no difference. The artifact is
+live-visible, decoder-independent, and downstream of everything tested. Leading
+theory: LCD panel response-time/ghosting -- a physical display characteristic (this
+tablet's panel EDID reports a 2020 manufacture date, plausibly not tuned for fast
+motion clarity), consistent with every observation including "worse at higher
+frame rates" (faster real content changes stress panel response time harder) and
+"still present, just smaller, when the pipeline was artificially throttled to
+~1fps" (still some transition, just less frequent). Not something Quill's software
+can fix if correct -- analogous to noticing a monitor's own motion blur. The one
+untested remaining variable is bit-level AOA transport corruption, considered
+unlikely given the artifact's clean, correctly-shaped appearance (typical transport
+corruption shows as block/macroblock artifacts, not two intact icons) -- not
+pursued further this session.

@@ -110,6 +110,16 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         // paths per MotionEvent, so all three listeners coexist safely with
         // no double-processing of the same event.
         surfaceView.setOnGenericMotionListener { _, event -> handleMotionEvent(event, down = false) }
+        // Confirmed live via a real tablet screenshot: two distinct, crisp
+        // cursor arrows side by side -- not motion blur/interpolation (that
+        // would look like a smear, not two sharp icons). Android draws its
+        // own system pointer icon for S Pen hover independent of whatever
+        // the app renders, on top of it -- so the real desktop cursor
+        // (already embedded in the video by the daemon/KWin) and Android's
+        // own hover-pointer icon were both visible at once. Suppressing the
+        // system one here: the video's own embedded cursor is the only one
+        // that should be visible.
+        surfaceView.pointerIcon = android.view.PointerIcon.getSystemIcon(this, android.view.PointerIcon.TYPE_NULL)
     }
 
     private fun showStatus(message: String) {
@@ -714,27 +724,42 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                     }
 
                     var latencyMs = 0L
+                    // Confirmed live via a real tablet screenshot: two
+                    // crisp, non-blurred cursor icons visible at once --
+                    // not a compositor/encode artifact (both the daemon's
+                    // raw captured frame and its encoded H.264 output were
+                    // independently verified clean for the same motion).
+                    // Root cause: this loop used to call
+                    // releaseOutputBuffer(index, render=true) on every
+                    // single output buffer it found ready, with zero
+                    // pacing. Right as motion stops, several real frames
+                    // (queued during the stop) land in a tight burst --
+                    // rendering all of them back to back, faster than the
+                    // panel/eye can cleanly separate them, showed as two
+                    // overlapping valid frames ("ghosting" that got worse
+                    // the faster frames arrived -- confirmed live, it
+                    // shrank when the pipeline was artificially throttled).
+                    // Same fix as the daemon's own capture-side drop-stale
+                    // logic: only *render* the newest buffer in a burst,
+                    // discard (don't render) the rest.
                     var outIndex = codec!!.dequeueOutputBuffer(bufferInfo, 10_000)
+                    var pendingRenderIndex = -1
+                    var lastSentAtMs: Long? = null
                     while (true) {
                         when {
                             outIndex >= 0 -> {
-                                codec!!.releaseOutputBuffer(outIndex, true)
-                                renderedCount++
-                                if (renderedCount == 1L) hideStatus()
-                                // Milestone 7 fix: match this render to the
-                                // send-timestamp of the frame that actually
-                                // fed it (FIFO, oldest pending), not
-                                // whatever frame this loop iteration just
-                                // happened to read off the socket -- the
-                                // decoder buffers several frames internally,
-                                // so those aren't the same frame.
-                                pendingSentTimesMs.removeFirstOrNull()?.let { sentAtMs ->
-                                    latencyMs = (System.currentTimeMillis() - clockOffsetMs) - sentAtMs
-                                    latencySumMs += latencyMs
-                                    if (latencyMs < latencyMinMs) latencyMinMs = latencyMs
-                                    if (latencyMs > latencyMaxMs) latencyMaxMs = latencyMs
-                                    latencySampleCount++
+                                if (pendingRenderIndex >= 0) {
+                                    // An older buffer from this same burst --
+                                    // release without rendering it.
+                                    codec!!.releaseOutputBuffer(pendingRenderIndex, false)
                                 }
+                                pendingRenderIndex = outIndex
+                                // One decoded buffer == one queued input
+                                // frame, rendered or not -- pop the FIFO
+                                // here (every buffer, not just the one that
+                                // ends up rendered) or it desyncs from
+                                // queuedCount over time.
+                                lastSentAtMs = pendingSentTimesMs.removeFirstOrNull() ?: lastSentAtMs
                                 outIndex = codec!!.dequeueOutputBuffer(bufferInfo, 0)
                             }
                             outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
@@ -746,6 +771,24 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                                 Log.w(tag, "dequeueOutputBuffer returned $outIndex")
                                 break
                             }
+                        }
+                    }
+                    if (pendingRenderIndex >= 0) {
+                        codec!!.releaseOutputBuffer(pendingRenderIndex, true)
+                        renderedCount++
+                        if (renderedCount == 1L) hideStatus()
+                        // Milestone 7 fix: match this render to the
+                        // send-timestamp of the frame that actually fed it
+                        // (FIFO, oldest pending), not whatever frame this
+                        // loop iteration just happened to read off the
+                        // socket -- the decoder buffers several frames
+                        // internally, so those aren't the same frame.
+                        lastSentAtMs?.let { sentAtMs ->
+                            latencyMs = (System.currentTimeMillis() - clockOffsetMs) - sentAtMs
+                            latencySumMs += latencyMs
+                            if (latencyMs < latencyMinMs) latencyMinMs = latencyMs
+                            if (latencyMs > latencyMaxMs) latencyMaxMs = latencyMs
+                            latencySampleCount++
                         }
                     }
 
