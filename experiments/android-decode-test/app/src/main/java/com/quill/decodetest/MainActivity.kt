@@ -252,10 +252,11 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 inputWriterThread = Thread { runInputWriterLoop(out) }.also { it.start() }
 
                 val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height)
-                // Milestone 7: ask the decoder to minimize its own internal
-                // buffering (some hardware decoders queue several frames
-                // deep by default). Harmlessly ignored on decoders/OS
-                // versions that don't support it.
+                // Re-verified with the corrected (FIFO-based) latency
+                // measurement (Milestone 7): genuinely no effect on this
+                // decoder (~85-115ms either way, same ~4-5 frame pipeline
+                // depth). Left enabled anyway -- harmless here, and other
+                // decoders/devices (e.g. the S10 FE+) may actually honor it.
                 format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
                 // Back to the device's default (hardware) decoder now that the
                 // daemon encodes Main profile/CABAC instead of Constrained

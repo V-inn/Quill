@@ -703,10 +703,18 @@ real measurement of a fast pipeline.
 **Where the latency actually lives:** overwhelmingly in the Android hardware
 decoder's own internal pipeline depth (~100ms, ~5 buffered frames), not in this
 project's capture (~28ms) or encode (~10-12ms) stages, which are both fast.
-`KEY_LOW_LATENCY` was tried earlier (Milestone 7) and showed "no measurable effect"
-— but that test used the *buggy* latency measurement, so that negative result should
-be treated as unverified, not confirmed, and would be worth re-checking against this
-corrected measurement if this is picked up again. Not re-tested this session.
+
+**`KEY_LOW_LATENCY` re-checked with the corrected measurement — same verdict, now
+trustworthy.** A/B tested live: with the flag, individual frame latencies ran
+100-118ms (min 85ms floor); with it removed, 92-115ms (min 80-85ms floor) — no
+meaningful difference, decoder pipeline depth (`pending=4-5` both ways) unchanged.
+Daemon-side numbers matched almost exactly between the two runs too (capture
+29.45ms vs 29.94ms, encode 14.4ms vs 15.0ms), confirming those stages are stable
+and unaffected by the decoder flag either way, as expected. The original "no
+effect" verdict turns out to have been *correct*, just previously unverified —
+this decoder's ~4-5 frame pipeline depth is fixed regardless of the flag. Left
+`KEY_LOW_LATENCY` enabled in code anyway: harmless here, and other decoders/devices
+(e.g. the S10 FE+) may actually honor it, so no reason to remove a no-cost request.
 
 ## 8. (Optional v2) AOA transport
 
