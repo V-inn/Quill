@@ -249,7 +249,27 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private fun sendHandshake(out: DataOutputStream) {
         // Real Display metrics + InputDevice.getMotionRange() -- the design
         // doc's capability handshake, not hardcoded per-device constants.
-        val metrics = resources.displayMetrics
+        //
+        // `resources.displayMetrics` is the legacy "app usable size" API --
+        // it still excludes the system-bar-reserved region even with
+        // edge-to-edge active (the bars are hidden, but that reserved
+        // region isn't reflected here), which under-reports the real touch
+        // surface and made pen/finger position drift increasingly off
+        // target towards the bottom of the screen (the S Pen digitizer's
+        // real range doesn't care about transient nav-bar visibility).
+        // `maximumWindowMetrics` is the modern (API 30+) replacement that
+        // always reports the display's true full size.
+        val bounds = if (android.os.Build.VERSION.SDK_INT >= 30) {
+            windowManager.maximumWindowMetrics.bounds
+        } else {
+            @Suppress("DEPRECATION")
+            val p = android.graphics.Point()
+            windowManager.defaultDisplay.getRealSize(p)
+            android.graphics.Rect(0, 0, p.x, p.y)
+        }
+        val widthPx = bounds.width()
+        val heightPx = bounds.height()
+
         val stylusDevice = InputDevice.getDeviceIds()
             .map { InputDevice.getDevice(it) }
             .firstOrNull { d -> d != null && d.sources and InputDevice.SOURCE_STYLUS == InputDevice.SOURCE_STYLUS }
@@ -264,12 +284,12 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
         Log.i(
             tag,
-            "handshake: ${metrics.widthPixels}x${metrics.heightPixels}px, " +
+            "handshake: ${widthPx}x${heightPx}px, " +
                 "pressure $pMin..$pMax, tilt -$tMaxDeg..$tMaxDeg (stylus device: ${stylusDevice?.name})"
         )
 
-        out.writeInt(metrics.widthPixels)
-        out.writeInt(metrics.heightPixels)
+        out.writeInt(widthPx)
+        out.writeInt(heightPx)
         out.writeInt(pMin)
         out.writeInt(pMax)
         out.writeInt(-tMaxDeg)
