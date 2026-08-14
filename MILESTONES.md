@@ -802,6 +802,52 @@ real long session (this test ran a few minutes). If sustained use turns out to b
 real battery/thermal problem, revert to `MediaCodec.createDecoderByType(...)` (picks
 the hardware decoder by default) — a one-line change, not a design commitment.
 
+### Pushed further, targeting a 2x cut on top of the software-decoder win — mostly negative results
+
+User asked to search deeper, aiming to halve the ~110-125ms further (~55-65ms).
+Researched SuperDisplay's own technical approach for any clues — no luck, their
+site discloses zero technical detail, and both the XDA and BlurBusters forum
+threads discussing it blocked automated fetching (403). Confirmed via literature
+that MJPEG (an alternative codec) is a known dead end for this use case.
+
+**Confirmed the software decoder's `FEATURE_LowLatency` is also `false`** (Google's
+own decoder doesn't claim the feature either) — rules that lever out cleanly for
+both decoder paths, not just the hardware one.
+
+**Reasoned through, not live-tested: async `MediaCodec.Callback` mode.** The
+software decoder's `pending=3-4` queue depth is *steady*, not growing, across
+thousands of frames — meaning decode isn't falling behind (not compute-bound) at
+the tested frame rate. That rules out async mode as a fix: it only changes how the
+*client* is notified of ready buffers (callback vs. polling), not how many frames
+the codec *itself* buffers internally, which is what's actually costing the time.
+Not implemented, since the reasoning is conclusive without needing a live test.
+
+**Tried PipeWire buffer-count negotiation on the capture side (~30ms segment,
+previously untouched).** Requested the minimum buffer count (2) via a `ParamBuffers`
+pod sent alongside the format pod at `stream.connect()` — no strongly-typed property
+key exists for this in the installed `libspa` crate version, so built directly from
+the raw `SPA_PARAM_BUFFERS_buffers` sys constant. Compiled clean, connected and
+streamed without error (1977 frames, no negotiation failure). **Live-tested: no
+change** — capture latency 29.52ms avg over 1643 samples, statistically identical to
+the untouched baseline (~29-30ms). Reverted cleanly (true no-op diff) rather than
+keeping unused complexity around — PipeWire's own "minimize buffering, dequeue/
+requeue promptly" recommendation is already satisfied by the existing drop-stale-
+frames logic, and the remaining capture latency looks like it's dominated by KWin's
+own compositor scheduling cadence, not a buffer-count knob at all.
+
+**Where this leaves the "halve it" goal:** six real, live/reasoned-through levers
+tried since the software-decoder win, all negative (Exynos vendor key,
+`KEY_PRIORITY`, `KEY_OPERATING_RATE` ruled out, async mode ruled out, `FEATURE_
+LowLatency` confirmed false on both decoders, PipeWire buffer count). Getting from
+~110-125ms to ~55-65ms would need real cuts across *multiple* pipeline stages
+simultaneously, not one more single lever — and every stage tried so far
+(hardware decoder floor, software decoder's own floor, capture buffer count) has
+turned out to have a hard floor not reachable from this project's side. The
+remaining honestly-untested territory is the transport hop itself (adb-forward vs.
+raw USB/AOA, Milestone 8 below) and Android's own `SurfaceView`/`SurfaceFlinger`
+presentation path — both real, but each a substantially bigger lift than anything
+tried this session, not a quick lever.
+
 ## 8. (Optional v2) AOA transport
 
 Swap adb transport for Android Open Accessory mode, drop the adb dependency entirely.
