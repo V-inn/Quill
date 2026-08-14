@@ -1,3 +1,4 @@
+mod clock_sync;
 mod color_convert;
 mod ffi;
 mod h264_headers;

@@ -5,16 +5,18 @@
 //!
 //! Wire format (all big-endian, Android -> daemon):
 //!
-//! Handshake (24 bytes, sent once, before any input records) -- this is
+//! Handshake (32 bytes, sent once, before any input records) -- this is
 //! the capability handshake from the design doc: Android reports its real
 //! `Display` metrics and `InputDevice.getMotionRange()` so nothing is
-//! hardcoded here.
+//! hardcoded here. The trailing `i64` is Milestone 7's clock-sync ping,
+//! not a capability -- see `clock_sync.rs`.
 //!   u32 screen_width_px
 //!   u32 screen_height_px
 //!   i32 pressure_min
 //!   i32 pressure_max
 //!   i32 tilt_min_deg
 //!   i32 tilt_max_deg
+//!   i64 android_send_time_ms (device wall clock, for clock-offset calibration)
 //!
 //! Input event record (22 bytes, repeated):
 //!   u8  event_type   (0=hover_enter 1=hover_move 2=hover_exit 3=down 4=move 5=up 6=button_down 7=button_up)
@@ -28,6 +30,7 @@
 use crate::uinput_tablet::{TabletRanges, UinputTablet};
 use std::io::{self, Read};
 use std::net::TcpStream;
+use std::sync::mpsc::Sender;
 
 fn read_u32(r: &mut impl Read) -> io::Result<u32> {
     let mut b = [0u8; 4];
@@ -37,6 +40,12 @@ fn read_u32(r: &mut impl Read) -> io::Result<u32> {
 
 fn read_i32(r: &mut impl Read) -> io::Result<i32> {
     Ok(read_u32(r)? as i32)
+}
+
+fn read_i64(r: &mut impl Read) -> io::Result<i64> {
+    let mut b = [0u8; 8];
+    r.read_exact(&mut b)?;
+    Ok(i64::from_be_bytes(b))
 }
 
 fn read_u8(r: &mut impl Read) -> io::Result<u8> {
@@ -52,6 +61,7 @@ struct Handshake {
     pressure_max: i32,
     tilt_min: i32,
     tilt_max: i32,
+    android_send_ms: i64,
 }
 
 fn read_handshake(r: &mut impl Read) -> io::Result<Handshake> {
@@ -62,6 +72,7 @@ fn read_handshake(r: &mut impl Read) -> io::Result<Handshake> {
         pressure_max: read_i32(r)?,
         tilt_min: read_i32(r)?,
         tilt_max: read_i32(r)?,
+        android_send_ms: read_i64(r)?,
     })
 }
 
@@ -77,7 +88,12 @@ const EV_BUTTON_UP: u8 = 7;
 /// Blocks reading the handshake, creates the uinput tablet from the real
 /// reported ranges, then loops injecting input events until the stream
 /// closes. Meant to run on its own thread.
-pub fn run(mut stream: TcpStream) {
+///
+/// `clock_tx`: sends `(android_send_ms, daemon_recv_ms)` the instant the
+/// handshake's clock-sync ping is read, so the main thread (which owns the
+/// video-writing half of the socket) can complete Milestone 7's clock-offset
+/// calibration handshake -- see `clock_sync.rs`.
+pub fn run(mut stream: TcpStream, clock_tx: Sender<(i64, i64)>) {
     let handshake = match read_handshake(&mut stream) {
         Ok(h) => h,
         Err(e) => {
@@ -85,6 +101,8 @@ pub fn run(mut stream: TcpStream) {
             return;
         }
     };
+    let daemon_recv_ms = crate::clock_sync::now_millis();
+    let _ = clock_tx.send((handshake.android_send_ms, daemon_recv_ms));
     eprintln!(
         "[input] handshake: {}x{} px, pressure {}..{}, tilt {}..{} deg",
         handshake.width,

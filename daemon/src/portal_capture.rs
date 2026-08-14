@@ -104,9 +104,30 @@ pub fn run_capture(
         // socket from video (daemon -> S Pen), so a cloned handle with its
         // own read loop on a separate thread doesn't interfere with the
         // video-writing half used by the capture callback below.
+        let mut s = s;
         match s.try_clone() {
             Ok(input_stream) => {
-                std::thread::spawn(move || crate::input_receiver::run(input_stream));
+                let (clock_tx, clock_rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || crate::input_receiver::run(input_stream, clock_tx));
+
+                // Milestone 7 clock-offset calibration (see clock_sync.rs):
+                // block briefly for the input thread to hand over the
+                // Android-side clock-ping it just read out of the
+                // handshake, then reply on the video channel before any
+                // frame is sent.
+                match clock_rx.recv_timeout(Duration::from_secs(5)) {
+                    Ok((android_send_ms, daemon_recv_ms)) => {
+                        let daemon_send_ms = crate::clock_sync::now_millis();
+                        let mut reply = Vec::with_capacity(24);
+                        reply.extend_from_slice(&daemon_send_ms.to_be_bytes());
+                        reply.extend_from_slice(&android_send_ms.to_be_bytes());
+                        reply.extend_from_slice(&daemon_recv_ms.to_be_bytes());
+                        if let Err(e) = s.write_all(&reply) {
+                            eprintln!("[clock-sync] failed to send calibration reply: {e}");
+                        }
+                    }
+                    Err(e) => eprintln!("[clock-sync] never received clock ping: {e}"),
+                }
             }
             Err(e) => eprintln!("[input] failed to clone transport socket: {e}"),
         }
@@ -245,8 +266,18 @@ pub fn run_capture(
                     drop(stats);
                     let _ = user_data.out_file.write_all(&encoded);
                     if let Some(sock) = user_data.transport.as_mut() {
+                        // Milestone 7: prefix every frame with the daemon's
+                        // send time (its own clock) so Android can compute a
+                        // per-frame latency estimate using the offset from
+                        // the earlier clock-sync exchange -- see clock_sync.rs.
+                        let ts = crate::clock_sync::now_millis().to_be_bytes();
                         let len = (encoded.len() as u32).to_be_bytes();
-                        if sock.write_all(&len).and_then(|_| sock.write_all(&encoded)).is_err() {
+                        if sock
+                            .write_all(&ts)
+                            .and_then(|_| sock.write_all(&len))
+                            .and_then(|_| sock.write_all(&encoded))
+                            .is_err()
+                        {
                             eprintln!("[transport] write failed, dropping connection");
                             user_data.transport = None;
                         }

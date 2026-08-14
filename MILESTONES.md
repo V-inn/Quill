@@ -506,6 +506,43 @@ which requires a clock-offset calibration step since daemon and tablet are separ
 devices with independently-clocked systems) rather than more guess-and-film cycles.
 Not attempted yet — a real scoping decision, not a small next step.
 
+**Built the clock-offset calibration + per-frame timestamp instrumentation.** New
+`daemon/src/clock_sync.rs`: standard NTP two-message offset estimate (daemon and
+tablet are separate devices with independent system clocks, so their timestamps
+aren't directly comparable without this). Android appends its send time to the
+capability handshake; the daemon replies once, before the first video frame, with
+its own send/receive timestamps; Android computes the offset itself
+(`(android_recv - daemon_send) - (daemon_recv - android_send)`, halved — assumes
+symmetric one-way transport delay, reasonable for one local adb-forward/USB link).
+From then on every video frame is prefixed with an 8-byte daemon send-timestamp
+(`portal_capture.rs`), and Android logs a running per-frame latency estimate
+(`android_render_time - (frame_timestamp + offset)`) — log-based from here on,
+no more camera/filming needed for iteration.
+
+**Result, live-tested after a full host reboot (fresh daemon, fresh app launch):**
+measured offset **1692ms** (a real, large, uncorrected clock skew between the two
+devices' independent system clocks — expected and exactly what the calibration
+exists to cancel out), calibration round-trip sum **3ms** (sane for a local
+USB/adb-forward link). Steady-state per-frame latency: **avg ~15-16ms, range
+7-48ms** across 1162 frames.
+
+**This does not mean glass-to-glass latency is 15ms — it means we finally know
+where the ~150-180ms lives, and it isn't where Milestone 4 assumed.** This
+instrumentation's timestamp is taken *after* the daemon already has a PipeWire
+buffer in hand, right before `encode_frame` — i.e. it measures encode + transport +
+decode + render only. That segment is fast (matches the already-known
+~10-15ms `dequeue→encoded` number plus a small transport/decode/render remainder).
+The camera-measured ~150-180ms must therefore mostly be hiding in the *unmeasured*
+segment: from the moment content actually changes on the source screen to the
+moment PipeWire hands the daemon a buffer for it. Milestone 4's original
+backlog/CPU-roundtrip theory pointed at the daemon's own processing; this new,
+more precise measurement rules that specific stage out as the dominant cost and
+redirects suspicion upstream, into PipeWire/KWin's own screencast buffer delivery
+— not yet instrumented. A promising next step if this is picked back up: check
+whether PipeWire buffers carry their own generation-time metadata (e.g. an SPA
+`Header` meta with a PTS) so buffer age can be measured directly on dequeue,
+single-machine, no cross-device clock sync needed.
+
 ## 8. (Optional v2) AOA transport
 
 Swap adb transport for Android Open Accessory mode, drop the adb dependency entirely.

@@ -179,7 +179,28 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         out.writeInt(pMax)
         out.writeInt(-tMaxDeg)
         out.writeInt(tMaxDeg)
+        // Milestone 7 clock-sync ping -- see clock_sync.rs on the daemon
+        // side for the two-message offset calibration this kicks off.
+        out.writeLong(System.currentTimeMillis())
         out.flush()
+    }
+
+    /**
+     * Reads the daemon's clock-sync reply (sent once, before any video
+     * frame) and computes the android-clock-minus-daemon-clock offset via
+     * the standard NTP two-message estimate -- see clock_sync.rs for the
+     * derivation. Assumes symmetric one-way transport delay, reasonable for
+     * a single local adb-forward/USB link.
+     */
+    private fun readClockOffset(input: DataInputStream): Long {
+        val daemonSendMs = input.readLong()
+        val androidSendEchoMs = input.readLong()
+        val daemonRecvMs = input.readLong()
+        val androidRecvMs = System.currentTimeMillis()
+        val offset = ((androidRecvMs - daemonSendMs) - (daemonRecvMs - androidSendEchoMs)) / 2
+        val roundTripSum = (daemonRecvMs - androidSendEchoMs) + (androidRecvMs - daemonSendMs)
+        Log.i(tag, "clock-sync: offset=${offset}ms (android-daemon), round-trip sum=${roundTripSum}ms")
+        return offset
     }
 
     private fun runDecodeLoop(holder: SurfaceHolder) {
@@ -194,6 +215,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 val out = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
                 output = out
                 sendHandshake(out)
+                val clockOffsetMs = readClockOffset(input)
                 inputWriterThread = Thread { runInputWriterLoop(out) }.also { it.start() }
 
                 val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height)
@@ -216,14 +238,18 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 var queuedCount = 0L
                 var renderedCount = 0L
                 var presentationTimeUs = 0L
+                var latencySumMs = 0L
+                var latencyMinMs = Long.MAX_VALUE
+                var latencyMaxMs = Long.MIN_VALUE
 
                 while (running) {
-                    val length = try {
-                        input.readInt()
+                    val frameSentAtMs = try {
+                        input.readLong()
                     } catch (e: Exception) {
                         Log.i(tag, "stream ended: ${e.message}")
                         break
                     }
+                    val length = input.readInt()
                     if (length <= 0 || length > 16 * 1024 * 1024) {
                         Log.w(tag, "bogus frame length $length, stopping")
                         break
@@ -266,11 +292,23 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                         }
                     }
 
+                    // Milestone 7: per-frame glass-to-glass latency estimate,
+                    // converting the daemon's send timestamp into
+                    // android-clock terms via the calibrated offset -- see
+                    // clock_sync.rs. Approximate (doesn't isolate decode vs
+                    // transport vs render), but log-based instead of
+                    // camera-based, so it's cheap to sample continuously.
+                    val latencyMs = (System.currentTimeMillis() - clockOffsetMs) - frameSentAtMs
+                    latencySumMs += latencyMs
+                    if (latencyMs < latencyMinMs) latencyMinMs = latencyMs
+                    if (latencyMs > latencyMaxMs) latencyMaxMs = latencyMs
+
                     frameCount++
                     if (frameCount == 1L || frameCount % 30 == 0L) {
                         Log.i(
                             tag,
-                            "frame $frameCount ($length bytes): queued=$queuedCount rendered=$renderedCount"
+                            "frame $frameCount ($length bytes): queued=$queuedCount rendered=$renderedCount, " +
+                                "latency avg=${latencySumMs / frameCount}ms min=${latencyMinMs}ms max=${latencyMaxMs}ms (this frame: ${latencyMs}ms)"
                         )
                     }
                 }
