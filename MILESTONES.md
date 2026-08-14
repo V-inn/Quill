@@ -1396,3 +1396,43 @@ the reverted feature and still lives in `aoa::connect`'s connection-reuse
 path today, just with nothing downstream currently acting on the garbage
 values it can produce -- worth a bounds/sanity check on the handshake
 read in `input_receiver.rs` regardless of whatever uses width/height next.
+
+## 14. Real FPS root cause: hardcoded software decoder starving at native resolution
+
+Milestone 13's revert fixed the daemon side, but re-testing against the real
+`Virtual-QuillDisplay` output (not the `eDP-1` mirroring fallback) was still
+laggy -- same reverted commit, same binary, only the capture source changed,
+which ruled out both the daemon's encode pipeline (measured clean, ~6-10ms/frame,
+`0 stale dropped`) and AOA/USB bandwidth (frame size ~28KB regardless of
+source, ~14Mbps effective either way, nowhere near USB 2.0's ceiling).
+
+Root cause was on the Android side: `MainActivity.kt` hardcoded
+`MediaCodec.createByCodecName("c2.android.avc.decoder")` -- Android's
+*software* AVC decoder -- rather than the device's hardware one
+(`c2.exynos.h264.decoder`, confirmed present via the app's own decoder
+enumeration, `hw=true`). That was a deliberate choice from Milestone 7
+(commit `e96ab61`), which measured software decode as a real ~20-30ms/frame
+latency win over hardware at the 1920x1080-or-smaller resolutions tested
+then. That measurement doesn't hold at the tablet's real native resolution
+(`2560x1600`, only reachable now that dynamic resolution + real-panel-size
+capture exist) -- confirmed live via `adb logcat`: `dequeueInputBuffer`
+returning -1 constantly, and comparing `queued`/`rendered` counts between
+the periodic frame-stat log lines showed ~80% of incoming frames silently
+dropped (e.g. 30 real frames received over the wire, only 6 successfully
+queued to the decoder) as the software decoder fell behind and its input
+buffer pool starved. Per-frame latency numbers were nonsensical
+(hour-scale negative/overflow values) as a direct symptom of this.
+
+Fixed by picking a hardware AVC decoder from the app's existing enumeration
+loop (`isHardwareAccelerated`) instead of hardcoding the software name,
+falling back to software only if no hardware decoder exists on the device
+(keeps the project's no-hardcoding-to-one-vendor rule). This also
+automatically enabled the existing Exynos vendor low-latency parameter
+(`vendor.rtc-ext-dec-low-latency.enable`), gated on the decoder name and
+already written but dead code while software was hardcoded. Live-confirmed
+after the fix: zero `dequeueInputBuffer` failures, `queued`/`rendered` track
+together (the small gap is the intentional render-dedup pacing from
+Milestone 12, not drops), stable ~71-77ms per-frame latency, smooth on the
+tablet by eye. Milestone 7's original hardware-vs-software measurement was
+correct for the resolution it was measured at; it just stopped applying once
+the pipeline started running at 3x the pixel count.
