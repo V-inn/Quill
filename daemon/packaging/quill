@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Convenience wrapper for manual runs: `quill` starts the daemon with
+# sensible defaults (AOA transport, standard output path) instead of typing
+# out the full quill-daemon invocation each time. Pass an argument to
+# override the transport mode -- `quill 7777` for adb-forward TCP, `quill
+# none` for capture-only with no transport.
+set -euo pipefail
+mkdir -p ~/.local/share/quill
+exec ~/.local/bin/quill-daemon ~/.local/share/quill/output.h264 "${1:-aoa}"

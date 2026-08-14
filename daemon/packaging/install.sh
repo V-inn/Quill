@@ -17,6 +17,10 @@ mkdir -p ~/.local/bin ~/.local/share/quill ~/.config/systemd/user
 # matter where this repo is checked out, that stays current across rebuilds
 # without needing to reinstall.
 ln -sf "$(pwd)/target/release/quill-daemon" ~/.local/bin/quill-daemon
+# `quill` itself is copied, not symlinked -- it's a tiny fixed wrapper
+# script, not a build artifact tied to this checkout.
+cp packaging/quill ~/.local/bin/quill
+chmod +x ~/.local/bin/quill
 
 cp packaging/quill-daemon.service ~/.config/systemd/user/quill-daemon.service
 systemctl --user daemon-reload
