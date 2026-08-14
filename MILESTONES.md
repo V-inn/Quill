@@ -495,7 +495,7 @@ event) — likely a real multitouch protocol (`ABS_MT_*` slots) or OS-level gest
 recognition, not a small extension of the current single-touch path. Worth its own
 milestone later, not a follow-up to this one.
 
-## 7. Tuning pass — DONE (~145ms → ~110-125ms, switched to software decoder)
+## 7. Tuning pass — DONE (~300ms → ~107-112ms confirmed by camera, ~2.7x improvement)
 
 Encoder settings, buffer sizes, thread priorities to cut jitter. Three concrete items
 were recorded as Milestone 4's findings: (1) import DMA-BUF from PipeWire instead of
@@ -886,6 +886,56 @@ total now ~35ms (was ~45ms). Given decode/render still dominates the full pipeli
 real hardware offload, no quality or battery trade-off unlike the software-decoder
 switch, and it answers the user's question directly: no, hardware acceleration
 wasn't being used to its fullest before this, and now it is for this stage.
+
+### Asked for more research; found a bigger, compounding win nobody predicted
+
+User asked for more improvements and to research other projects. Checked scrcpy
+(its biggest documented latency fix, PR #646, was about `av_parser_parse2()`
+lookahead ambiguity -- doesn't apply here, this project's protocol already gives
+`MediaCodec` exact frame boundaries via length-prefixing, no parser involved), a
+no-ADB WebSocket scrcpy fork (motivated by setup convenience, not latency -- WiFi
+transport, likely worse than our USB adb-forward), and Parsec's engineering blog
+(`<10ms` encode/decode -- real, but dedicated PC GPU ASICs, a different silicon
+class from a mobile SoC decoder; not directly actionable, though their "zero-copy
+GPU pipeline" principle is exactly what the VPP change above already did).
+
+**One credible new lever surfaced: Android's `SurfaceFlinger` triple-buffering.**
+Documentation confirms it trades latency for smoothness, and it sits *after* this
+project's own latency measurement point (`releaseOutputBuffer()`) -- meaning the
+measured ~85-115ms decode/render number could have been an understatement, with a
+real, unmeasured gap hiding between "we handed the frame to the OS" and "pixel
+actually on screen" (same class of blind spot the barcode probe already found and
+fixed on the capture side, just never checked on the Android render side).
+
+**Investigated by re-running the existing camera test (readable-clock method) now
+that the GPU VPP change was in place, rather than building new PixelCopy
+instrumentation** -- reused already-built infrastructure instead of adding more.
+**Result: ~100-117ms (three fresh readings: 101ms, 117ms, 117ms, avg ~112ms) --
+down from ~144-150ms before VPP.** That's a ~35-40ms improvement, far larger than
+the ~9.5ms the VPP change's own direct instrumentation predicted for the
+encode segment alone. Pulled fresh numbers for the other stages from the same live
+session to find out why: capture latency unchanged (~30ms, confirmed separately,
+ruling out a capture-side CPU-contention explanation), but **Android's own
+decode/render latency dropped too -- avg 72ms (from ~85-115ms), decoder queue depth
+`pending=3` (from 4-5)** -- despite the VPP change touching only the daemon side,
+nothing on the Android decode path at all.
+
+**The arithmetic now closes cleanly with no unexplained gap:** ~30ms capture +
+~5.5ms encode + ~72ms decode/render ≈ 107.5ms, matching the camera-confirmed ~112ms
+almost exactly. So the SurfaceFlinger hypothesis that motivated this investigation
+turned out not to be needed -- there's no large hidden post-`releaseOutputBuffer`
+gap. What actually happened: removing ~9ms of CPU-bound, occasionally-bursty work
+from the daemon's single-threaded main loop made frame delivery to the tablet more
+consistent, and that consistency let the Android decoder's own effective pipeline
+depth shrink too (fewer frames in flight, less latency) -- a real, compounding,
+emergent win from reducing jitter, not just the isolated segment time saved.
+Recorded with appropriate honesty: the *mechanism* (jitter reduction improving
+downstream buffering behavior) is a coherent, plausible explanation consistent with
+every number gathered, not something independently proven via deeper profiling.
+
+**Final numbers:** daemon-side ~35ms (was ~45ms pre-VPP), full pipeline ~107-112ms
+(was ~144-150ms pre-VPP, ~300ms at the Milestone 4 baseline) -- roughly a **2.7x
+improvement over where Milestone 7 started**, confirmed by camera three times.
 
 ## 8. (Optional v2) AOA transport
 
