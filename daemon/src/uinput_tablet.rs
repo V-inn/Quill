@@ -56,6 +56,26 @@ pub struct TabletRanges {
     pub tilt_max: i32,
 }
 
+/// Cheap, non-destructive check for whether `/dev/uinput` is actually
+/// usable before committing to the uinput input path -- on a machine with
+/// no root access, ever (e.g. a school computer), the device node exists
+/// but is root-owned with no ACL/uaccess grant, and opening it fails with
+/// permission denied. `main.rs` uses this to decide between the real
+/// tablet-fidelity input path and the reduced-fidelity portal
+/// `RemoteDesktop` fallback (`remote_desktop_input.rs`) before doing any
+/// portal negotiation, since the two paths need different (and mutually
+/// exclusive) portal sessions.
+pub fn uinput_accessible() -> bool {
+    // Test knob for the RemoteDesktop fallback path on a machine that
+    // actually does have uinput access -- there's no way to safely fake a
+    // real permission-denied /dev/uinput without root, which defeats the
+    // purpose of testing "what a no-root machine sees".
+    if std::env::var("QUILL_FORCE_NO_UINPUT").is_ok() {
+        return false;
+    }
+    OpenOptions::new().read(true).write(true).open("/dev/uinput").is_ok()
+}
+
 impl UinputTablet {
     pub fn create(ranges: &TabletRanges) -> io::Result<Self> {
         let file = OpenOptions::new()

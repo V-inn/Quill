@@ -1200,3 +1200,30 @@ whole plug-in-to-video chain anymore, mid-session drops included.
 Pinch-to-zoom, two-finger scroll, and similar — deferred from the Milestone 6b finger
 click/drag follow-up (see there for why: needs a real multitouch device model, not a
 small extension of the current single-pointer protocol).
+
+## 10. (Not started) GNOME support
+
+Requested by the user after Milestone 8's no-sudo input fallback (`remote_desktop_input.rs`,
+see the follow-up work under Milestone 8 above) landed. Two genuinely separate problems,
+not one:
+
+- **Input (already portable):** the `RemoteDesktop` portal fallback added for no-sudo
+  machines uses only the standard `org.freedesktop.portal.RemoteDesktop`/`ScreenCast`
+  interfaces, nothing KWin-specific, so it should work unmodified against
+  `xdg-desktop-portal-gnome` (mutter's own backend, a separate implementation from KDE's).
+  Confirmed hitting a real KDE-only bug testing it live on this machine (Plasma 6.3.6):
+  `xdg-desktop-portal-kde`'s "MegaAuth" permission lookup fails for unsandboxed apps
+  requesting `RemoteDesktop` specifically (`ScreenCast` already has this allowance,
+  `RemoteDesktop` doesn't yet) -- see
+  [MR !144](https://invent.kde.org/plasma/xdg-desktop-portal-kde/-/merge_requests/144),
+  "Allow RemoteDesktop requests if they come from a non-sandboxed app", not yet in our
+  installed version. GNOME's backend is a different codebase, unlikely to share this
+  exact bug, but unconfirmed -- needs live testing on an actual GNOME machine.
+- **Display (the real blocker, not yet solved):** `krfb-virtualmonitor`, which creates
+  the virtual monitor in the first place, is KDE-only (part of `krfb`). GNOME/mutter has
+  no equivalent simple tool -- this is the same gap already flagged in Milestone 1's
+  evdi-to-portal pivot ("KWin has a native, compositor-level virtual-output mechanism...
+  no stable cross-desktop equivalent exists"). Making the *display* side work on GNOME
+  needs its own research pass (does mutter expose any virtual-output mechanism at all,
+  stable or not; would a different approach be needed entirely) before any code gets
+  written -- not started.

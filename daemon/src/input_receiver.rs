@@ -32,6 +32,7 @@
 //!                     bit; bit1 = tool is a finger, not the S Pen)
 
 use crate::portal_capture::TransportReader;
+use crate::remote_desktop_input::RemoteDesktopInput;
 use crate::uinput_tablet::{TabletRanges, UinputTablet};
 use std::io::{self, Read};
 use std::sync::mpsc::Sender;
@@ -97,7 +98,13 @@ const EV_BUTTON_UP: u8 = 7;
 /// handshake's clock-sync ping is read, so the main thread (which owns the
 /// video-writing half of the socket) can complete Milestone 7's clock-offset
 /// calibration handshake -- see `clock_sync.rs`.
-pub fn run(mut stream: TransportReader, clock_tx: Sender<(i64, i64)>) {
+///
+/// `remote_input`: `None` selects the normal full-fidelity uinput tablet
+/// path; `Some` means uinput wasn't accessible (see
+/// `uinput_tablet::uinput_accessible`) and this session is running the
+/// reduced-fidelity `RemoteDesktop` portal fallback instead (position +
+/// click, no pressure/tilt) -- see `remote_desktop_input.rs`.
+pub fn run(mut stream: TransportReader, clock_tx: Sender<(i64, i64)>, remote_input: Option<RemoteDesktopInput>) {
     let handshake = match read_handshake(&mut stream) {
         Ok(h) => h,
         Err(e) => {
@@ -124,14 +131,36 @@ pub fn run(mut stream: TransportReader, clock_tx: Sender<(i64, i64)>) {
         tilt_min: handshake.tilt_min,
         tilt_max: handshake.tilt_max,
     };
-    let tablet = match UinputTablet::create(&ranges) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("[input] failed to create uinput tablet: {e}");
-            return;
-        }
+
+    // Mutually exclusive: either a real uinput tablet, or the reduced-
+    // fidelity portal fallback -- never both, decided once by `main.rs`
+    // before any portal negotiation happened (the two need different,
+    // incompatible portal sessions).
+    let tablet = match &remote_input {
+        None => match UinputTablet::create(&ranges) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                eprintln!("[input] failed to create uinput tablet: {e}");
+                return;
+            }
+        },
+        Some(_) => None,
     };
-    eprintln!("[input] virtual tablet ready, waiting for S Pen input...");
+    if tablet.is_some() {
+        eprintln!("[input] virtual tablet ready, waiting for S Pen input...");
+    } else {
+        eprintln!(
+            "[input] uinput not accessible -- using portal RemoteDesktop input \
+             (position + click only, no pressure/tilt), waiting for input..."
+        );
+    }
+
+    // Edge-triggered like the uinput path's own BTN_TOUCH handling (real
+    // hardware, and libinput's own state machine, only expect a button
+    // event on an actual state change) -- only relevant to the
+    // RemoteDesktop path, which has no kernel input subsystem underneath
+    // it to do this for us.
+    let mut remote_prev_contact = false;
 
     let mut event_count = 0u64;
     loop {
@@ -173,12 +202,32 @@ pub fn run(mut stream: TransportReader, clock_tx: Sender<(i64, i64)>) {
             event_type,
             EV_HOVER_ENTER | EV_HOVER_MOVE | EV_HOVER_EXIT | EV_DOWN | EV_MOVE | EV_UP
         ) {
-            if let Err(e) = tablet.emit(x, y, pressure.max(0), tilt_x, tilt_y, in_contact) {
-                eprintln!("[input] emit failed: {e}");
+            if let Some(tablet) = &tablet {
+                if let Err(e) = tablet.emit(x, y, pressure.max(0), tilt_x, tilt_y, in_contact) {
+                    eprintln!("[input] emit failed: {e}");
+                }
+            } else if let Some(ri) = &remote_input {
+                // Scale from the tablet's own panel-pixel space (the
+                // handshake's width/height) into the shared ScreenCast
+                // stream's logical pixel space -- the portal wants
+                // coordinates in the latter, not the former (see
+                // `remote_desktop_input.rs`'s module doc).
+                let sx = x as f64 * ri.stream_size.0 as f64 / ranges.width.max(1) as f64;
+                let sy = y as f64 * ri.stream_size.1 as f64 / ranges.height.max(1) as f64;
+                ri.pointer_motion(sx, sy);
+                if in_contact != remote_prev_contact {
+                    ri.button(in_contact, false);
+                    remote_prev_contact = in_contact;
+                }
             }
         } else if matches!(event_type, EV_BUTTON_DOWN | EV_BUTTON_UP) {
-            if let Err(e) = tablet.set_button(event_type == EV_BUTTON_DOWN) {
-                eprintln!("[input] set_button failed: {e}");
+            let pressed = event_type == EV_BUTTON_DOWN;
+            if let Some(tablet) = &tablet {
+                if let Err(e) = tablet.set_button(pressed) {
+                    eprintln!("[input] set_button failed: {e}");
+                }
+            } else if let Some(ri) = &remote_input {
+                ri.button(pressed, true);
             }
         }
 

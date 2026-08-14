@@ -4,6 +4,7 @@ mod ffi;
 mod h264_headers;
 mod input_receiver;
 mod portal_capture;
+mod remote_desktop_input;
 mod uinput_tablet;
 mod vaapi_encoder;
 
@@ -49,10 +50,30 @@ async fn main() {
         ),
     };
 
-    eprintln!("Opening portal ScreenCast session -- pick the virtual monitor in the dialog...");
-    let (stream, fd) = portal_capture::open_portal()
-        .await
-        .expect("portal negotiation failed");
+    // Decided once, before any portal negotiation: uinput (real S Pen
+    // pressure/tilt fidelity) needs a root-granted udev rule or ACL that
+    // may simply not exist on this machine and never will (e.g. a school
+    // computer with no sudo, ever) -- see uinput_tablet::uinput_accessible
+    // and remote_desktop_input.rs. The two paths need different,
+    // mutually-exclusive portal sessions, so this has to be decided before
+    // either one starts, not worked around after the fact.
+    let (stream, fd, remote_input) = if uinput_tablet::uinput_accessible() {
+        eprintln!("Opening portal ScreenCast session -- pick the virtual monitor in the dialog...");
+        let (stream, fd) = portal_capture::open_portal()
+            .await
+            .expect("portal negotiation failed");
+        (stream, fd, None)
+    } else {
+        eprintln!(
+            "[input] /dev/uinput not accessible (no root-granted permission on this machine) \
+             -- falling back to portal RemoteDesktop input: position + click only, no S Pen \
+             pressure/tilt. Opening combined ScreenCast + RemoteDesktop portal session..."
+        );
+        let (stream, fd, remote_input) = remote_desktop_input::open_portal_with_input()
+            .await
+            .expect("portal negotiation failed");
+        (stream, fd, Some(remote_input))
+    };
     let node_id = stream.pipe_wire_node_id();
     eprintln!(
         "[portal] got stream: node_id={node_id} size={:?} position={:?}",
@@ -60,7 +81,7 @@ async fn main() {
         stream.position()
     );
 
-    let stats = portal_capture::run_capture(node_id, fd, &out_path, transport_config)
+    let stats = portal_capture::run_capture(node_id, fd, &out_path, transport_config, remote_input)
         .expect("capture failed");
 
     if stats.frame_count == 0 {

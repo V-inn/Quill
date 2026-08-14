@@ -165,7 +165,10 @@ struct CaptureData {
 /// exchange, and returns the write half for video frames -- identical
 /// downstream handling regardless of which transport actually carried the
 /// bytes.
-fn setup_transport(config: TransportConfig) -> Option<TransportWriter> {
+fn setup_transport(
+    config: TransportConfig,
+    remote_input: Option<crate::remote_desktop_input::RemoteDesktopInput>,
+) -> Option<TransportWriter> {
     // AOA needs a much longer clock-sync wait than TCP: adb-forward's
     // ServerSocket::accept() already guarantees a connected, ready peer by
     // the time we get here, but AOA's USB_ACCESSORY_ATTACHED flow involves
@@ -214,7 +217,7 @@ fn setup_transport(config: TransportConfig) -> Option<TransportWriter> {
     };
 
     let (clock_tx, clock_rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || crate::input_receiver::run(reader, clock_tx));
+    std::thread::spawn(move || crate::input_receiver::run(reader, clock_tx, remote_input));
 
     // Milestone 7 clock-offset calibration (see clock_sync.rs) doubles as
     // Milestone 8's "is the peer actually ready" signal: block for the
@@ -263,6 +266,7 @@ pub fn run_capture(
     fd: OwnedFd,
     out_path: &str,
     transport_config: TransportConfig,
+    remote_input: Option<crate::remote_desktop_input::RemoteDesktopInput>,
 ) -> Result<CaptureStats, pw::Error> {
     pw::init();
 
@@ -278,7 +282,7 @@ pub fn run_capture(
     crate::set_up_sigint_handler();
 
     let out_file = File::create(out_path).expect("create output file");
-    let transport = setup_transport(transport_config);
+    let transport = setup_transport(transport_config, remote_input);
     let stats = Rc::new(RefCell::new(CaptureStats::default()));
     let data = CaptureData {
         format: Default::default(),
