@@ -1116,6 +1116,38 @@ every `onWindowFocusChanged(true)`, since the transient reveal (or a permission
 dialog stealing focus) doesn't hide itself again on its own. Confirmed live: both
 system bars gone, video fills the screen edge to edge.
 
+### No-hardcode follow-up: video resolution, and an AOA idle-timeout bug it surfaced
+
+The Android app hardcoded `width = 1920, height = 1080` to build its decoder's
+`MediaFormat` -- happened to match this project's one test setup (the daemon's
+virtual monitor), but broke the project's own no-hardcoding rule and would silently
+mismatch if that monitor's size ever changed. Fixed by having the daemon send an
+8-byte `(width, height)` header once, right after the clock-sync reply and before
+the first video frame -- written from `portal_capture.rs`'s PipeWire `param_changed`
+callback, the first point the daemon actually knows the negotiated size. Android
+reads it (`readVideoFormat`) before configuring the codec instead of assuming a
+constant. Confirmed live: `video format: 1920x1080` read correctly off the wire,
+decoder configured from it, video unaffected.
+
+Testing this surfaced a real, unrelated bug: **S Pen and finger input stopped
+working after ~90 seconds of nobody touching the screen.** Root cause: AOA's
+`AoaReader::read()` uses a fixed `READ_TIMEOUT` (90s, originally sized to tolerate a
+human clicking through the USB accessory permission dialog on the very first read),
+but `input_receiver.rs`'s steady-state loop reuses the same reader for every
+subsequent event and treats *any* read error -- including an ordinary "nothing
+arrived within the timeout" -- as fatal, permanently killing the input thread with
+no retry. A real TCP socket blocks indefinitely instead of erroring in the same
+idle situation, which is what `input_receiver.rs` was actually written assuming.
+Confirmed via `journalctl`: `[input] receiver thread exiting after 0 events`
+exactly 90s after the handshake, with no touches in that window -- an entirely
+normal idle stretch (just watching video, not touching yet) silently and
+permanently broke input for the rest of the session. Fixed by looping on
+`rusb::Error::Timeout` inside `AoaReader::read()` instead of surfacing it -- genuine
+failures (device unplugged, etc.) come back as a different error variant and still
+propagate normally. Confirmed live: input survives idle periods now, both pen and
+finger events flowing correctly (`[input] event 600: type=1 ...`) well past the
+90s mark.
+
 ## 9. (Not started) Multi-touch gestures
 
 Pinch-to-zoom, two-finger scroll, and similar — deferred from the Milestone 6b finger

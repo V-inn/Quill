@@ -52,8 +52,6 @@ private data class PenEvent(
 class MainActivity : Activity(), SurfaceHolder.Callback {
     private val tag = "QuillDecodeTest"
     private val port = 7777
-    private val width = 1920
-    private val height = 1080
 
     private var decodeThread: Thread? = null
     private var inputWriterThread: Thread? = null
@@ -354,6 +352,18 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         return offset
     }
 
+    /** Reads the video resolution the daemon actually negotiated for its
+     * virtual monitor (sent once, right after the clock-sync reply and
+     * before the first video frame -- see `portal_capture.rs`'s
+     * `param_changed` handler). Not a fixed constant: the host's virtual
+     * monitor size isn't under this app's control and shouldn't be assumed. */
+    private fun readVideoFormat(input: BufferedAccessoryInput): Pair<Int, Int> {
+        val videoWidth = input.readInt()
+        val videoHeight = input.readInt()
+        Log.i(tag, "video format: ${videoWidth}x${videoHeight}")
+        return videoWidth to videoHeight
+    }
+
     /** Original transport (Milestones 3-7): listens on a TCP port reached
      * via `adb forward tcp:PORT tcp:PORT`. */
     private fun runAdbForwardDecodeLoop(holder: SurfaceHolder) {
@@ -407,6 +417,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 output = out
                 sendHandshake(out)
                 val clockOffsetMs = readClockOffset(input)
+                val (width, height) = readVideoFormat(input)
                 inputWriterThread = Thread { runInputWriterLoop(out) }.also { it.start() }
 
                 // Diagnostic: enumerate every AVC decoder this device offers,

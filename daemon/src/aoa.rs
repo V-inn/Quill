@@ -221,11 +221,25 @@ fn try_open_accessory() -> Option<AoaTransport> {
 }
 
 impl Read for AoaReader {
+    /// Loops on a USB bulk timeout instead of surfacing it as an error --
+    /// confirmed live: `input_receiver.rs`'s steady-state loop reads one
+    /// event at a time and treats any read error as fatal (stream ended,
+    /// thread exits for good, no retry). A `rusb` bulk-read timeout just
+    /// means "no data arrived within `READ_TIMEOUT`", which is completely
+    /// normal during any idle stretch with no pen/finger input -- a real
+    /// TCP socket blocks indefinitely in the same situation rather than
+    /// erroring, so this makes AOA behave the same way rather than killing
+    /// the input thread after 90 seconds of nobody touching the screen.
+    /// Genuine failures (device unplugged, etc.) come back as a different
+    /// `rusb::Error` variant and still propagate normally.
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.shared
-            .handle
-            .read_bulk(self.ep_in, buf, READ_TIMEOUT)
-            .map_err(|e| io::Error::other(format!("AOA bulk read: {e}")))
+        loop {
+            match self.shared.handle.read_bulk(self.ep_in, buf, READ_TIMEOUT) {
+                Ok(n) => return Ok(n),
+                Err(rusb::Error::Timeout) => continue,
+                Err(e) => return Err(io::Error::other(format!("AOA bulk read: {e}"))),
+            }
+        }
     }
 }
 

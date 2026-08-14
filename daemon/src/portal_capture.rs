@@ -325,6 +325,24 @@ pub fn run_capture(
 
             let encoder = VaapiEncoder::new(width, height).expect("VAAPI encoder init failed");
             user_data.encoder = Some(encoder);
+
+            // Milestone 9 follow-up: the video resolution comes from
+            // whatever the host's virtual monitor negotiates, not a fixed
+            // constant -- previously the Android client just assumed
+            // 1920x1080 to match this project's one test setup, which broke
+            // the project's own no-hardcoding rule (see MILESTONES.md).
+            // Sent once, right after the clock-sync reply and before any
+            // video frame, so the client can size its decoder correctly
+            // before the first frame arrives.
+            if let Some(sock) = user_data.transport.as_mut() {
+                let mut header = Vec::with_capacity(8);
+                header.extend_from_slice(&width.to_be_bytes());
+                header.extend_from_slice(&height.to_be_bytes());
+                if let Err(e) = sock.write_all(&header) {
+                    eprintln!("[transport] failed to send video format header: {e}");
+                    user_data.transport = None;
+                }
+            }
         })
         .process(|stream, user_data| {
             let start = Instant::now();
