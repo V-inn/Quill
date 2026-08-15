@@ -4,11 +4,11 @@ plugins {
 }
 
 android {
-    namespace = "com.quill.decodetest"
+    namespace = "com.quill.client"
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.quill.decodetest"
+        applicationId = "com.quill.client"
         minSdk = 26
         targetSdk = 34
         versionCode = 1

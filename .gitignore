@@ -19,9 +19,3 @@ android-client/local.properties
 android-client/.idea/
 android-client/.cxx/
 android-client/captures/
-experiments/android-decode-test/.gradle/
-experiments/android-decode-test/build/
-experiments/android-decode-test/*/build/
-experiments/android-decode-test/local.properties
-experiments/android-decode-test/.idea/
-experiments/android-decode-test/.cxx/

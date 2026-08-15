@@ -6,7 +6,7 @@
 
     <application
         android:allowBackup="false"
-        android:label="Quill Decode Test"
+        android:label="Quill"
         android:theme="@android:style/Theme.Black.NoTitleBar">
         <activity
             android:name=".MainActivity"

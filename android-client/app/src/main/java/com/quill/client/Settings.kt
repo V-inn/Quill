@@ -1,4 +1,4 @@
-package com.quill.decodetest
+package com.quill.client
 
 import android.content.Context
 import android.content.SharedPreferences

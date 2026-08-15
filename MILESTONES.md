@@ -2183,3 +2183,74 @@ cadence against a 60Hz virtual output, roughly two output frames. Raising that
 output's refresh rate is the remaining lever, and it needs an
 `outputmanagement_v2` Wayland client since this build's `kscreen-doctor` has no
 `addCustomMode` verb.
+
+## 21. The Android client leaves `experiments/`
+
+The client had been living in `experiments/android-decode-test/` since Milestone
+3, when it genuinely was a throwaway decode spike. It stopped being one a long
+time ago, and the repo had been contradicting itself since: the root README
+describes `experiments/` as "throwaway validation code... not part of the real
+daemon/client" while `android-client/` held a single README pointing back into
+it.
+
+Moved with `git mv` so the history follows:
+
+- `experiments/android-decode-test/` -> `android-client/`
+- package `com.quill.decodetest` -> `com.quill.client`
+- app label "Quill Decode Test" -> "Quill", log tag `QuillDecodeTest` -> `Quill`
+- gradle root project `android-decode-test` -> `quill-client`
+- pruned the now-dead `experiments/android-decode-test/*` ignore rules; the
+  `android-client/*` ones were already there
+
+`experiments/` is now only `capture-latency-probe` and `evdi-bringup`, both of
+which really are spikes.
+
+`android-client/README.md` is a real README now: build/install steps, a file
+map, a pointer to `daemon/src/protocol.rs` as the single source of truth for the
+wire format, and the three things that will bite whoever touches this next --
+the decode loop's two threads are load-bearing (merging them costs a frame
+interval), a dropped frame now corrupts up to a full GOP, and
+`BufferedAccessoryInput` exists because USB accessory fds can be read neither
+buffered nor unbuffered by the obvious means.
+
+**MILESTONES.md's references to the old path are deliberately left alone.** This
+file is a record of what happened; rewriting the paths would make earlier entries
+claim work happened somewhere it didn't.
+
+### The applicationId change costs a permission re-grant, and that is worth noting
+
+Changing `applicationId` makes Android treat this as a different app, so the USB
+accessory permission granted to `com.quill.decodetest` did not carry over. The
+new package fell straight through to its adb-forward fallback, logging
+`accessory attached but no permission -- falling back to adb-forward` while the
+daemon sat waiting on AOA. No fresh `USB_ACCESSORY_ATTACHED` intent existed to
+prompt against, because the tablet was already in accessory mode from the
+previous session.
+
+Rather than requiring a physical replug, forced re-enumeration from the host with
+a `USBDEVFS_RESET` ioctl on the device node:
+
+```python
+USBDEVFS_RESET = ord('U') << 8 | 20
+fd = os.open("/dev/bus/usb/003/008", os.O_WRONLY)
+fcntl.ioctl(fd, USBDEVFS_RESET, 0)
+```
+
+(The `ENODEV` it returns is the device disappearing mid-reset -- the reset
+itself worked; it came back as device 010.) The client did reconnect over AOA on
+the next daemon start.
+
+**But that is not a clean result and should not be cited as one.** The user
+replugged the cable at the same time, so the recovery is confounded between the
+two and this run says nothing about whether the ioctl alone is sufficient. The
+first write-up of this claimed the reset was enough; it was corrected once the
+overlap came to light.
+
+Still worth pursuing for Milestone 11's reconnect work -- a host-side USB reset
+is the kind of lever the daemon could pull itself instead of telling the user to
+unplug the cable, which is the app status overlay's current advice. It just
+needs an actual isolated test: reset with nobody touching the cable, and see
+whether Android re-fires `USB_ACCESSORY_ATTACHED`.
+
+Verified end to end after the move: **avg 26ms, min 9ms, `pending=0`**, encode
+~8-10ms, old package uninstalled so nothing competes for the accessory intent.

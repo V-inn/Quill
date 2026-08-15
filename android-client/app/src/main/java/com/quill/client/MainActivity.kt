@@ -1,4 +1,4 @@
-package com.quill.decodetest
+package com.quill.client
 
 import android.app.Activity
 import android.content.Intent
@@ -54,7 +54,7 @@ private data class PenEvent(
  * side (S Pen -> daemon) -- independent directions of the same socket.
  */
 class MainActivity : Activity(), SurfaceHolder.Callback {
-    private val tag = "QuillDecodeTest"
+    private val tag = "Quill"
     private val port = 7777
 
     private var decodeThread: Thread? = null

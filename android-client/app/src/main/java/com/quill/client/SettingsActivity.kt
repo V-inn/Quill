@@ -1,4 +1,4 @@
-package com.quill.decodetest
+package com.quill.client
 
 import android.app.Activity
 import android.graphics.Color

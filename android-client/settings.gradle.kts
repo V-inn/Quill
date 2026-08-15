@@ -13,5 +13,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "android-decode-test"
+rootProject.name = "quill-client"
 include(":app")
