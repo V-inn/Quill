@@ -1930,3 +1930,69 @@ project does. Flagged as the most promising remaining capture-side lever.
 12.66 -> 9.73ms. ~5.5ms off a ~46ms daemon-side budget. The decode-side change
 (the SPS VUI, worth a predicted 33ms) is still the largest single unverified item
 and needs the tablet.
+
+### Live-tested on the tablet: the SPS VUI is worth 34ms, confirmed by a clean A/B
+
+Ran it on the real Galaxy Tab S9 FE+ (SM_X610, `c2.exynos.h264.decoder`). Both
+legs in the same session, same APK, same on-screen motion, ~30s each, swapping
+only the daemon binary -- the only difference between them is whether
+`build_sps` emits the VUI:
+
+| | latency avg | min | max | `pending` |
+|---|---|---|---|---|
+| no VUI (previous behaviour) | 64ms | 36ms | 140ms | 3, steady |
+| **with VUI** | **30ms** | **9ms** | 181ms | **0-2** |
+
+**-34ms average, -27ms on the floor.** Two frames at 60fps is 33ms, which is
+exactly what the DPB arithmetic predicted for level 4.1 at 160x100 macroblocks.
+The mechanism is confirmed, not just the outcome.
+
+**This settles the doubt recorded above, in the opposite direction from the
+research.** moonlight's `decoderNeedsSpsBitstreamRestrictions()` does not list
+Exynos, no public before/after measurement for these VUI fields on a modern
+Exynos part could be found, and Samsung's Codec2 component is closed -- the
+honest expectation going in was "a real chance of a negative result". This
+tablet honors `max_num_reorder_frames = 0` completely. Milestone 7's conclusion
+that "this tablet's ~85-115ms decoder pipeline depth is a firmware/silicon floor,
+not reachable from app-level MediaCodec configuration" was wrong: it was
+reachable, just not from MediaCodec -- from the bitstream.
+
+**Attribution between the two Phase A changes.** A1 (VUI) and A2 (the
+reader/render thread split) shipped together, so the A/B above was run with A2
+present on both legs. That isolates A1 at -34ms. Comparing the no-VUI leg's 64ms
+against the ~70-77ms this file recorded before A2 puts A2 at roughly -8 to -13ms,
+though that half is a cross-session comparison and correspondingly weaker.
+
+**Full pipeline now, summing the three instrumented segments:** ~30.6ms capture +
+~8.4ms encode + ~30ms decode/render = **~69ms**, against ~112-123ms at the start
+of this session. Worth a camera glass-to-glass confirmation before treating ~69ms
+as the headline number -- every previous milestone that trusted summed segments
+without one eventually found a gap.
+
+### A framing bug this session introduced, caught only on the tablet
+
+The two-EnumFormat-pod DMA-BUF negotiation makes `param_changed` fire **twice**
+(modifier negotiation is inherently two-step: offer a DONT_FIXATE choice, the
+producer picks and sends the fixated format back). Counting the events makes it
+plain: 1 with `QUILL_FORCE_SHM`, 2 without. The handler announced the video
+format on each firing, so a second 8-byte header landed in a stream the client
+was already reading as length-prefixed frames.
+
+Live symptom: handshake fine, then `clock-sync: offset=3457846859832230715ms`,
+then `video format: 1174405120x18998372`, then
+`MediaCodec.configure` throwing `IllegalArgumentException: Invalid size(s)` in a
+1-second reconnect loop, with a green rectangle over a zoomed-in wallpaper on the
+tablet. Easy to misread as the known stale-AOA desync from Milestones 13/14/17;
+it wasn't, it was new and deterministic.
+
+Fixed with a `sent_format: Option<(u32, u32)>` on `CaptureData`: the header is
+announced once, a repeat of the same size is ignored, and a genuine mid-session
+size change logs a warning (the client cannot reconfigure its decoder, so that
+case is a reconnect either way). The encoder is likewise only rebuilt when the
+geometry actually changes -- the second firing had been discarding a working
+encoder and resetting its GOP state for nothing.
+
+Worth stating plainly: this shipped in the previous commit and could not have
+been caught without hardware. Capture-only runs looked perfectly healthy, because
+nothing was reading the stream.
+

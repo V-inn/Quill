@@ -248,6 +248,19 @@ struct CaptureData {
     flip_180: bool,
     /// `QUILL_NO_ENCODE` -- see the early return in `process`.
     no_encode: bool,
+    /// Dimensions already announced to the client, if any.
+    ///
+    /// `param_changed` fires more than once on the DMA-BUF path: modifier
+    /// negotiation is inherently two-step (we offer a DONT_FIXATE choice, the
+    /// producer picks one and sends the fixated format back), so PipeWire
+    /// reports a format twice where the shm path reported it once. Confirmed by
+    /// counting the events: 1 with `QUILL_FORCE_SHM`, 2 without. Announcing the
+    /// video format on each of those wrote a second 8-byte header into a stream
+    /// the client was already reading as length-prefixed frames, desyncing its
+    /// framing permanently -- live symptom was a garbage clock offset, a
+    /// `1174405120x18998372` video format, and `MediaCodec.configure` throwing
+    /// `Invalid size(s)` on a reconnect loop.
+    sent_format: Option<(u32, u32)>,
     /// `None` unless `QUILL_DUMP_H264` is set -- see the write site in
     /// `process` for why this stopped being unconditional.
     out_file: Option<File>,
@@ -508,6 +521,7 @@ pub fn run_capture(
         encoder: None,
         flip_180,
         no_encode: std::env::var("QUILL_NO_ENCODE").is_ok(),
+        sent_format: None,
         out_file,
         transport: transport.clone(),
         stats: stats.clone(),
@@ -561,8 +575,15 @@ pub fn run_capture(
                 user_data.format.framerate().denom
             );
 
-            let encoder = VaapiEncoder::new(width, height, user_data.flip_180).expect("VAAPI encoder init failed");
-            user_data.encoder = Some(encoder);
+            // Only build a new encoder when the geometry actually changes.
+            // The second `param_changed` of a DMA-BUF negotiation reports the
+            // same size as the first, and rebuilding on it threw away a working
+            // encoder (and reset its GOP state) for nothing.
+            if user_data.sent_format != Some((width, height)) {
+                let encoder = VaapiEncoder::new(width, height, user_data.flip_180)
+                    .expect("VAAPI encoder init failed");
+                user_data.encoder = Some(encoder);
+            }
 
             // Milestone 9 follow-up: the video resolution comes from
             // whatever the host's virtual monitor negotiates, not a fixed
@@ -572,6 +593,25 @@ pub fn run_capture(
             // Sent once, right after the clock-sync reply and before any
             // video frame, so the client can size its decoder correctly
             // before the first frame arrives.
+            //
+            // Guarded on `sent_format`: this callback fires twice on the
+            // DMA-BUF path (see that field), and writing the header again put 8
+            // stray bytes into a stream the client was already reading as
+            // length-prefixed frames.
+            if user_data.sent_format == Some((width, height)) {
+                eprintln!("[pipewire] format re-reported unchanged, not re-announcing it");
+                return;
+            }
+            if user_data.sent_format.is_some() {
+                // Never observed; if a producer ever does resize mid-session the
+                // client has no way to reconfigure its decoder, so say so loudly
+                // rather than silently sending a header it can't act on.
+                eprintln!(
+                    "[pipewire] WARNING: video size changed mid-session to {width}x{height}; \
+                     the client cannot reconfigure -- expect a reconnect"
+                );
+            }
+            user_data.sent_format = Some((width, height));
             if let Some(sock) = user_data.transport.borrow_mut().as_mut() {
                 let mut header = Vec::with_capacity(8);
                 header.extend_from_slice(&width.to_be_bytes());
