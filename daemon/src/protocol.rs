@@ -41,12 +41,23 @@
 //! i32  tilt_max_deg
 //! i64  android_send_ms  wall clock, for the clock-offset calibration
 //! u8   config_flags     see `config_flags`
+//! i32  xdpi_milli       physical pixels per inch * 1000, X axis
+//! i32  ydpi_milli       ditto, Y axis -- the virtual touchpad needs a real
+//!                       units/mm resolution or libinput's gesture thresholds
+//!                       (all specified in millimetres) are meaningless
 //! ... any future fields; a reader that doesn't know them skips to body_len
 //! ```
 //!
+//! The two dpi fields were appended after the fact and are exactly what
+//! `body_len` exists for: an older daemon reads the fields it knows and skips
+//! the rest, and a newer daemon treats them as absent when an older client
+//! doesn't send them.
+//!
 //! Input events follow, unchanged from v1 (22 bytes each, see
-//! `input_receiver.rs`) -- they were never the problem, being fixed-size
-//! records in a direction that carries nothing else.
+//! `input_receiver.rs`) -- fixed-size records in a direction that carries
+//! nothing else. Multi-touch (Milestone 9) reuses that same 22-byte record
+//! rather than introducing a second framing: the new event types document
+//! different meanings for fields the pen types leave unused.
 //!
 //! # Downstream: daemon -> Android
 //!
@@ -89,6 +100,13 @@ pub const MSG_VIDEO_FORMAT: u8 = 4;
 /// itself, so the daemon should ask the portal for cursor *metadata* rather
 /// than have KWin composite the cursor into every frame.
 pub const CONFIG_CLIENT_SIDE_CURSOR: u8 = 1 << 0;
+
+/// Bit 1: send pinch as ctrl+wheel instead of letting it reach the virtual
+/// touchpad as a real gesture. libinput's pinch is delivered as a Wayland
+/// gesture, which only gesture-aware toolkits act on -- anything on XWayland
+/// ignores it. Ctrl+scroll zooms in nearly everything, in steps rather than
+/// smoothly. See `gesture.rs`.
+pub const CONFIG_CTRL_SCROLL_ZOOM: u8 = 1 << 1;
 
 /// Serializes one downstream message. Built as a single buffer and written with
 /// a single `write_all`, deliberately: with `TCP_NODELAY` set, and over USB

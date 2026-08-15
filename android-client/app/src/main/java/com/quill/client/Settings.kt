@@ -42,21 +42,39 @@ class Settings(context: Context) {
         get() = prefs.getBoolean(KEY_LATENCY_OVERLAY, false)
         set(value) = prefs.edit().putBoolean(KEY_LATENCY_OVERLAY, value).apply()
 
+    /**
+     * Sends pinch as Ctrl+scroll instead of as a real pinch gesture.
+     *
+     * Off, the daemon hands both fingers to a virtual touchpad and libinput
+     * turns them into a proper pinch -- which is delivered over the Wayland
+     * gesture protocol, so only applications that speak it (Firefox, GTK, Qt6)
+     * zoom, and anything running on XWayland ignores it entirely. On, the
+     * daemon recognizes the pinch itself and synthesizes Ctrl+scroll, which
+     * nearly every application honours, but zooms in fixed steps rather than
+     * smoothly.
+     */
+    var ctrlScrollZoom: Boolean
+        get() = prefs.getBoolean(KEY_CTRL_SCROLL_ZOOM, false)
+        set(value) = prefs.edit().putBoolean(KEY_CTRL_SCROLL_ZOOM, value).apply()
+
     /** Packed into the handshake's `config_flags` byte. */
     fun configFlags(): Int {
         var flags = 0
         if (clientSideCursor) flags = flags or CONFIG_CLIENT_SIDE_CURSOR
+        if (ctrlScrollZoom) flags = flags or CONFIG_CTRL_SCROLL_ZOOM
         return flags
     }
 
     companion object {
         private const val KEY_CLIENT_SIDE_CURSOR = "client_side_cursor"
         private const val KEY_LATENCY_OVERLAY = "latency_overlay"
+        private const val KEY_CTRL_SCROLL_ZOOM = "ctrl_scroll_zoom"
 
         // Mirrors protocol.rs. Kept as plain constants in both languages rather
         // than generated, since there are only a handful and a build-time
         // codegen step for them would cost more than it saves -- but they must
         // be changed together.
         const val CONFIG_CLIENT_SIDE_CURSOR = 1 shl 0
+        const val CONFIG_CTRL_SCROLL_ZOOM = 1 shl 1
     }
 }

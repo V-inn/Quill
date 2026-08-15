@@ -63,6 +63,90 @@ fn current_size(name: &str) -> Option<(u32, u32)> {
     Some((size.get("width")?.as_u64()? as u32, size.get("height")?.as_u64()? as u32))
 }
 
+/// A rectangle in the compositor's *logical* coordinate space -- the space
+/// output positions and pointer coordinates live in, which is the pixel size
+/// divided by the output's scale factor. On this machine the panel is
+/// 1920x1080 at scale 1.25 and the virtual output 2560x1600 at scale 1.5, so
+/// the two are 1536x864 and 1707x1067 logically, laid out side by side.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Rect {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
+
+/// Where the virtual monitor sits inside the whole desktop.
+///
+/// Needed because gestures and clicks are delivered to whatever the *pointer*
+/// is over, and a relative device (the virtual touchpad) can't put it
+/// anywhere. Warping an absolute pointer there requires knowing both the
+/// target rectangle and the full desktop it is mapped across -- see
+/// `uinput_buttons.rs`.
+#[derive(Clone, Copy, Debug)]
+pub struct DesktopLayout {
+    pub output: Rect,
+    pub desktop: Rect,
+}
+
+fn logical_rect(output: &Value) -> Option<Rect> {
+    let pos = output.get("pos")?;
+    let scale = output.get("scale").and_then(Value::as_f64).unwrap_or(1.0).max(0.1);
+    let current_mode_id = output.get("currentModeId")?.as_str()?;
+    let mode = output
+        .get("modes")?
+        .as_array()?
+        .iter()
+        .find(|m| m.get("id").and_then(Value::as_str) == Some(current_mode_id))?;
+    let size = mode.get("size")?;
+    Some(Rect {
+        x: pos.get("x")?.as_f64()?,
+        y: pos.get("y")?.as_f64()?,
+        w: size.get("width")?.as_f64()? / scale,
+        h: size.get("height")?.as_f64()? / scale,
+    })
+}
+
+/// The virtual output's rectangle plus the bounding box of every enabled
+/// output, both logical. `None` if the output isn't there or kscreen-doctor
+/// can't be read -- the caller then does without pointer warping rather than
+/// guessing at a layout.
+pub fn layout() -> Option<DesktopLayout> {
+    let out = Command::new("kscreen-doctor").arg("-j").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let json: Value = serde_json::from_slice(&out.stdout).ok()?;
+    let outputs = json.get("outputs")?.as_array()?;
+    let name = virtual_output_name();
+
+    let mut desktop: Option<Rect> = None;
+    let mut ours: Option<Rect> = None;
+    for output in outputs {
+        if output.get("enabled").and_then(Value::as_bool) != Some(true) {
+            continue;
+        }
+        let Some(rect) = logical_rect(output) else { continue };
+        if output.get("name").and_then(Value::as_str) == Some(name.as_str()) {
+            ours = Some(rect);
+        }
+        desktop = Some(match desktop {
+            None => rect,
+            Some(d) => {
+                let x = d.x.min(rect.x);
+                let y = d.y.min(rect.y);
+                Rect {
+                    x,
+                    y,
+                    w: (d.x + d.w).max(rect.x + rect.w) - x,
+                    h: (d.y + d.h).max(rect.y + rect.h) - y,
+                }
+            }
+        });
+    }
+    Some(DesktopLayout { output: ours?, desktop: desktop? })
+}
+
 /// Not a secret worth persisting -- this RFB server only exists because
 /// `krfb-virtualmonitor` requires *a* password to start at all. Freshly
 /// random per launch instead of a fixed string in source.

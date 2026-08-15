@@ -347,21 +347,52 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     // synchronization needed.
     private var lastStylusButtonState = false
 
+    // --- Multi-touch state (Milestone 9). UI thread only, like the field above.
+
+    /** Android pointer id -> multitouch slot, stable for the life of a contact. */
+    private val slotOfPointer = HashMap<Int, Int>()
+
+    /** True from the moment a second finger lands until the last one lifts.
+     * Once a gesture starts, the remaining fingers keep going to the touchpad
+     * even as the count drops back to one -- resuming absolute dragging
+     * mid-gesture would jump the cursor to whichever finger happened to
+     * survive. */
+    private var gestureActive = false
+
+    private val longPressHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private var longPressPending: Runnable? = null
+    private var longPressFired = false
+    private var longPressAnchor = 0f to 0f
+
+    private fun send(type: Int, x: Int, y: Int, pressure: Int = 0, tiltX: Int = 0, tiltY: Int = 0, buttons: Int = 0) {
+        // Cheap, non-blocking enqueue on the UI thread; the actual socket
+        // write happens on inputWriterThread.
+        eventQueue.offer(PenEvent(type, x, y, pressure, tiltX, tiltY, buttons))
+    }
+
     private fun handleMotionEvent(event: MotionEvent, down: Boolean): Boolean {
         if (output == null) return false
 
         val stylusButtonNow = event.buttonState and MotionEvent.BUTTON_STYLUS_PRIMARY != 0
         if (stylusButtonNow != lastStylusButtonState) {
             lastStylusButtonState = stylusButtonNow
-            eventQueue.offer(
-                PenEvent(
-                    if (stylusButtonNow) EV_BUTTON_DOWN else EV_BUTTON_UP,
-                    event.x.roundToInt(), event.y.roundToInt(), 0, 0, 0, 1
-                )
+            send(
+                if (stylusButtonNow) EV_BUTTON_DOWN else EV_BUTTON_UP,
+                event.x.roundToInt(), event.y.roundToInt(), buttons = 1
             )
         }
 
-        val type: Int = when (event.action) {
+        // `actionMasked`, not `action`: for the secondary-pointer actions the
+        // raw value carries the pointer index in its high byte, so switching on
+        // it made ACTION_POINTER_DOWN/UP unmatchable -- which is why every
+        // finger past the first was silently dropped before Milestone 9.
+        val action = event.actionMasked
+        val isFinger = event.getToolType(event.actionIndex) == MotionEvent.TOOL_TYPE_FINGER
+        if (isFinger && down) {
+            return handleFingerEvent(event, action)
+        }
+
+        val type: Int = when (action) {
             MotionEvent.ACTION_HOVER_ENTER -> EV_HOVER_ENTER
             MotionEvent.ACTION_HOVER_MOVE -> EV_HOVER_MOVE
             MotionEvent.ACTION_HOVER_EXIT -> EV_HOVER_EXIT
@@ -373,23 +404,159 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
         val (tiltX, tiltY) = tiltXY(event)
         val pressureRaw = (event.pressure * pressureMax).roundToInt()
-        val isFinger = event.getToolType(0) == MotionEvent.TOOL_TYPE_FINGER
         val buttons = (if (stylusButtonNow) 1 else 0) or (if (isFinger) 2 else 0)
-
-        if (isFinger) {
-            // Diagnostic: confirms Android is actually delivering finger
-            // touches to this listener at all (vs. e.g. S Pen palm
-            // rejection suppressing them device-side before we ever see
-            // them).
-            Log.d(tag, "finger event: action=${event.action} at (${event.x}, ${event.y})")
-        }
-
-        // Cheap, non-blocking enqueue on the UI thread; the actual socket
-        // write happens on inputWriterThread.
-        eventQueue.offer(
-            PenEvent(type, event.x.roundToInt(), event.y.roundToInt(), pressureRaw, tiltX, tiltY, buttons)
-        )
+        send(type, event.x.roundToInt(), event.y.roundToInt(), pressureRaw, tiltX, tiltY, buttons)
         return true
+    }
+
+    /**
+     * The finger half of the input path.
+     *
+     * One finger keeps the pre-Milestone-9 behaviour exactly: it drives the
+     * tablet device absolutely, so a touch lands where you touch. Two or more
+     * become real multitouch slots on their own device, which is what lets
+     * libinput recognize scroll, pinch and swipe rather than us
+     * (`daemon/src/uinput_touchpad.rs`).
+     */
+    private fun handleFingerEvent(event: MotionEvent, action: Int): Boolean {
+        when (action) {
+            MotionEvent.ACTION_DOWN -> {
+                slotOfPointer.clear()
+                gestureActive = false
+                longPressFired = false
+                send(EV_DOWN, event.x.roundToInt(), event.y.roundToInt(), fingerPressure(event, 0), buttons = 2)
+                armLongPress(event.x, event.y)
+            }
+
+            MotionEvent.ACTION_POINTER_DOWN -> {
+                cancelLongPress()
+                if (!gestureActive) {
+                    gestureActive = true
+                    // Release the absolute contact the first finger was
+                    // holding, or the tablet device stays pressed for the whole
+                    // gesture and the desktop sees a drag underneath it.
+                    send(EV_UP, event.x.roundToInt(), event.y.roundToInt(), buttons = 2)
+                    // Then report *every* live contact, including the one that
+                    // was already down: libinput needs to see the gesture from
+                    // its first frame to classify it at all.
+                    for (i in 0 until event.pointerCount) {
+                        sendTouch(EV_TOUCH_DOWN, event, i)
+                    }
+                } else {
+                    sendTouch(EV_TOUCH_DOWN, event, event.actionIndex)
+                }
+            }
+
+            MotionEvent.ACTION_MOVE -> {
+                if (gestureActive) {
+                    for (i in 0 until event.pointerCount) {
+                        sendTouch(EV_TOUCH_MOVE, event, i)
+                    }
+                } else {
+                    val moved = kotlin.math.hypot(
+                        event.x - longPressAnchor.first,
+                        event.y - longPressAnchor.second
+                    )
+                    if (moved > longPressSlopPx) cancelLongPress()
+                    if (!longPressFired) {
+                        send(EV_MOVE, event.x.roundToInt(), event.y.roundToInt(), fingerPressure(event, 0), buttons = 2)
+                    }
+                }
+            }
+
+            MotionEvent.ACTION_POINTER_UP -> {
+                if (gestureActive) sendTouch(EV_TOUCH_UP, event, event.actionIndex)
+            }
+
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                cancelLongPress()
+                if (gestureActive) {
+                    // Lift whatever is still slotted -- ACTION_UP reports only
+                    // the last pointer, and a contact left down is a phantom
+                    // finger on the pad for the rest of the session.
+                    for (i in 0 until event.pointerCount) {
+                        sendTouch(EV_TOUCH_UP, event, i)
+                    }
+                    for (slot in slotOfPointer.values.toList()) {
+                        send(EV_TOUCH_UP, 0, 0, slot, buttons = 0)
+                    }
+                    slotOfPointer.clear()
+                    gestureActive = false
+                } else if (longPressFired) {
+                    // The right click already happened; the left contact was
+                    // released when it fired. Nothing left to send.
+                    longPressFired = false
+                } else {
+                    send(EV_UP, event.x.roundToInt(), event.y.roundToInt(), buttons = 2)
+                }
+            }
+        }
+        return true
+    }
+
+    /** Android's finger "pressure" is a contact-area estimate, not force, but
+     * the tablet device needs a nonzero value to move the cursor at all
+     * (`daemon/src/uinput_tablet.rs` module doc). */
+    private fun fingerPressure(event: MotionEvent, index: Int): Int =
+        (event.getPressure(index) * pressureMax).roundToInt().coerceAtLeast(1)
+
+    /** Slots are assigned on first sight and released on lift, so a five-finger
+     * mess doesn't permanently consume the four the daemon has. */
+    private fun slotFor(pointerId: Int): Int {
+        slotOfPointer[pointerId]?.let { return it }
+        val used = slotOfPointer.values.toSet()
+        val free = (0 until MAX_SLOTS).firstOrNull { it !in used } ?: return -1
+        slotOfPointer[pointerId] = free
+        return free
+    }
+
+    private fun sendTouch(type: Int, event: MotionEvent, index: Int) {
+        if (event.getToolType(index) != MotionEvent.TOOL_TYPE_FINGER) return
+        val pointerId = event.getPointerId(index)
+        val slot = slotFor(pointerId)
+        if (slot < 0) return // more fingers than slots; the extras are ignored
+        send(
+            type,
+            event.getX(index).roundToInt(),
+            event.getY(index).roundToInt(),
+            // The daemon reads the slot out of the pressure field and the
+            // contact count out of the buttons byte for these types -- see
+            // daemon/src/input_receiver.rs's wire-format comment.
+            pressure = slot,
+            buttons = event.pointerCount.coerceAtMost(255)
+        )
+        if (type == EV_TOUCH_UP) slotOfPointer.remove(pointerId)
+    }
+
+    private val longPressSlopPx: Float
+        get() = LONG_PRESS_SLOP_DP * resources.displayMetrics.density
+
+    /**
+     * Press and hold one finger without moving = right click there.
+     *
+     * The left contact is released first: without that, the press that started
+     * the hold is still down, and the desktop would see a drag with a right
+     * click inside it. Releasing first costs a plain click before the context
+     * menu, which is what a touchscreen user expects anyway (tap selects, hold
+     * opens the menu).
+     */
+    private fun armLongPress(x: Float, y: Float) {
+        cancelLongPress()
+        longPressAnchor = x to y
+        val runnable = Runnable {
+            if (gestureActive) return@Runnable
+            longPressFired = true
+            send(EV_UP, x.roundToInt(), y.roundToInt(), buttons = 2)
+            send(EV_RIGHT_DOWN, x.roundToInt(), y.roundToInt())
+            send(EV_RIGHT_UP, x.roundToInt(), y.roundToInt())
+        }
+        longPressPending = runnable
+        longPressHandler.postDelayed(runnable, LONG_PRESS_TIMEOUT_MS)
+    }
+
+    private fun cancelLongPress() {
+        longPressPending?.let { longPressHandler.removeCallbacks(it) }
+        longPressPending = null
     }
 
     /** Drains eventQueue on a dedicated thread, blocking-writes each event to
@@ -479,6 +646,15 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             // side for the two-message offset calibration this kicks off.
             writeLong(System.currentTimeMillis())
             writeByte(Settings(this@MainActivity).configFlags())
+            // Appended in Milestone 9: the virtual touchpad's gesture
+            // thresholds are all specified in millimetres, so the daemon needs
+            // a real physical resolution or none of them mean anything.
+            // `xdpi`/`ydpi` are the panel's true physical density, unlike
+            // `densityDpi`, which is the rounded bucket Android uses for
+            // layout scaling. Appending is safe by construction -- `body_len`
+            // is what makes an older daemon skip what it doesn't know.
+            writeInt((resources.displayMetrics.xdpi * 1000).roundToInt())
+            writeInt((resources.displayMetrics.ydpi * 1000).roundToInt())
         }
         val bodyBytes = body.toByteArray()
 
@@ -1076,6 +1252,20 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         private const val EV_UP = 5
         private const val EV_BUTTON_DOWN = 6
         private const val EV_BUTTON_UP = 7
+        private const val EV_TOUCH_DOWN = 8
+        private const val EV_TOUCH_MOVE = 9
+        private const val EV_TOUCH_UP = 10
+        private const val EV_RIGHT_DOWN = 11
+        private const val EV_RIGHT_UP = 12
+
+        /** Must match `MAX_SLOTS` in daemon/src/uinput_touchpad.rs. */
+        private const val MAX_SLOTS = 4
+        /** Android's own long-press timeout is 500ms; matching it keeps the
+         * gesture feeling like the rest of the system. */
+        private const val LONG_PRESS_TIMEOUT_MS = 500L
+        /** Movement past this cancels the hold rather than firing a right click
+         * at a finger that was really starting a drag. */
+        private const val LONG_PRESS_SLOP_DP = 10f
 
         /** Touch target; the drawn gear is 60% of this (see [GearButton]). */
         private const val GEAR_SIZE_DP = 48f

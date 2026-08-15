@@ -65,6 +65,34 @@ class SettingsActivity : Activity() {
         )
 
         root.addView(divider())
+        root.addView(heading("Touch gestures"))
+        root.addView(
+            note(
+                "Two-finger scroll, pinch, swipes and two-finger tap are recognized by " +
+                    "Linux itself, from a virtual touchpad the daemon creates. Configure " +
+                    "them in System Settings > Touchpad (or Mouse & Touchpad on GNOME) " +
+                    "like any real trackpad.\n\n" +
+                    "One finger still points where you touch, and holding one finger still " +
+                    "is a right click."
+            )
+        )
+        root.addView(
+            switchRow("Zoom with Ctrl+scroll instead of pinch", settings.ctrlScrollZoom) {
+                settings.ctrlScrollZoom = it
+            }
+        )
+        root.addView(
+            note(
+                "OFF sends a real pinch gesture. Only applications that understand Wayland " +
+                    "gestures zoom from it -- Firefox and GTK apps do, anything running " +
+                    "through XWayland (Krita, older Qt apps) ignores it entirely.\n\n" +
+                    "ON has the daemon recognize the pinch itself and send Ctrl+scroll, which " +
+                    "almost every application honours, but zooms in fixed steps instead of " +
+                    "smoothly."
+            )
+        )
+
+        root.addView(divider())
         root.addView(heading("Diagnostics"))
         root.addView(
             switchRow("Show latency overlay", settings.showLatencyOverlay) {

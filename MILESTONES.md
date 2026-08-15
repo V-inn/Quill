@@ -1195,7 +1195,7 @@ daemon, the write failure now exits the process, systemd restarts it, and the ap
 reconnects on its own -- no manual `systemctl restart` needed at any point in the
 whole plug-in-to-video chain anymore, mid-session drops included.
 
-## 9. (Not started) Multi-touch gestures
+## 9. Multi-touch gestures — DONE, written up in Milestone 23
 
 Pinch-to-zoom, two-finger scroll, and similar — deferred from the Milestone 6b finger
 click/drag follow-up (see there for why: needs a real multitouch device model, not a
@@ -2459,3 +2459,130 @@ the handshake never arrives" -- which surfaces as `setup_transport`'s 120s
 clock-sync timeout, not inside `aoa::connect`, so wiring it there is its own
 small change. And the deadlock fixed above was the cause of most of the stuck
 sessions this would have been papering over.
+
+## 23. Multi-touch gestures: a second device, and the pointer nobody was moving
+
+Milestone 6b deferred this with a specific diagnosis -- fingers need "a
+genuinely different device model", because adding `BTN_TOOL_FINGER` to the
+tablet device stopped the cursor moving at all. That is what this milestone
+builds.
+
+### One finger absolute, two fingers a touchpad
+
+`uinput_touchpad.rs` is a second uinput device declaring itself a real
+touchpad: `INPUT_PROP_POINTER`, `BTN_TOOL_FINGER`/`DOUBLETAP`/`TRIPLETAP`/
+`QUADTAP`, `BTN_TOUCH`, `BTN_LEFT`/`BTN_RIGHT`, and multitouch type B
+(`ABS_MT_SLOT`, `ABS_MT_POSITION_X/Y`, `ABS_MT_TRACKING_ID`) -- the capability
+set copied from this laptop's own Synaptics pad rather than invented. The
+tablet stays a pure tablet, so the Milestone 6b collision can't recur.
+
+libinput then does the recognition, which is the entire point: two-finger
+scroll, pinch, swipe, tap-to-click, two-finger tap as right click, kinetic
+scrolling and palm handling, all configurable in System Settings > Touchpad,
+and all of it portable to GNOME later since mutter drives libinput too.
+
+Routing, decided on the Android side: one finger keeps the pre-existing
+absolute path (touch lands where you touch), and the moment a second finger
+lands the client releases that contact and reports every contact as a
+multitouch slot instead. Once a gesture starts it stays a gesture until the
+last finger lifts -- resuming absolute dragging with whichever finger happened
+to survive would jump the cursor.
+
+`handleMotionEvent` had two bugs that made this impossible before: it switched
+on `event.action` rather than `actionMasked`, so `ACTION_POINTER_DOWN`/`UP`
+could never match, and every accessor read pointer index 0. Every finger past
+the first was silently dropped.
+
+### Protocol: five new types, no new framing
+
+Types 8-10 are touch down/move/up and 11-12 a right click, all reusing the
+existing 22-byte record with the `pressure` field carrying the slot and
+`buttons` the contact count. The alternative -- a second framing upstream --
+is exactly the class of thing protocol v2 exists to prevent.
+
+The desync detector added in Milestone 11 had to move with it: it treats
+anything above the highest known type as evidence of a misaligned stream and
+drops the connection after three, so a new type without a new bound would have
+made every touch record read as garbage.
+
+The handshake body gained `xdpi_milli`/`ydpi_milli`, appended, which is what
+`body_len` forward-compat was built for. libinput states every touchpad
+threshold in millimetres, so the device needs a real units/mm resolution or
+they are all meaningless -- the same class of mistake as the tablet's
+`resolution: 0` in Milestone 5, which made nothing move at all.
+
+### Zoom: a real trade-off, so it is a setting
+
+libinput's pinch is delivered as a Wayland gesture, which only gesture-aware
+toolkits act on -- anything on XWayland ignores it. Ctrl+scroll zooms in nearly
+everything but in fixed steps. So `gesture.rs` is a small recognizer (centroid
+delta is scroll, separation delta is pinch, decided once per contact pair and
+never revisited) that the daemon uses when `CONFIG_CTRL_SCROLL_ZOOM` is set: it
+withholds pinch contacts from the touchpad entirely and re-emits them as
+ctrl+wheel, so libinput sees no gesture and nothing is counted twice.
+
+That recognizer is also the piece Milestone 10 will need. The `RemoteDesktop`
+portal has `NotifyPointerAxis` and no gesture API at all, so on a no-uinput
+machine gestures can only come from a recognizer of ours. Its wiring is
+deliberately not built yet; the recognizer is, and is unit-tested.
+
+### The bug live testing found: gestures landed on the wrong screen
+
+User report, immediately: the new gestures applied "directly over the screen
+which mouse cursor was left on".
+
+Three facts stacked: wheel and button events go to whatever the *pointer* is
+over; the touchpad device is relative and only ever sees two contacts or more,
+so it never emits pointer motion at all; and the tablet's tool cursor is
+tracked separately from that pointer. Nothing in the chain was moving the
+pointer, so it stayed wherever the mouse had left it -- usually the laptop
+panel.
+
+Fixed by making `uinput_buttons.rs` an absolute pointer (`ABS_X`/`ABS_Y` across
+the desktop's logical bounding box, `INPUT_PROP_POINTER`, no `BTN_TOUCH` and no
+MT axes, so udev tags it `ID_INPUT_MOUSE` rather than a touchscreen) and
+warping it to the finger position before the event: to the midpoint between the
+fingers when a gesture starts, and to the finger before a long-press right
+click. The geometry comes from `kscreen-doctor` via `orientation::layout`, in
+*logical* coordinates -- this machine runs the panel at scale 1.25 and the
+virtual output at 1.5, so pixel sizes would have aimed at the wrong place.
+
+Second-order bug fixed with it: the layout was read at startup and always
+failed, because `main` is concurrently running `orientation::ensure`, which
+tears the virtual output down and recreates it. Startup is precisely when the
+desktop has no virtual output in it. Now resolved lazily on the first gesture,
+by which time the output is up.
+
+### Verification
+
+Device classification first, since that decides whether any of it works:
+`libinput list-devices` reports `Quill Virtual Touchpad` with
+**`Capabilities: pointer gesture`** and `Size: 256x160mm`, alongside the
+unchanged tablet (`cap:T`). Milestone 6b's failure did not recur.
+
+Driven by a synthetic client sending real multitouch records over the TCP
+transport (gestures need fingers, and this needed to be repeatable):
+
+- native mode: `POINTER_SCROLL_FINGER` for a two-finger drag,
+  `GESTURE_PINCH_BEGIN` with scale climbing 1.10 -> 1.34 for a spread, plus
+  `GESTURE_HOLD_BEGIN/END` that came free.
+- ctrl+scroll mode: **zero** `GESTURE_PINCH` (the withholding works), and
+  instead `KEY_LEFTCTRL pressed` -> 16 x `POINTER_SCROLL_WHEEL` -> `released`
+  on the buttons device.
+
+20 unit tests, including the recognizer's pan/pinch/undecided classification,
+its stickiness across a gesture, the zoom accumulator's quantization and sign,
+and the pointer mapping (corners, out-of-range clamping, negative desktop
+origin).
+
+Confirmed working on the hardware by the user after the pointer fix. **Not yet
+recorded: which applications honour the native pinch.** That measurement --
+GIMP 3.0.4 on GTK3, Firefox, Krita on Qt5 -- is what should decide whether
+ctrl+scroll becomes the default, and it is still open.
+
+A note for whoever runs synthetic clients against a live session: sending a
+handshake makes the daemon run `orientation::ensure`, which will `pkill
+krfb-virtualmonitor` and recreate the output if the size differs. That happened
+during this work, the recreate timed out, and the desktop lost its virtual
+monitor until the next connect -- which also invalidates the portal token and
+puts the picker dialog in front of whoever is there.

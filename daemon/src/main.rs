@@ -1,6 +1,7 @@
 mod aoa;
 mod clock_sync;
 mod ffi;
+mod gesture;
 mod h264_headers;
 mod input_receiver;
 mod orientation;
@@ -8,7 +9,9 @@ mod portal_capture;
 mod protocol;
 mod remote_desktop_input;
 mod single_instance;
+mod uinput_buttons;
 mod uinput_tablet;
+mod uinput_touchpad;
 mod vaapi_encoder;
 
 use std::sync::atomic::{AtomicBool, Ordering};

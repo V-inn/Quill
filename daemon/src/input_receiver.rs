@@ -20,20 +20,42 @@
 //!   i64 android_send_time_ms (device wall clock, for clock-offset calibration)
 //!
 //! Input event record (22 bytes, repeated):
-//!   u8  event_type   (0=hover_enter 1=hover_move 2=hover_exit 3=down 4=move 5=up 6=button_down 7=button_up)
+//!   u8  event_type   (0=hover_enter 1=hover_move 2=hover_exit 3=down 4=move 5=up 6=button_down 7=button_up
+//!                     8=touch_down 9=touch_move 10=touch_up 11=right_down 12=right_up)
 //!   i32 x_px
 //!   i32 y_px
-//!   i32 pressure
+//!   i32 pressure     (touch_* types: the multitouch **slot** instead)
 //!   i32 tilt_x_deg
 //!   i32 tilt_y_deg
 //!   u8  buttons      (bit0 = stylus primary button state, informational --
 //!                     the actual BTN_STYLUS toggle is driven by the
 //!                     explicit button_down/button_up event types, not this
-//!                     bit; bit1 = tool is a finger, not the S Pen)
+//!                     bit; bit1 = tool is a finger, not the S Pen.
+//!                     touch_* types: the live contact count instead)
+//!
+//! # Multi-touch (Milestone 9)
+//!
+//! Types 0-7 are the single-pointer path and are unchanged: the pen, and a
+//! lone finger, both position the cursor absolutely through the tablet device.
+//! The moment a second finger lands, the client switches to types 8-10 and
+//! reports every contact as a real multitouch slot, which goes to a *separate*
+//! device (`uinput_touchpad.rs`) that libinput classifies as a touchpad and
+//! recognizes gestures on. Milestone 6b established why this cannot be the
+//! same device: `BTN_TOOL_FINGER` on the tablet stopped the cursor moving at
+//! all.
+//!
+//! Types 11-12 are a right click at the current position -- the client's
+//! long-press. Neither the tablet (whose only button is the pen's barrel) nor
+//! the touchpad's own tap handling covers a press-and-hold on a device where
+//! one finger is an absolute pointer, so it is recognized on the Android side
+//! and injected through `uinput_buttons.rs`.
 
+use crate::gesture::{Classification, Gesture, Recognizer, ZoomAccumulator};
 use crate::portal_capture::TransportReader;
 use crate::remote_desktop_input::RemoteDesktopInput;
+use crate::uinput_buttons::UinputButtons;
 use crate::uinput_tablet::{TabletRanges, UinputTablet};
+use crate::uinput_touchpad::{TouchpadGeometry, UinputTouchpad, MAX_SLOTS};
 use std::io::{self, Read};
 use std::sync::mpsc::{Receiver, Sender};
 
@@ -80,6 +102,9 @@ pub struct Handshake {
     pub tilt_max: i32,
     pub android_send_ms: i64,
     pub config_flags: u8,
+    /// Physical pixels per inch * 1000, or `None` from a client that predates
+    /// the field. Only the touchpad device needs it.
+    pub dpi: Option<(i32, i32)>,
 }
 
 fn read_u16(r: &mut impl Read) -> io::Result<u16> {
@@ -168,7 +193,7 @@ fn read_handshake_body(r: &mut impl Read) -> io::Result<Option<Handshake>> {
     }
 
     let mut body = io::Cursor::new(&body[..]);
-    let handshake = Handshake {
+    let mut handshake = Handshake {
         width: read_u32(&mut body)?,
         height: read_u32(&mut body)?,
         pressure_min: read_i32(&mut body)?,
@@ -177,9 +202,18 @@ fn read_handshake_body(r: &mut impl Read) -> io::Result<Option<Handshake>> {
         tilt_max: read_i32(&mut body)?,
         android_send_ms: read_i64(&mut body)?,
         config_flags: read_u8(&mut body)?,
+        dpi: None,
     };
+    // Appended in Milestone 9, and optional exactly as `body_len` promises:
+    // a client that predates it still talks to this daemon, it just doesn't
+    // get a physically-calibrated touchpad.
+    if body_len >= KNOWN_BODY + 8 {
+        handshake.dpi = Some((read_i32(&mut body)?, read_i32(&mut body)?));
+    }
 
-    if !(MIN_DIM..=MAX_DIM).contains(&handshake.width) || !(MIN_DIM..=MAX_DIM).contains(&handshake.height) {
+    if !(MIN_DIM..=MAX_DIM).contains(&handshake.width)
+        || !(MIN_DIM..=MAX_DIM).contains(&handshake.height)
+    {
         eprintln!(
             "[input] rejecting handshake candidate: {}x{} px is outside the sane {MIN_DIM}..={MAX_DIM} \
              range, so this is a corrupted read rather than a real panel size",
@@ -188,10 +222,11 @@ fn read_handshake_body(r: &mut impl Read) -> io::Result<Option<Handshake>> {
         return Ok(None);
     }
 
-    if body_len > KNOWN_BODY {
+    let consumed = KNOWN_BODY + if handshake.dpi.is_some() { 8 } else { 0 };
+    if body_len > consumed {
         eprintln!(
             "[input] skipped {} trailing handshake byte(s) from a newer client",
-            body_len - KNOWN_BODY
+            body_len - consumed
         );
     }
     Ok(Some(handshake))
@@ -213,7 +248,9 @@ fn read_handshake(r: &mut impl Read) -> io::Result<(Handshake, usize)> {
         if let Some(handshake) = read_handshake_body(r)? {
             return Ok((handshake, discarded));
         }
-        eprintln!("[input] handshake candidate {attempt}/{MAX_HANDSHAKE_ATTEMPTS} rejected, resyncing...");
+        eprintln!(
+            "[input] handshake candidate {attempt}/{MAX_HANDSHAKE_ATTEMPTS} rejected, resyncing..."
+        );
     }
     Err(io::Error::new(
         io::ErrorKind::InvalidData,
@@ -229,10 +266,166 @@ const EV_MOVE: u8 = 4;
 const EV_UP: u8 = 5;
 const EV_BUTTON_DOWN: u8 = 6;
 const EV_BUTTON_UP: u8 = 7;
+const EV_TOUCH_DOWN: u8 = 8;
+const EV_TOUCH_MOVE: u8 = 9;
+const EV_TOUCH_UP: u8 = 10;
+const EV_RIGHT_DOWN: u8 = 11;
+const EV_RIGHT_UP: u8 = 12;
+
+/// Highest valid event type. Milestone 11's desync detector treats anything
+/// above this as evidence the stream is misaligned, so it has to move whenever
+/// a type is added -- otherwise every record of the new type reads as garbage
+/// and three in a row drop the connection.
+const EV_MAX: u8 = EV_RIGHT_UP;
 
 /// Consecutive out-of-range event types tolerated before the stream is called
 /// desynced. One is survivable noise; three in a row is a wrong read offset.
 const MAX_BAD_EVENTS: u32 = 3;
+
+
+/// Maps a point in the tablet's own pixel space onto the desktop's logical
+/// coordinate space, which is where the pointer lives.
+///
+/// Resolved lazily, on the first warp, rather than at startup: `main` is
+/// meanwhile running `orientation::ensure`, which tears the virtual output down
+/// and recreates it when the shape changed. Reading the layout during that
+/// window sees a desktop with no virtual output in it at all -- confirmed live,
+/// the first version of this logged "couldn't read the desktop layout" every
+/// time the monitor was recreated. By the time a finger is on the glass, the
+/// output is up.
+struct PointerMap {
+    layout: crate::orientation::DesktopLayout,
+    tablet_w: f64,
+    tablet_h: f64,
+}
+
+impl PointerMap {
+    fn to_desktop(&self, x: i32, y: i32) -> (i32, i32) {
+        let out = self.layout.output;
+        let desktop = self.layout.desktop;
+        let dx = out.x + (x as f64 / self.tablet_w).clamp(0.0, 1.0) * out.w;
+        let dy = out.y + (y as f64 / self.tablet_h).clamp(0.0, 1.0) * out.h;
+        // The device's axes start at 0, so subtract the desktop origin, which
+        // is not necessarily (0,0) -- an output above or left of the primary
+        // one puts it negative.
+        ((dx - desktop.x).round() as i32, (dy - desktop.y).round() as i32)
+    }
+}
+
+/// Owns the pointer-warping half of the input path: the lazily-resolved screen
+/// mapping, and the device that does the warping.
+///
+/// Warping is the fix for gestures landing on whichever screen the mouse
+/// pointer was last left on. Wheel and button events are delivered to whatever
+/// the pointer is over; the virtual touchpad is relative and only ever sees two
+/// contacts or more, so it never emits pointer motion at all, and the tablet's
+/// tool cursor is tracked separately from the pointer. Nothing in the chain was
+/// moving the pointer, so it stayed where the mouse had left it.
+struct Pointer {
+    device: Option<UinputButtons>,
+    map: Option<PointerMap>,
+    resolved: bool,
+    tablet_w: f64,
+    tablet_h: f64,
+}
+
+impl Pointer {
+    fn new(tablet_w: i32, tablet_h: i32) -> Self {
+        Self {
+            device: None,
+            map: None,
+            resolved: false,
+            tablet_w: tablet_w.max(1) as f64,
+            tablet_h: tablet_h.max(1) as f64,
+        }
+    }
+
+    fn map(&mut self) -> Option<&PointerMap> {
+        if !self.resolved {
+            self.resolved = true;
+            self.map = crate::orientation::layout().map(|layout| {
+                eprintln!(
+                    "[input] pointer warp target: output {}x{} at ({}, {}) in a {}x{} desktop (logical)",
+                    layout.output.w.round(),
+                    layout.output.h.round(),
+                    layout.output.x.round(),
+                    layout.output.y.round(),
+                    layout.desktop.w.round(),
+                    layout.desktop.h.round()
+                );
+                PointerMap { layout, tablet_w: self.tablet_w, tablet_h: self.tablet_h }
+            });
+            if self.map.is_none() {
+                eprintln!(
+                    "[input] couldn't read the desktop layout from kscreen-doctor -- gestures and \
+                     long-press clicks will land wherever the pointer already is"
+                );
+            }
+        }
+        self.map.as_ref()
+    }
+
+    /// The absolute space the device was created against. Falls back to a
+    /// degenerate 1x1 when the layout is unknown, which is harmless: with no
+    /// map there is nothing to warp to either, and only the wheel and button
+    /// halves of the device get used.
+    fn desktop(&mut self) -> crate::orientation::Rect {
+        self.map()
+            .map(|m| m.layout.desktop)
+            .unwrap_or(crate::orientation::Rect { x: 0.0, y: 0.0, w: 1.0, h: 1.0 })
+    }
+
+    /// Lazily creates the device -- it exists only when something actually
+    /// needs it (a warp, a right click, ctrl+scroll zoom), so a session that
+    /// uses none of those presents two devices rather than three.
+    fn device(&mut self) -> Option<&UinputButtons> {
+        if self.device.is_none() {
+            let desktop = self.desktop();
+            match UinputButtons::create(desktop) {
+                Ok(b) => {
+                    eprintln!(
+                        "[input] virtual buttons device created (pointer warp / right click / ctrl+scroll zoom)"
+                    );
+                    self.device = Some(b);
+                }
+                Err(e) => eprintln!("[input] failed to create the buttons device: {e}"),
+            }
+        }
+        self.device.as_ref()
+    }
+
+    fn warp_to(&mut self, x: i32, y: i32) {
+        let Some((dx, dy)) = self.map().map(|m| m.to_desktop(x, y)) else { return };
+        if let Some(b) = self.device() {
+            if let Err(e) = b.warp(dx, dy) {
+                eprintln!("[input] pointer warp failed: {e}");
+            }
+        }
+    }
+}
+
+/// One touch record onto the touchpad device. Split out because the
+/// ctrl+scroll path has to be able to *replay* records it held back, which
+/// means emitting them from two places.
+fn forward_touch(
+    touchpad: &UinputTouchpad,
+    event_type: u8,
+    slot: usize,
+    x: i32,
+    y: i32,
+) -> io::Result<()> {
+    match event_type {
+        EV_TOUCH_DOWN => touchpad.touch_down(slot, x, y),
+        EV_TOUCH_MOVE => touchpad.touch_move(slot, x, y),
+        _ => touchpad.touch_up(slot),
+    }
+}
+
+/// Fallback when a client predates the handshake's dpi fields. 10 units/mm is
+/// roughly a 254-dpi panel, which is the right order of magnitude for every
+/// tablet this runs on -- close enough that libinput's millimetre thresholds
+/// stay sane, and only used when the real number isn't available.
+const DEFAULT_UNITS_PER_MM: i32 = 10;
 
 /// Blocks reading the handshake, creates the uinput tablet from the real
 /// reported ranges, then loops injecting input events until the stream
@@ -275,7 +468,9 @@ pub fn run(
         // bytes queued ahead of the real handshake. Recovered rather than
         // fatal now, but still worth counting -- if this number is ever large
         // or growing, the `clear_halt`/reset work in `aoa.rs` is the lever.
-        eprintln!("[input] resynced after {discarded} discarded byte(s) of stale/garbage stream data");
+        eprintln!(
+            "[input] resynced after {discarded} discarded byte(s) of stale/garbage stream data"
+        );
     }
 
     let daemon_recv_ms = crate::clock_sync::now_millis();
@@ -335,12 +530,80 @@ pub fn run(
         },
         Some(_) => None,
     };
+    // Milestone 9: multi-finger contacts go to their own device, which
+    // libinput classifies as a touchpad and does the gesture recognition on.
+    // Created alongside the tablet rather than lazily -- a device appearing
+    // mid-gesture would miss the contacts that started it, and libinput needs
+    // a gesture from its first frame.
+    let (res_x, res_y) = match handshake.dpi {
+        // dpi/25.4 = pixels per millimetre, from the *_milli fields.
+        Some((x, y)) => (
+            ((x as f32 / 1000.0) / 25.4).round().max(1.0) as i32,
+            ((y as f32 / 1000.0) / 25.4).round().max(1.0) as i32,
+        ),
+        None => {
+            eprintln!(
+                "[input] client sent no dpi in its handshake -- assuming {DEFAULT_UNITS_PER_MM} units/mm \
+                 for the touchpad, so gesture thresholds may feel off"
+            );
+            (DEFAULT_UNITS_PER_MM, DEFAULT_UNITS_PER_MM)
+        }
+    };
+    let touchpad = match &tablet {
+        None => None,
+        Some(_) => {
+            let geometry = TouchpadGeometry {
+                width: ranges.width,
+                height: ranges.height,
+                res_x,
+                res_y,
+            };
+            match UinputTouchpad::create(&geometry) {
+                Ok(t) => {
+                    eprintln!(
+                        "[input] virtual touchpad ready: {}x{} px at {res_x}x{res_y} units/mm (~{}x{} mm)",
+                        ranges.width,
+                        ranges.height,
+                        ranges.width / res_x.max(1),
+                        ranges.height / res_y.max(1)
+                    );
+                    Some(t)
+                }
+                Err(e) => {
+                    // Not fatal, unlike the tablet: pen and single-finger input
+                    // still work without it, and losing gestures is worth less
+                    // than losing the session.
+                    eprintln!(
+                        "[input] failed to create the virtual touchpad ({e}) -- gestures disabled"
+                    );
+                    None
+                }
+            }
+        }
+    };
+
+    let ctrl_scroll_zoom = handshake.config_flags & crate::protocol::CONFIG_CTRL_SCROLL_ZOOM != 0;
+    let mut pointer = Pointer::new(ranges.width, ranges.height);
+    let mut recognizer = Recognizer::new(res_x, res_y);
+    let mut zoom = ZoomAccumulator::new();
+    // Contacts withheld from the touchpad while the recognizer decides whether
+    // this is a pinch. Replayed if it turns out to be a scroll, dropped if it
+    // turns out to be a pinch -- see the routing below.
+    let mut withheld: Vec<(u8, usize, i32, i32)> = Vec::new();
+
     if tablet.is_some() {
-        eprintln!("[input] virtual tablet ready, waiting for S Pen input...");
+        eprintln!(
+            "[input] virtual tablet ready, waiting for S Pen input... (zoom: {})",
+            if ctrl_scroll_zoom {
+                "ctrl+scroll"
+            } else {
+                "native pinch gesture"
+            }
+        );
     } else {
         eprintln!(
             "[input] uinput not accessible -- using portal RemoteDesktop input \
-             (position + click only, no pressure/tilt), waiting for input..."
+             (position + click only, no pressure/tilt, no gestures yet), waiting for input..."
         );
     }
 
@@ -377,7 +640,11 @@ pub fn run(
             Ok(v) => v,
             Err(_) => break,
         };
-        let (x, y) = if flip_180 { (ranges.width - x, ranges.height - y) } else { (x, y) };
+        let (x, y) = if flip_180 {
+            (ranges.width - x, ranges.height - y)
+        } else {
+            (x, y)
+        };
         let pressure = match read_i32(&mut stream) {
             Ok(v) => v,
             Err(_) => break,
@@ -403,10 +670,10 @@ pub fn run(
         // loop went on consuming misaligned records forever, injecting nothing.
         // One bad record can be a bit flip; several in a row is a desync, and
         // the only fix from here is a fresh connection with a fresh handshake.
-        if event_type > EV_BUTTON_UP {
+        if event_type > EV_MAX {
             consecutive_bad += 1;
             eprintln!(
-                "[input] event type {event_type} is outside the valid 0..={EV_BUTTON_UP} range \
+                "[input] event type {event_type} is outside the valid 0..={EV_MAX} range \
                  ({consecutive_bad}/{MAX_BAD_EVENTS} consecutive)"
             );
             if consecutive_bad >= MAX_BAD_EVENTS {
@@ -449,6 +716,115 @@ pub fn run(
             } else if let Some(ri) = &remote_input {
                 ri.button(pressed, true);
             }
+        } else if matches!(event_type, EV_TOUCH_DOWN | EV_TOUCH_MOVE | EV_TOUCH_UP) {
+            // The `pressure` field carries the slot for these types, and
+            // `buttons` the contact count -- see the module doc.
+            let slot = pressure.clamp(0, MAX_SLOTS as i32 - 1) as usize;
+            let Some(touchpad) = &touchpad else {
+                // No touchpad device: the portal fallback has no gesture path
+                // yet (Milestone 10), and dropping these is better than
+                // feeding multi-finger contacts to an absolute pointer.
+                continue;
+            };
+
+            // Feed the recognizer first, always: it is what decides whether a
+            // pinch should be withheld from the touchpad, and it needs every
+            // frame of the gesture to do that, not just the ones after the
+            // decision.
+            let outcome = match event_type {
+                EV_TOUCH_DOWN => {
+                    let was = recognizer.contact_count();
+                    recognizer.down(slot, x, y);
+                    // The gesture is starting: put the pointer between the two
+                    // fingers first, so the scroll or zoom that follows is
+                    // delivered to what is under them rather than to whatever
+                    // window the mouse pointer was last left on.
+                    if was < 2 {
+                        if let Some((cx, cy)) = recognizer.centroid() {
+                            pointer.warp_to(cx, cy);
+                        }
+                    }
+                    None
+                }
+                EV_TOUCH_MOVE => recognizer.motion(slot, x, y),
+                _ => {
+                    recognizer.up(slot);
+                    zoom.reset();
+                    None
+                }
+            };
+
+            if !ctrl_scroll_zoom {
+                // Native-gesture mode: libinput sees everything and decides
+                // for itself. The recognizer above is running but nothing
+                // acts on it.
+                if let Err(e) = forward_touch(touchpad, event_type, slot, x, y) {
+                    eprintln!("[input] touchpad emit failed: {e}");
+                }
+            } else {
+                match recognizer.classification() {
+                    // Still undecided: hold the contacts back rather than commit
+                    // them to the touchpad, since a pinch must never reach it.
+                    Classification::Undecided => {
+                        withheld.push((event_type, slot, x, y));
+                    }
+                    Classification::Scroll => {
+                        // Decided against us intercepting: replay whatever was
+                        // held back, in order, then pass through from here on.
+                        for (t, s, hx, hy) in withheld.drain(..) {
+                            if let Err(e) = forward_touch(touchpad, t, s, hx, hy) {
+                                eprintln!("[input] touchpad replay failed: {e}");
+                            }
+                        }
+                        if let Err(e) = forward_touch(touchpad, event_type, slot, x, y) {
+                            eprintln!("[input] touchpad emit failed: {e}");
+                        }
+                    }
+                    Classification::Pinch => {
+                        // The contacts never reach the touchpad at all, so
+                        // libinput sees no gesture and nothing double-counts.
+                        withheld.clear();
+                        if let Some(Gesture::Pinch { ratio }) = outcome {
+                            let clicks = zoom.feed(ratio);
+                            if clicks != 0 {
+                                if let Some(b) = pointer.device() {
+                                    let _ = b.set_ctrl(true);
+                                    if let Err(e) = b.wheel(clicks) {
+                                        eprintln!("[input] wheel emit failed: {e}");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Ctrl is held only for as long as the pinch is: releasing it on
+            // the last lift keeps a dropped connection from leaving the whole
+            // desktop in a ctrl-stuck state.
+            if recognizer.contact_count() == 0 {
+                withheld.clear();
+                if let Some(b) = &pointer.device {
+                    let _ = b.set_ctrl(false);
+                }
+            }
+        } else if matches!(event_type, EV_RIGHT_DOWN | EV_RIGHT_UP) {
+            let pressed = event_type == EV_RIGHT_DOWN;
+            if let Some(ri) = &remote_input {
+                ri.button(pressed, true);
+            } else {
+                // Aim first, click second: the finger's own absolute motion
+                // went to the tablet device, which does not move the pointer
+                // that button events are delivered to.
+                if pressed {
+                    pointer.warp_to(x, y);
+                }
+                if let Some(b) = pointer.device() {
+                    if let Err(e) = b.set_right_button(pressed) {
+                        eprintln!("[input] right button emit failed: {e}");
+                    }
+                }
+            }
         }
 
         event_count += 1;
@@ -457,6 +833,15 @@ pub fn run(
                 "[input] event {event_count}: type={event_type} x={x} y={y} pressure={pressure} finger={is_finger}"
             );
         }
+    }
+    // Whatever was mid-gesture when the stream died must not stay pressed:
+    // contacts left down read as phantom fingers on the pad, and a held ctrl
+    // affects the whole desktop, not just this session.
+    if let Some(touchpad) = &touchpad {
+        let _ = touchpad.release_all();
+    }
+    if let Some(b) = &pointer.device {
+        let _ = b.release_all();
     }
     eprintln!("[input] receiver thread exiting after {event_count} events");
 
@@ -547,6 +932,76 @@ mod tests {
         bytes.extend_from_slice(&[0xEE, 0xEE]);
         let (h, _) = read_handshake(&mut io::Cursor::new(bytes)).unwrap();
         assert_eq!((h.width, h.height), (1848, 2960));
+    }
+
+    #[test]
+    fn reads_the_appended_dpi_fields_when_present() {
+        let mut bytes = handshake_bytes(2560, 1600);
+        let new_len = (KNOWN_BODY + 8) as u16;
+        bytes[6..8].copy_from_slice(&new_len.to_be_bytes());
+        bytes.extend_from_slice(&243_000i32.to_be_bytes());
+        bytes.extend_from_slice(&243_000i32.to_be_bytes());
+        let (h, _) = read_handshake(&mut io::Cursor::new(bytes)).unwrap();
+        assert_eq!(h.dpi, Some((243_000, 243_000)));
+    }
+
+    #[test]
+    fn treats_dpi_as_absent_for_a_client_that_predates_it() {
+        // The forward-compat contract in reverse: a newer daemon, an older
+        // client, and the touchpad falls back to an assumed resolution rather
+        // than reading whatever follows.
+        let (h, _) = read_handshake(&mut io::Cursor::new(handshake_bytes(2560, 1600))).unwrap();
+        assert_eq!(h.dpi, None);
+    }
+
+    /// The layout this machine actually reports: a 1920x1080 panel at scale
+    /// 1.25 (1536x864 logical) with the 2560x1600 virtual output at scale 1.5
+    /// (1707x1067 logical) to its right.
+    fn pointer_map() -> PointerMap {
+        use crate::orientation::{DesktopLayout, Rect};
+        PointerMap {
+            layout: DesktopLayout {
+                output: Rect { x: 1536.0, y: 0.0, w: 1707.0, h: 1067.0 },
+                desktop: Rect { x: 0.0, y: 0.0, w: 3243.0, h: 1067.0 },
+            },
+            tablet_w: 2560.0,
+            tablet_h: 1600.0,
+        }
+    }
+
+    #[test]
+    fn maps_tablet_corners_onto_the_virtual_output() {
+        let map = pointer_map();
+        assert_eq!(map.to_desktop(0, 0), (1536, 0));
+        assert_eq!(map.to_desktop(2560, 1600), (3243, 1067));
+        // Dead centre of the tablet lands dead centre of that output, not of
+        // the desktop -- the whole point of the mapping.
+        assert_eq!(map.to_desktop(1280, 800), (2390, 534));
+    }
+
+    #[test]
+    fn clamps_coordinates_from_outside_the_panel() {
+        // A corrupted or over-range coordinate must not aim the pointer at
+        // another screen entirely.
+        let map = pointer_map();
+        assert_eq!(map.to_desktop(-500, -500), (1536, 0));
+        assert_eq!(map.to_desktop(99999, 99999), (3243, 1067));
+    }
+
+    #[test]
+    fn subtracts_a_negative_desktop_origin() {
+        use crate::orientation::{DesktopLayout, Rect};
+        // An output placed above/left of the primary one puts the desktop
+        // origin negative, while the device's own axes still start at 0.
+        let map = PointerMap {
+            layout: DesktopLayout {
+                output: Rect { x: -1707.0, y: -200.0, w: 1707.0, h: 1067.0 },
+                desktop: Rect { x: -1707.0, y: -200.0, w: 3243.0, h: 1267.0 },
+            },
+            tablet_w: 2560.0,
+            tablet_h: 1600.0,
+        };
+        assert_eq!(map.to_desktop(0, 0), (0, 0));
     }
 
     #[test]
