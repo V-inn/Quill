@@ -101,6 +101,17 @@ pub const MSG_VIDEO_FORMAT: u8 = 4;
 /// than have KWin composite the cursor into every frame.
 pub const CONFIG_CLIENT_SIDE_CURSOR: u8 = 1 << 0;
 
+/// Bit 2: rotate the video 180 degrees (GPU-side in the encoder) and reflect
+/// touch/pen coordinates to match.
+///
+/// This was inferred from the aspect ratio until Milestone 24 -- portrait meant
+/// flipped -- which was really a statement about where the USB cable enters
+/// *this* tablet when held that way. It is a property of how the device is
+/// physically oriented, not of its shape, so it belongs to whoever is holding
+/// it. A phone, which is portrait by default, would otherwise always be
+/// flipped.
+pub const CONFIG_FLIP_180: u8 = 1 << 2;
+
 /// Bit 1: send pinch as ctrl+wheel instead of letting it reach the virtual
 /// touchpad as a real gesture. libinput's pinch is delivered as a Wayland
 /// gesture, which only gesture-aware toolkits act on -- anything on XWayland

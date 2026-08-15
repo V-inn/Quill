@@ -33,16 +33,19 @@ class CursorOverlay(context: Context) : View(context) {
     private var videoWidth = 1
     private var videoHeight = 1
 
-    /** 180-degree rotation, matching the encoder's `flip_180` for portrait. */
+    /** 180-degree rotation, matching the encoder's `flip_180`. Set from the
+     * same setting the daemon is told about in the handshake -- inferring it
+     * here from the aspect ratio, as this did until Milestone 24, would put the
+     * pointer in the wrong corner whenever the two disagreed. */
     private var flip180 = false
+
+    fun setFlip180(flip: Boolean) {
+        flip180 = flip
+    }
 
     fun setVideoSize(width: Int, height: Int) {
         videoWidth = width.coerceAtLeast(1)
         videoHeight = height.coerceAtLeast(1)
-        // Mirrors vaapi_encoder.rs and input_receiver.rs: portrait on this
-        // hardware is flipped GPU-side, and the cursor has to follow the same
-        // rule or it lands in the wrong corner.
-        flip180 = height > width
     }
 
     /** Called off the network thread; posts to the UI thread to redraw. */

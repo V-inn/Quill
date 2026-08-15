@@ -112,7 +112,11 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             gravity = android.view.Gravity.CENTER
             setPadding(48, 48, 48, 48)
         }
-        cursorOverlay = CursorOverlay(this)
+        cursorOverlay = CursorOverlay(this).apply {
+            // Same flag the daemon gets in the handshake, so the tablet-drawn
+            // pointer and the rotated video agree about which way is up.
+            setFlip180(Settings(this@MainActivity).flip180)
+        }
         gearButton = GearButton(this)
         val gearSize = (GEAR_SIZE_DP * resources.displayMetrics.density).toInt()
         val gearMargin = (GEAR_MARGIN_DP * resources.displayMetrics.density).toInt()

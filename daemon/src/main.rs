@@ -108,12 +108,17 @@ async fn main() {
         }
     );
 
-    // Portrait needs a 180-degree flip on this machine (USB cable position)
-    // -- applied GPU-side by the encoder and mirrored in the uinput touch
-    // mapping (see vaapi_encoder.rs / input_receiver.rs), not via KWin
-    // rotation, which Milestone 16 found has no effect on this output type
-    // at all.
-    let flip_180 = transport_setup.as_ref().is_some_and(|(_, i)| i.height > i.width);
+    // A 180-degree flip, when the client asks for one -- applied GPU-side by
+    // the encoder and mirrored in the uinput touch mapping (see
+    // vaapi_encoder.rs / input_receiver.rs), not via KWin rotation, which
+    // Milestone 16 found has no effect on this output type at all.
+    //
+    // Milestone 24 moved this from `height > width` to the handshake flag: the
+    // flip exists because of which end the USB cable enters, which the person
+    // holding the device knows and the aspect ratio does not.
+    let flip_180 = transport_setup
+        .as_ref()
+        .is_some_and(|(_, i)| i.config_flags & protocol::CONFIG_FLIP_180 != 0);
 
     if let Some((_, info)) = &transport_setup {
         orientation::ensure(info.width, info.height);

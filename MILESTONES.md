@@ -2586,3 +2586,36 @@ krfb-virtualmonitor` and recreate the output if the size differs. That happened
 during this work, the recreate timed out, and the desktop lost its virtual
 monitor until the next connect -- which also invalidates the portal token and
 puts the picker dialog in front of whoever is there.
+
+## 24. The 180-degree flip becomes a setting
+
+`flip_180` was inferred from the aspect ratio -- `height > width`, i.e.
+"portrait means flipped". That was never really a statement about shape. It
+encoded which end of *this* tablet the USB cable enters when it is held in
+portrait, which is a fact about the physical situation, and the person holding
+the device is the only one who can see it.
+
+The cost of leaving it inferred showed up when considering phones: a phone is
+portrait by default, so it would have been flipped unconditionally, correct
+only for whoever happens to hold it the same way this tablet is held.
+
+Now `CONFIG_FLIP_180` (bit 2 of the handshake's `config_flags`), with a switch
+under Display in the settings screen. Three places read it instead of
+recomputing the guess independently:
+
+- `main.rs` -> `vaapi_encoder.rs`, which does the rotation GPU-side (KWin's own
+  rotation property does nothing for this output type -- Milestone 16),
+- `input_receiver.rs`, which reflects touch and pen coordinates to match,
+- `CursorOverlay.kt`, which draws the client-side pointer.
+
+That last one is the reason this matters beyond phones: three separate copies of
+the same heuristic had to agree, and any future case where they didn't would
+put the pointer in one corner and the ink in another.
+
+**Behaviour change worth knowing:** portrait no longer flips by itself. On this
+tablet, held with the cable where it has always been, the switch now has to be
+turned on for portrait sessions. Landscape is unaffected.
+
+Verified with a synthetic client sending `config_flags = 4`: a touch at
+(1000, 700) arrived at the uinput layer as (1560, 900) -- reflected against the
+2560x1600 panel, exactly as the old portrait path did.

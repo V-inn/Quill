@@ -614,13 +614,16 @@ pub fn run(
     // it to do this for us.
     let mut remote_prev_contact = false;
 
-    // Mirrors vaapi_encoder.rs's flip_180: this machine's USB cable
-    // position needs portrait video flipped 180 degrees, applied GPU-side
-    // since KWin's own rotation property does nothing for this output type
-    // (Milestone 16). Reflecting touch/pen x,y here keeps the two in sync
-    // -- computed independently, same formula, same handshake dims, since
-    // this thread reads the handshake before main.rs even knows them.
-    let flip_180 = ranges.height > ranges.width;
+    // Mirrors vaapi_encoder.rs's flip_180, which rotates the video GPU-side
+    // (KWin's own rotation property does nothing for this output type --
+    // Milestone 16). Reflecting touch/pen x,y here keeps input and image in
+    // sync; both sides read the same handshake flag, since this thread has the
+    // handshake before main.rs does.
+    //
+    // Until Milestone 24 this was `height > width`, i.e. "portrait means
+    // flipped" -- which was really a fact about where the USB cable enters this
+    // one tablet held that way, and would flip every phone unconditionally.
+    let flip_180 = handshake.config_flags & crate::protocol::CONFIG_FLIP_180 != 0;
 
     let mut event_count = 0u64;
     let mut consecutive_bad = 0u32;

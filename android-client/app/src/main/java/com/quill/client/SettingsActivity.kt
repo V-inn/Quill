@@ -65,6 +65,21 @@ class SettingsActivity : Activity() {
         )
 
         root.addView(divider())
+        root.addView(heading("Display"))
+        root.addView(
+            switchRow("Rotate the image 180°", settings.flip180) { settings.flip180 = it }
+        )
+        root.addView(
+            note(
+                "Turn this on if the desktop appears upside down -- which way up it " +
+                    "belongs depends on which end of the device the USB cable enters, and " +
+                    "only you can see that.\n\n" +
+                    "Touch and pen coordinates rotate with the image, so they keep lining " +
+                    "up either way."
+            )
+        )
+
+        root.addView(divider())
         root.addView(heading("Touch gestures"))
         root.addView(
             note(

@@ -57,11 +57,26 @@ class Settings(context: Context) {
         get() = prefs.getBoolean(KEY_CTRL_SCROLL_ZOOM, false)
         set(value) = prefs.edit().putBoolean(KEY_CTRL_SCROLL_ZOOM, value).apply()
 
+    /**
+     * Rotates the streamed image 180 degrees, and the touch mapping with it.
+     *
+     * Which way up the picture belongs depends on which end of the device the
+     * USB cable enters, and only the person holding it knows that. Until
+     * Milestone 24 the daemon inferred it from the aspect ratio -- portrait
+     * meant flipped -- which was a fact about one tablet held one way, and
+     * would have flipped every phone unconditionally, since phones are portrait
+     * by default.
+     */
+    var flip180: Boolean
+        get() = prefs.getBoolean(KEY_FLIP_180, false)
+        set(value) = prefs.edit().putBoolean(KEY_FLIP_180, value).apply()
+
     /** Packed into the handshake's `config_flags` byte. */
     fun configFlags(): Int {
         var flags = 0
         if (clientSideCursor) flags = flags or CONFIG_CLIENT_SIDE_CURSOR
         if (ctrlScrollZoom) flags = flags or CONFIG_CTRL_SCROLL_ZOOM
+        if (flip180) flags = flags or CONFIG_FLIP_180
         return flags
     }
 
@@ -69,6 +84,7 @@ class Settings(context: Context) {
         private const val KEY_CLIENT_SIDE_CURSOR = "client_side_cursor"
         private const val KEY_LATENCY_OVERLAY = "latency_overlay"
         private const val KEY_CTRL_SCROLL_ZOOM = "ctrl_scroll_zoom"
+        private const val KEY_FLIP_180 = "flip_180"
 
         // Mirrors protocol.rs. Kept as plain constants in both languages rather
         // than generated, since there are only a handful and a build-time
@@ -76,5 +92,6 @@ class Settings(context: Context) {
         // be changed together.
         const val CONFIG_CLIENT_SIDE_CURSOR = 1 shl 0
         const val CONFIG_CTRL_SCROLL_ZOOM = 1 shl 1
+        const val CONFIG_FLIP_180 = 1 shl 2
     }
 }
