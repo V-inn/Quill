@@ -1635,3 +1635,213 @@ check rather than assume. Keeping the GOP change: bandwidth matters independentl
 (lower USB traffic, more headroom before the pipeline itself becomes the
 bottleneck), and a ~13ms cost from 4 noisy readings isn't a strong enough signal to
 revert a validated bitstream win over.
+
+## 18. Latency pass: the SPS was telling the decoder to buffer, and the capture
+## path was making KWin read the GPU back to CPU every frame
+
+User asked for every available latency lever, however expensive, checking other
+open-source projects, targeting ~60ms glass-to-glass against the ~110-125ms
+Milestone 17 left. Research covered project-monitorize, scrcpy, moonlight-android
+/ moonlight-common-c, Sunshine, obs-studio's PipeWire capture, FFmpeg's VAAPI
+hwcontext, and KWin 6.3's own screencast source.
+
+**Two numbers in this file turned out to be stale, both found by just reading the
+production journal instead of trusting the record.** `upload+VPP+encode` was
+recorded as ~5.13ms; it is **12.66ms** at 2560x1600 (the 5.13ms was measured at
+1920x1080, before dynamic resolution existed). And with precise timestamps the
+every-30-frames log lines sit ~0.655s apart -- **~46fps delivered, not 60**, a
+~21.8ms period against a 16.67ms budget, with `0 stale dropped` throughout.
+
+### Root cause of the decoder's queue depth: no VUI in the SPS
+
+`h264_headers.rs`'s `build_sps` wrote `vui_parameters_present_flag = 0`.
+Confirmed on the real bitstream, not inferred:
+
+```
+$ ffmpeg -i /tmp/gop_test_ab.h264 -c copy -bsf:v trace_headers -f null -
+  level_idc                     00101001 = 41
+  vui_parameters_present_flag          0 = 0
+```
+
+With no VUI a decoder cannot know the stream never reorders, so clause E.2.1
+makes it infer `max_num_reorder_frames = MaxDpbFrames` from `level_idc` and the
+picture size. At level 4.1 (`MaxDpbMbs = 32768`): 2 frames at 2560x1600 (160x100
+= 16000 MBs), 4 frames at 1920x1080 (120x68 = 8160 MBs). **Those are exactly the
+`pending=3` and `pending=4-5` queue depths this file has been recording at those
+two resolutions all along.** At 60fps that is 33-66ms of latency the decoder is
+*required* to add.
+
+That reframes Milestone 7's whole decoder investigation. `KEY_LOW_LATENCY`, the
+Exynos vendor parameter, `KEY_PRIORITY`, the software-decoder switch -- every one
+of them was fighting an instruction carried in the bitstream itself. Milestone 7's
+conclusion, "this tablet's ~85-115ms decoder pipeline depth is a firmware/silicon
+floor, not reachable from app-level MediaCodec configuration," was reasonable on
+the evidence it had and is wrong.
+
+**Fixed:** `write_low_latency_vui()` in `h264_headers.rs` emits
+`bitstream_restriction_flag = 1`, `max_num_reorder_frames = 0`,
+`max_dec_frame_buffering = max_num_ref_frames`. Sunshine does the same thing
+host-side (`src/cbs.cpp`, `make_sps_h264`) and moonlight-android patches the same
+fields client-side, with the comment "increases decoding latency".
+
+Validated offline before touching hardware, via a throwaway
+`daemon/src/bin/vui_bitstream_test.rs` driving `VaapiEncoder` on 150 synthetic
+2560x1600 frames (same pattern Milestone 17 used): `trace_headers` shows
+`max_num_reorder_frames = 0` / `max_dec_frame_buffering = 1`, and
+`ffmpeg -f null -` decodes 150/150 with zero warnings. The exact VUI field layout
+was cross-checked against x264's own `--tune zerolatency` output at the same
+resolution -- identical order, identical restriction values.
+
+**Honesty check, and it matters.** An earlier draft of this claimed moonlight
+gates its patch on a device list including Exynos. It does not:
+`decoderNeedsSpsBitstreamRestrictions()` prefix-matches exactly `omx.nvidia`,
+`omx.qcom`, `omx.brcm` -- none of which can match `c2.exynos.h264.decoder`.
+No measured before/after latency result attributable to these VUI fields on a
+modern Exynos part could be found anywhere. What does hold up: AOSP's own
+`C2SoftAvcDec.cpp` reads `i4_reorder_depth` back out of `ih264d` and reconfigures
+`C2PortActualDelayTuning::output` live, so deriving output delay from the SPS is
+the contract every Codec2 component is written against. Samsung's component is
+closed and may instead report a fixed hardware-pipeline depth. **So the mechanism
+is right and the framework is designed around it, but whether this tablet honors
+it is unproven until `pending=N` is read live.** Expect a real chance of a
+negative result.
+
+**Also demoted on research:** `pic_order_cnt_type = 2` does not change the
+Annex E default inference on its own, and states nothing the VUI doesn't state
+explicitly once it is present. Not implemented.
+
+### Capture was routing every frame through a GPU->CPU readback
+
+KWin's `ScreenCastStream::onStreamParamChanged()` does a literal
+`spa_pod_find_prop(format, nullptr, SPA_FORMAT_VIDEO_modifier)` and only sets up
+its DMA-BUF path if that finds something. `portal_capture.rs`'s EnumFormat pod
+never carried a modifier property, so **every frame took KWin's MemFd fallback**,
+which is `grabTexture()` → a synchronous `glReadnPixels` of the whole 2560x1600
+render target into CPU memory. KWin's own comment in `record()` -- "Sample it
+before video rendering, readback and buffer synchronization add latency" --
+places that cost inside the ~28-30ms this project measures as capture latency.
+And then the daemon copied those same 16.4MB straight back onto the same GPU.
+
+**Fixed:** two EnumFormat pods are now offered in preference order, the first
+carrying a `SPA_FORMAT_VIDEO_modifier` choice with MANDATORY + DONT_FIXATE
+(`build_format_pod`), the second the old shm form as a real fallback.
+`vaapi_encoder.rs` gained `encode_frame_dmabuf` / `import_dmabuf`, importing the
+PipeWire fd as a VA surface via `VADRMPRIMESurfaceDescriptor` +
+`VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2`, cached by fd (KWin hands out a fixed
+3-buffer pool and reuses the same fds). All the FFI needed was already in the
+generated bindings; `wrapper.h` already included `va/va_drmcommon.h`.
+
+Confirmed live: `[pipewire] buffer data type: DataType::DmaBuf (1 plane(s))`,
+modifier `0x0` (LINEAR), three fds imported as surfaces 3/4/5, frames encoding
+normally.
+
+**The predicted win did not materialize where predicted.** The going-in
+hypothesis was that the 16.4MB memcpy into a write-combined VAAPI mapping
+dominated the 12.66ms. A controlled A/B -- `QUILL_FORCE_SHM=1` versus default,
+same 30-second window, same on-screen motion probe, back to back -- says
+otherwise: **shm 11.72ms vs DMA-BUF 10.92ms, with an identical 1350 frames
+delivered either way.** The copy was ~0.8ms. That segment is dominated by GPU
+work (VPP colour conversion plus H.264 encode over 4.1M pixels), not by the copy.
+
+**And the half that should matter most is still unmeasured.** Removing KWin's
+readback from the ~28-30ms capture segment was always the bigger prize, and it
+could not be confirmed: the barcode probe decodes the CPU mapping that the
+zero-copy path deliberately no longer has. A `QUILL_BARCODE_PROBE` escape hatch
+is in (`with_mapped_dmabuf`, maps the imported surface for the diagnostic only,
+off by default since mapping a GPU surface forces exactly the sync this path
+exists to avoid), but the probe window currently renders clipped to ~100px of its
+480px barcode on this display layout, so it decodes nothing. Confirmed by dumping
+a raw frame with `QUILL_DUMP_FRAME` and looking at the pixels -- the run lengths
+are clean multiples of 10, so it isn't a scaling problem, the window is just
+mostly not there. Re-calibrating it is the next step; Milestone 7 called this
+positioning "its own detour" and it still is.
+
+### Encoder: two free wins on top
+
+**Removed the `vaSyncSurface` between VPP and encode.** The encode targets the
+same surface and ends with its own sync; the intermediate one only parked the CPU
+between two GPU jobs that can overlap. Verified rather than assumed: the same 150
+synthetic frames encode **byte-identical** (`md5` match) with and without it, and
+still decode clean -- so VAAPI's ordering guarantee holds in practice on iHD.
+
+**Pinned the encoder quality level to the driver's fastest.** Never set before.
+`VAConfigAttribEncQualityRange` reports 7 on this iGPU; VAAPI's convention is 1 =
+best quality, higher = faster, and rate control is CQP so picture quality is set
+by QP regardless. P-frames grew from ~1250 to ~1316 bytes on synthetic content --
+irrelevant next to a 240-byte steady-state frame.
+
+**Cumulative, measured on the same probe back to back:** 12.66ms → 10.92
+(DMA-BUF) → 10.65 (no VPP sync) → **9.73ms** (quality level). **-23% on the
+daemon's encode segment.**
+
+### Android: the decode loop only drained output when a packet arrived
+
+`runDecodeLoop` read a frame off USB, queued it, then polled for output -- all on
+one thread. A decoded frame could therefore only be rendered on an iteration that
+*also* received a new frame, so a frame the decoder finished 2ms after queueing
+waited for the next packet: up to a full inter-frame interval, unbounded while the
+source screen was briefly idle.
+
+Milestone 7 ruled out async `MediaCodec` mode on the grounds that it "only changes
+how the client is notified, not how many frames the codec buffers internally."
+That is true of the codec's DPB and doesn't cover this -- the polling delay is a
+separate, additive cost created by the loop's shape. Research backs the
+distinction: no measured A/B exists anywhere between async callbacks and a
+dedicated blocking-dequeue thread (they converge structurally), but the
+network-coupled third pattern -- exactly what this code did -- is the one
+well-documented way to add a full inter-arrival interval of pure scheduling delay.
+
+**Fixed:** split into a reader (socket → `queueInputBuffer`) and a dedicated
+render thread doing a blocking `dequeueOutputBuffer(info, 50_000)`, both at
+`THREAD_PRIORITY_URGENT_DISPLAY`, with the pending-send-time FIFO promoted to a
+`ConcurrentLinkedQueue`. Milestone 12's burst-dedup is preserved verbatim on the
+render side. Blocking-dequeue-on-its-own-thread rather than async callbacks
+matches moonlight-android and keeps the burst logic, which needs to see a whole
+burst at once, simple.
+
+**A real bug fixed alongside it, introduced by Milestone 17 and not noticed then.**
+When `dequeueInputBuffer` returned < 0 the loop logged a warning and **silently
+discarded a frame it had already read off the wire**. Harmless under all-intra --
+the next frame was a fresh IDR. Since the GOP landed, one discarded P frame
+corrupts every frame after it until the next IDR, up to a full second of visible
+garbage. Now it waits for a buffer instead of dropping.
+
+**Wire format gained a keyframe flag.** The frame header is 13 bytes now
+(`i64` send time, `u32` length, `u8` is_idr); heartbeats carry the same shape with
+length 0 so the read loop has no special case before it knows the length. The
+client had been passing `BUFFER_FLAG_KEY_FRAME` on every buffer, which has been a
+lie on every P frame since Milestone 17. Also set `KEY_MAX_INPUT_SIZE` so the
+codec never reallocates an input buffer mid-stream.
+
+### Also: the per-frame disk write is now opt-in
+
+`portal_capture.rs` wrote every encoded frame to `~/.local/share/quill/output.h264`
+with an unbuffered `write()` syscall in the middle of the hot path, into a file
+that grew without bound (~50MB after one session) and that nothing reads unless
+someone is debugging the bitstream. Now behind `QUILL_DUMP_H264`, matching the
+existing `QUILL_DUMP_FRAME` convention.
+
+### Not done yet, in priority order
+
+1. **Re-calibrate the barcode probe** so the capture segment is measurable again.
+   Everything else on the capture side is guesswork until this works.
+2. **Live-test A1 and A2 on the tablet.** `pending=N` in the Android stat line
+   settles the VUI question in one run.
+3. **Move the USB write off the capture thread** and release the PipeWire buffer
+   as early as the data allows. KWin's `record()` calls `dequeueBuffer()` and, if
+   the 2-4 buffer pool is exhausted, simply `return`s with **no retry scheduled**
+   (the stream is `PW_STREAM_FLAG_DRIVER`; the next chance is the next damage
+   event). Holding a buffer ~13ms against a 3-buffer pool is a source-grounded
+   explanation for 46fps against a 60Hz ceiling.
+4. **`CursorMode::Metadata` instead of `Embedded`.** `record()` ORs
+   `Content::Video` in unconditionally under `Embedded`, so every cursor move
+   forces a full composite of the whole output even with no window change --
+   the dominant event source for a pen-driven monitor.
+5. **Higher refresh virtual output.** No refresh argument exists anywhere in the
+   krfb → `zkde_screencast_unstable_v1` → KWin path (`virtualOutputScreencast
+   Requested` takes five arguments, none of them a rate; both virtual-output
+   classes hardcode `OutputModeline(size, 60000, Preferred)`). Both advertise
+   `Capability::CustomModes` though, so `kscreen-doctor addCustomMode` can
+   override after the fact -- must be re-applied after every krfb launch, and
+   before the daemon connects, since `screencaststream.cpp` renegotiates on size
+   changes only.

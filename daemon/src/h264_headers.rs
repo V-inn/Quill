@@ -94,6 +94,11 @@ pub struct H264Params {
     pub frame_crop_bottom: u32,
     pub pic_init_qp: u8,
     pub deblocking_filter_control_present: bool,
+    /// VUI `max_dec_frame_buffering`. Must be >= `max_num_ref_frames` -- some
+    /// decoders reject the stream outright otherwise, so this is derived from
+    /// the same value in `vaapi_encoder.rs` rather than being an independent
+    /// constant that can silently drift.
+    pub max_dec_frame_buffering: u32,
 }
 
 /// Returns the SPS NAL unit's RBSP payload (NAL header byte + body), not
@@ -126,9 +131,57 @@ pub fn build_sps(p: &H264Params) -> Vec<u8> {
         w.write_ue(0); // top
         w.write_ue(p.frame_crop_bottom);
     }
-    w.write_bit(0); // vui_parameters_present_flag
+    write_low_latency_vui(&mut w, p);
     nal.extend(w.finish());
     with_start_code(apply_emulation_prevention(&nal))
+}
+
+/// The whole reason this SPS carries a VUI at all: `bitstream_restriction_flag`
+/// with `max_num_reorder_frames = 0`.
+///
+/// Without a VUI, a decoder has no way to know this stream never reorders, so
+/// clause E.2.1 makes it infer `max_num_reorder_frames = MaxDpbFrames`, derived
+/// from `level_idc` and the picture size (Annex A, Table A-1). At level 4.1
+/// (`MaxDpbMbs = 32768`) that's 2 frames for 2560x1600 (160x100 = 16000 MBs) and
+/// 4 frames for 1920x1080 (120x68 = 8160 MBs) -- which is exactly the
+/// `pending=3` / `pending=4-5` decoder queue depth the Android client has been
+/// logging at those two resolutions all along (see MILESTONES.md, Milestone 7).
+/// At 60fps that is 33-66ms of latency the decoder is *required* to add, and it
+/// explains why every decoder-side flag tried in Milestone 7 (`KEY_LOW_LATENCY`,
+/// the Exynos vendor key, `KEY_PRIORITY`) measured as a no-op: they were all
+/// fighting an instruction carried in the bitstream itself. This is not a
+/// hardware floor, as that milestone concluded.
+///
+/// Same fields, same values, as two mature projects solving the same problem:
+/// Sunshine rewrites its hardware encoder's SPS this way host-side
+/// (`src/cbs.cpp`, `make_sps_h264`), and moonlight-android patches it
+/// client-side on devices whose encoders omit it
+/// (`MediaCodecDecoderRenderer.java`, "increases decoding latency"). Quill owns
+/// both ends, so emitting it correctly here means the client needs no patching.
+///
+/// Everything ahead of `bitstream_restriction_flag` is signalled absent.
+/// `timing_info` in particular is deliberately *not* written: it would mean
+/// hardcoding a frame rate here, the capture side has no fixed one to report
+/// (frames arrive on damage), and with `fixed_frame_rate_flag` off it carries no
+/// normative weight anyway.
+fn write_low_latency_vui(w: &mut BitWriter, p: &H264Params) {
+    w.write_bit(1); // vui_parameters_present_flag
+    w.write_bit(0); // aspect_ratio_info_present_flag
+    w.write_bit(0); // overscan_info_present_flag
+    w.write_bit(0); // video_signal_type_present_flag
+    w.write_bit(0); // chroma_loc_info_present_flag
+    w.write_bit(0); // timing_info_present_flag
+    w.write_bit(0); // nal_hrd_parameters_present_flag
+    w.write_bit(0); // vcl_hrd_parameters_present_flag
+    w.write_bit(0); // pic_struct_present_flag
+    w.write_bit(1); // bitstream_restriction_flag
+    w.write_bit(1); // motion_vectors_over_pic_boundaries_flag
+    w.write_ue(0); // max_bytes_per_pic_denom (0 = no limit signalled)
+    w.write_ue(0); // max_bits_per_mb_denom (0 = no limit signalled)
+    w.write_ue(16); // log2_max_mv_length_horizontal
+    w.write_ue(16); // log2_max_mv_length_vertical
+    w.write_ue(0); // max_num_reorder_frames -- the point of all this
+    w.write_ue(p.max_dec_frame_buffering);
 }
 
 /// Returns the PPS NAL unit's RBSP payload (NAL header byte + body).

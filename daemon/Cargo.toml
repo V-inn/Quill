@@ -7,7 +7,10 @@ edition = "2021"
 ashpd = "0.12.3"
 input-linux = "0.7.1"
 libc = "0.2"
-pipewire = "0.10.0"
+# v0_3_33 gates `PropertyFlags::DONT_FIXATE`, which the DMA-BUF format
+# negotiation in portal_capture.rs needs (installed PipeWire is 1.4.2, far past
+# the 0.3.33 this guards).
+pipewire = { version = "0.10.0", features = ["v0_3_33"] }
 rusb = "0.9"
 serde_json = "1"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }

@@ -13,6 +13,30 @@ use std::ptr;
 
 pub type VaResult<T> = Result<T, String>;
 
+/// One encoded frame plus whether it's an IDR. The flag travels to the Android
+/// client in the frame header so it can pass `BUFFER_FLAG_KEY_FRAME` only when
+/// it's actually true -- before the GOP landed every frame was an IDR and the
+/// client hardcoded the flag, which has been a lie on every P frame since.
+pub struct EncodedFrame {
+    pub data: Vec<u8>,
+    pub is_idr: bool,
+}
+
+/// One PipeWire DMA-BUF plane, as handed over by KWin's screencast. Single
+/// plane in practice for the packed BGRx format this stream negotiates.
+pub struct DmabufPlane {
+    pub fd: std::os::fd::RawFd,
+    pub offset: u32,
+    pub stride: u32,
+    pub size: u32,
+    pub modifier: u64,
+}
+
+/// `DRM_FORMAT_XRGB8888` -- little-endian 0xXXRRGGBB, i.e. B,G,R,X in memory
+/// order, which is exactly what SPA calls BGRx and what `VA_FOURCC_BGRX`
+/// expects. The three names describe the same byte layout.
+const DRM_FORMAT_XRGB8888: u32 = u32::from_le_bytes([b'X', b'R', b'2', b'4']);
+
 fn check(status: ffi::VAStatus, what: &str) -> VaResult<()> {
     if status as u32 == ffi::VA_STATUS_SUCCESS {
         Ok(())
@@ -49,6 +73,12 @@ pub struct VaapiEncoder {
     // Replaced ~10ms of CPU time (more than the hardware encode itself
     // took) -- see MILESTONES.md for the measured before/after.
     src_surface: ffi::VASurfaceID,
+    /// Zero-copy path: PipeWire DMA-BUF fds imported as VA surfaces, keyed by
+    /// fd. KWin hands out a small fixed pool (2-4 buffers) and reuses those
+    /// same fds for the life of the stream, so importing once per fd rather
+    /// than once per frame turns a per-frame `vaCreateSurfaces` into a hash
+    /// lookup. Destroyed together in `Drop`.
+    imported_surfaces: std::collections::HashMap<std::os::fd::RawFd, ffi::VASurfaceID>,
     vpp_config_id: ffi::VAConfigID,
     vpp_context_id: ffi::VAContextID,
     width: u32,
@@ -67,6 +97,12 @@ pub struct VaapiEncoder {
     // (idr_pic_id must differ between them even though frame_num resets to
     // 0 each time), and the previous frame's frame_num/POC -- needed to
     // populate the P slice's single reference-picture entry.
+    /// Encoder speed/quality preset, queried from
+    /// `VAConfigAttribEncQualityRange` at init. VAAPI's convention is 1 = best
+    /// quality, higher = faster; this is pinned to the driver's advertised
+    /// maximum. A virtual monitor is a latency problem, not an archival one,
+    /// and the rate control is CQP so picture quality is set by QP regardless.
+    quality_level: u32,
     frame_count: u64,
     idr_count: u16,
     prev_frame_num: u16,
@@ -123,6 +159,31 @@ impl VaapiEncoder {
             "[vaapi] packed header support bitmask: {:#x} (requesting: {:#x})",
             packed_headers_attrib.value, packed_headers_supported
         );
+
+        let mut quality_attrib = ffi::VAConfigAttrib {
+            type_: ffi::VAConfigAttribType_VAConfigAttribEncQualityRange,
+            value: 0,
+        };
+        check(
+            unsafe {
+                ffi::vaGetConfigAttributes(
+                    dpy,
+                    ffi::VAProfile_VAProfileH264Main,
+                    ffi::VAEntrypoint_VAEntrypointEncSliceLP,
+                    &mut quality_attrib,
+                    1,
+                )
+            },
+            "vaGetConfigAttributes(quality range)",
+        )?;
+        // VA_ATTRIB_NOT_SUPPORTED comes back as all-ones; anything else is the
+        // number of levels, of which the highest is the fastest.
+        let quality_level = if quality_attrib.value == 0 || quality_attrib.value == u32::MAX {
+            0 // 0 means "driver default", i.e. don't send the buffer at all
+        } else {
+            quality_attrib.value
+        };
+        eprintln!("[vaapi] encoder quality range: {} (using level {quality_level})", quality_attrib.value);
 
         let mut attribs = [
             ffi::VAConfigAttrib {
@@ -272,6 +333,7 @@ impl VaapiEncoder {
             context_id,
             surfaces,
             src_surface,
+            imported_surfaces: std::collections::HashMap::new(),
             vpp_config_id,
             vpp_context_id,
             width,
@@ -279,6 +341,7 @@ impl VaapiEncoder {
             aligned_width,
             aligned_height,
             flip_180,
+            quality_level,
             frame_count: 0,
             idr_count: 0,
             prev_frame_num: 0,
@@ -289,8 +352,143 @@ impl VaapiEncoder {
     /// Uploads a raw BGRX frame (`src_stride` bytes/row, as captured --
     /// untouched by any CPU color conversion), converts it to NV12 via
     /// VAAPI's own GPU VPP entrypoint, and encodes it as a standalone IDR
-    /// frame. Returns the raw Annex-B H.264 bytes.
-    pub fn encode_frame(&mut self, bgrx: &[u8], src_stride: usize) -> VaResult<Vec<u8>> {
+    /// frame. Returns the raw Annex-B H.264 bytes plus whether this frame was
+    /// an IDR.
+    pub fn encode_frame(&mut self, bgrx: &[u8], src_stride: usize) -> VaResult<EncodedFrame> {
+        self.upload_bgrx_surface(bgrx, src_stride)?;
+        let src = self.src_surface;
+        self.encode_from_surface(src)
+    }
+
+    /// Zero-copy counterpart of `encode_frame`: takes KWin's own GPU buffer by
+    /// dmabuf fd instead of a CPU-side copy of it.
+    ///
+    /// The shm path costs two full-frame trips across the CPU/GPU boundary per
+    /// frame -- KWin does a synchronous `glReadnPixels` of the whole render
+    /// target to hand us mapped bytes, then `upload_bgrx_surface` memcpys those
+    /// 16.4MB (2560x1600x4) straight back onto the same GPU. Neither is needed:
+    /// the pixels start and end on the iGPU, and VAAPI can import the
+    /// compositor's buffer directly.
+    pub fn encode_frame_dmabuf(&mut self, plane: &DmabufPlane) -> VaResult<EncodedFrame> {
+        let src = self.import_dmabuf(plane)?;
+        self.encode_from_surface(src)
+    }
+
+    /// Imports a dmabuf fd as a BGRX VA surface, or returns the surface already
+    /// imported for that fd. `VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2` is the
+    /// modifier-aware import path (the older `..._DRM_PRIME` can't express one),
+    /// which matters because KWin negotiated an explicit modifier rather than
+    /// leaving it implicit.
+    fn import_dmabuf(&mut self, plane: &DmabufPlane) -> VaResult<ffi::VASurfaceID> {
+        if let Some(&existing) = self.imported_surfaces.get(&plane.fd) {
+            return Ok(existing);
+        }
+
+        let mut desc: ffi::VADRMPRIMESurfaceDescriptor = unsafe { std::mem::zeroed() };
+        desc.fourcc = ffi::VA_FOURCC_BGRX;
+        desc.width = self.width;
+        desc.height = self.height;
+        desc.num_objects = 1;
+        desc.objects[0].fd = plane.fd;
+        desc.objects[0].size = plane.size;
+        desc.objects[0].drm_format_modifier = plane.modifier;
+        desc.num_layers = 1;
+        desc.layers[0].drm_format = DRM_FORMAT_XRGB8888;
+        desc.layers[0].num_planes = 1;
+        desc.layers[0].object_index[0] = 0;
+        desc.layers[0].offset[0] = plane.offset;
+        desc.layers[0].pitch[0] = plane.stride;
+
+        let mut attribs = [
+            ffi::VASurfaceAttrib {
+                type_: ffi::VASurfaceAttribType_VASurfaceAttribMemoryType,
+                flags: ffi::VA_SURFACE_ATTRIB_SETTABLE,
+                value: ffi::VAGenericValue {
+                    type_: ffi::VAGenericValueType_VAGenericValueTypeInteger,
+                    value: ffi::_VAGenericValue__bindgen_ty_1 {
+                        i: ffi::VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2 as i32,
+                    },
+                },
+            },
+            ffi::VASurfaceAttrib {
+                type_: ffi::VASurfaceAttribType_VASurfaceAttribExternalBufferDescriptor,
+                flags: ffi::VA_SURFACE_ATTRIB_SETTABLE,
+                value: ffi::VAGenericValue {
+                    type_: ffi::VAGenericValueType_VAGenericValueTypePointer,
+                    value: ffi::_VAGenericValue__bindgen_ty_1 {
+                        p: &mut desc as *mut _ as *mut c_void,
+                    },
+                },
+            },
+        ];
+
+        let mut surface: ffi::VASurfaceID = 0;
+        check(
+            unsafe {
+                ffi::vaCreateSurfaces(
+                    self.dpy,
+                    ffi::VA_RT_FORMAT_RGB32,
+                    self.width,
+                    self.height,
+                    &mut surface,
+                    1,
+                    attribs.as_mut_ptr(),
+                    attribs.len() as u32,
+                )
+            },
+            "vaCreateSurfaces(DRM_PRIME_2 import)",
+        )?;
+
+        eprintln!(
+            "[vaapi] imported dmabuf fd {} as surface {surface} (modifier 0x{:016x}, stride {}, offset {})",
+            plane.fd, plane.modifier, plane.stride, plane.offset
+        );
+        self.imported_surfaces.insert(plane.fd, surface);
+        Ok(surface)
+    }
+
+    /// Diagnostic only: maps an imported dmabuf so the caller can read raw
+    /// pixels out of it (the latency-barcode probe, specifically).
+    ///
+    /// The barcode instrument in `portal_capture.rs` reads the CPU mapping
+    /// PipeWire hands over, which the zero-copy path deliberately no longer
+    /// has -- so without this, turning on DMA-BUF would silently blind the one
+    /// measurement that says whether DMA-BUF helped. Gated by the caller behind
+    /// an env var: `vaDeriveImage`/`vaMapBuffer` on a GPU surface forces a sync
+    /// and is exactly the kind of per-frame cost this path exists to remove.
+    pub fn with_mapped_dmabuf<R>(
+        &mut self,
+        plane: &DmabufPlane,
+        f: impl FnOnce(&[u8], usize) -> R,
+    ) -> VaResult<R> {
+        let surface = self.import_dmabuf(plane)?;
+        let mut image: ffi::VAImage = unsafe { std::mem::zeroed() };
+        check(
+            unsafe { ffi::vaDeriveImage(self.dpy, surface, &mut image) },
+            "vaDeriveImage(dmabuf probe)",
+        )?;
+        let mut buf_ptr: *mut c_void = ptr::null_mut();
+        check(
+            unsafe { ffi::vaMapBuffer(self.dpy, image.buf, &mut buf_ptr) },
+            "vaMapBuffer(dmabuf probe)",
+        )?;
+        let stride = image.pitches[0] as usize;
+        let result = unsafe {
+            let base = (buf_ptr as *const u8).add(image.offsets[0] as usize);
+            f(
+                std::slice::from_raw_parts(base, stride * self.height as usize),
+                stride,
+            )
+        };
+        check(unsafe { ffi::vaUnmapBuffer(self.dpy, image.buf) }, "vaUnmapBuffer(dmabuf probe)")?;
+        check(
+            unsafe { ffi::vaDestroyImage(self.dpy, image.image_id) },
+            "vaDestroyImage(dmabuf probe)",
+        )?;
+        Ok(result)
+    }
+
+    fn encode_from_surface(&mut self, source: ffi::VASurfaceID) -> VaResult<EncodedFrame> {
         let is_idr = self.frame_count % GOP_SIZE == 0;
         let cur_idx = (self.frame_count % 2) as usize;
         let cur_surface = self.surfaces[cur_idx];
@@ -299,8 +497,7 @@ impl VaapiEncoder {
         // it two calls ago (max_num_ref_frames=1 never looks further back).
         let ref_surface = self.surfaces[1 - cur_idx];
 
-        self.upload_bgrx_surface(bgrx, src_stride)?;
-        self.run_vpp_conversion(cur_surface)?;
+        self.run_vpp_conversion(source, cur_surface)?;
 
         let mbs_w = self.aligned_width / 16;
         let mbs_h = self.aligned_height / 16;
@@ -443,6 +640,14 @@ impl VaapiEncoder {
                 frame_crop_bottom: seq.frame_crop_bottom_offset,
                 pic_init_qp: pic.pic_init_qp,
                 deblocking_filter_control_present: true,
+                // Smallest value the spec allows here: it must be at least
+                // `max_num_ref_frames`, and every frame above it is a frame the
+                // decoder is entitled to buffer before emitting output. Tied to
+                // the same field rather than written as its own constant so the
+                // two can't drift apart -- moonlight-android carries an explicit
+                // "some devices throw errors if maxDecFrameBuffering <
+                // numRefFrames" note for exactly this.
+                max_dec_frame_buffering: seq.max_num_ref_frames,
             };
             let sps_bytes = h264_headers::build_sps(&h264_params);
             let pps_bytes = h264_headers::build_pps(&h264_params);
@@ -521,6 +726,14 @@ impl VaapiEncoder {
             named_buffers.push(("packed_pic_data", packed_pic_data_buf));
         }
         named_buffers.push(("pic", pic_buf));
+        // Submitted alongside the picture, not at config time: VAAPI carries
+        // encoder speed/quality as a per-picture "misc parameter" buffer rather
+        // than a config attribute.
+        let mut quality_buf: ffi::VABufferID = 0;
+        if self.quality_level > 0 {
+            self.create_quality_level_buffer(&mut quality_buf)?;
+            named_buffers.push(("quality_level", quality_buf));
+        }
         named_buffers.push(("slice", slice_buf));
         for (name, mut id) in named_buffers {
             let status = unsafe { ffi::vaRenderPicture(self.dpy, self.context_id, &mut id, 1) };
@@ -551,7 +764,48 @@ impl VaapiEncoder {
         }
         self.frame_count += 1;
 
-        Ok(out)
+        Ok(EncodedFrame { data: out, is_idr })
+    }
+
+    /// A `VAEncMiscParameterBuffer` is a variable-length header (`type`)
+    /// followed inline by the type-specific payload, so it has to be allocated
+    /// at the combined size and filled through a mapping rather than passed as
+    /// a plain struct like the seq/pic/slice buffers.
+    fn create_quality_level_buffer(&self, buf: &mut ffi::VABufferID) -> VaResult<()> {
+        let size = (std::mem::size_of::<ffi::VAEncMiscParameterBuffer>()
+            + std::mem::size_of::<ffi::VAEncMiscParameterBufferQualityLevel>())
+            as u32;
+        check(
+            unsafe {
+                ffi::vaCreateBuffer(
+                    self.dpy,
+                    self.context_id,
+                    ffi::VABufferType_VAEncMiscParameterBufferType,
+                    size,
+                    1,
+                    ptr::null_mut(),
+                    buf,
+                )
+            },
+            "vaCreateBuffer(quality level)",
+        )?;
+
+        let mut ptr_out: *mut c_void = ptr::null_mut();
+        check(
+            unsafe { ffi::vaMapBuffer(self.dpy, *buf, &mut ptr_out) },
+            "vaMapBuffer(quality level)",
+        )?;
+        unsafe {
+            let misc = ptr_out as *mut ffi::VAEncMiscParameterBuffer;
+            (*misc).type_ = ffi::VAEncMiscParameterType_VAEncMiscParameterTypeQualityLevel;
+            let payload = (*misc).data.as_mut_ptr() as *mut ffi::VAEncMiscParameterBufferQualityLevel;
+            (*payload).quality_level = self.quality_level;
+        }
+        check(
+            unsafe { ffi::vaUnmapBuffer(self.dpy, *buf) },
+            "vaUnmapBuffer(quality level)",
+        )?;
+        Ok(())
     }
 
     fn create_packed_header(
@@ -637,16 +891,21 @@ impl VaapiEncoder {
         Ok(())
     }
 
-    /// Converts `src_surface` (BGRX) into `surface` (NV12) entirely on the
+    /// Converts `source` (BGRX -- either the CPU-uploaded staging surface or an
+    /// imported PipeWire dmabuf) into `target_surface` (NV12) entirely on the
     /// GPU via VAAPI's Video Post-Processing entrypoint.
-    fn run_vpp_conversion(&mut self, target_surface: ffi::VASurfaceID) -> VaResult<()> {
+    fn run_vpp_conversion(
+        &mut self,
+        source: ffi::VASurfaceID,
+        target_surface: ffi::VASurfaceID,
+    ) -> VaResult<()> {
         check(
             unsafe { ffi::vaBeginPicture(self.dpy, self.vpp_context_id, target_surface) },
             "vaBeginPicture(VPP)",
         )?;
 
         let mut pipeline_param: ffi::VAProcPipelineParameterBuffer = Default::default();
-        pipeline_param.surface = self.src_surface;
+        pipeline_param.surface = source;
         pipeline_param.rotation_state = if self.flip_180 { ffi::VA_ROTATION_180 } else { ffi::VA_ROTATION_NONE };
 
         let mut pipeline_buf: ffi::VABufferID = 0;
@@ -672,10 +931,13 @@ impl VaapiEncoder {
             unsafe { ffi::vaEndPicture(self.dpy, self.vpp_context_id) },
             "vaEndPicture(VPP)",
         )?;
-        check(
-            unsafe { ffi::vaSyncSurface(self.dpy, target_surface) },
-            "vaSyncSurface(VPP)",
-        )?;
+        // Deliberately no vaSyncSurface here. The encode that follows targets
+        // this same surface and ends with its own sync, and VAAPI orders
+        // operations on a surface for us -- syncing in between only parks the
+        // CPU between two GPU jobs that could otherwise overlap. Verified by
+        // encoding the same 150 synthetic frames with and without it and
+        // diffing the output: byte-identical, so the ordering guarantee holds
+        // in practice on iHD, not just on paper.
         check(
             unsafe { ffi::vaDestroyBuffer(self.dpy, pipeline_buf) },
             "vaDestroyBuffer(VPP pipeline)",
@@ -711,6 +973,9 @@ impl Drop for VaapiEncoder {
         unsafe {
             ffi::vaDestroyContext(self.dpy, self.vpp_context_id);
             ffi::vaDestroyConfig(self.dpy, self.vpp_config_id);
+            for (_, mut imported) in self.imported_surfaces.drain() {
+                ffi::vaDestroySurfaces(self.dpy, &mut imported, 1);
+            }
             let mut src = self.src_surface;
             ffi::vaDestroySurfaces(self.dpy, &mut src, 1);
             ffi::vaDestroyContext(self.dpy, self.context_id);

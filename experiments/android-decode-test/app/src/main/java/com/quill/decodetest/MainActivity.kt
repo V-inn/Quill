@@ -226,6 +226,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         running = true
 
         decodeThread = Thread {
+            // This thread does the USB read and feeds the decoder; anything
+            // that delays it delays every frame behind it. Same priority
+            // moonlight and project-monitorize give their equivalent threads.
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY)
             var attempt = 0
             while (running) {
                 attempt++
@@ -642,6 +646,11 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 }
 
                 val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height)
+                // Sized so the codec never has to reallocate an input buffer
+                // mid-stream. The wire protocol already refuses anything above
+                // 16MB, and real frames are 200 bytes to a few KB, so this is
+                // headroom rather than a real allocation target.
+                format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 1 shl 20)
                 // Standard KEY_LOW_LATENCY re-verified with the corrected
                 // (FIFO-based) latency measurement (Milestone 7): genuinely
                 // no effect on this decoder. Left enabled anyway -- harmless
@@ -698,142 +707,174 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 codec!!.configure(format, holder.surface, null, 0)
                 codec!!.start()
 
-                val bufferInfo = MediaCodec.BufferInfo()
-                var frameCount = 0L
-                var queuedCount = 0L
-                var renderedCount = 0L
-                var presentationTimeUs = 0L
-                var latencySumMs = 0L
-                var latencyMinMs = Long.MAX_VALUE
-                var latencyMaxMs = Long.MIN_VALUE
-                var latencySampleCount = 0L
                 // FIFO of send-timestamps for frames queued into the decoder
-                // but not yet rendered -- the decoder buffers several frames
-                // internally (confirmed live: `rendered` trailing `queued`
-                // by ~5-6 at steady state) before it starts producing
-                // output, so "the frame we just read this loop iteration" is
-                // NOT the frame that actually renders on this iteration. All
-                // frames are independent IDR with no reordering, so FIFO
-                // order is correct.
-                val pendingSentTimesMs = ArrayDeque<Long>()
+                // but not yet emitted -- the decoder buffers several frames
+                // internally before it starts producing output, so "the frame
+                // we just read" is NOT the frame that renders next. Concurrent
+                // because the reader thread pushes and the render thread pops;
+                // there is no reordering in this stream (IPPP, no B-frames), so
+                // FIFO order matches decode order.
+                val pendingSentTimesMs = java.util.concurrent.ConcurrentLinkedQueue<Long>()
+                val queuedCount = java.util.concurrent.atomic.AtomicLong(0)
 
-                while (running) {
-                    val frameSentAtMs = try {
-                        input.readLong()
+                // The whole point of splitting reader from renderer.
+                //
+                // This used to be one loop: read a frame off the socket, queue
+                // it, then poll for output. That meant a decoded frame could
+                // only ever be rendered on an iteration that *also* received a
+                // new frame over USB -- so a frame the decoder finished 2ms
+                // after it was queued sat there until the next frame arrived,
+                // up to a full inter-frame interval (~16ms at 60fps, unbounded
+                // while the source screen is briefly idle). Milestone 7 ruled
+                // out async MediaCodec mode on the grounds that it "only
+                // changes how the client is notified, not how many frames the
+                // codec buffers internally" -- true about the codec's own DPB,
+                // but it doesn't cover this: the polling delay is a separate,
+                // additive cost created purely by the loop's shape.
+                //
+                // Blocking dequeue on a dedicated thread (rather than async
+                // callbacks) matches moonlight-android, which does the same
+                // thing for the same reason; the 50ms timeout is only there so
+                // the thread notices shutdown, it returns the instant a buffer
+                // is actually ready.
+                val renderThread = Thread {
+                    android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY)
+                    val bufferInfo = MediaCodec.BufferInfo()
+                    var renderedCount = 0L
+                    var latencySumMs = 0L
+                    var latencyMinMs = Long.MAX_VALUE
+                    var latencyMaxMs = Long.MIN_VALUE
+                    var latencySampleCount = 0L
+                    try {
+                        while (running) {
+                            var outIndex = codec!!.dequeueOutputBuffer(bufferInfo, 50_000)
+                            // Burst dedup, unchanged from Milestone 12: right as
+                            // motion stops, several real frames land back to
+                            // back; rendering all of them faster than the panel
+                            // can separate them showed up as two overlapping
+                            // valid frames ("ghosting", confirmed via a real
+                            // tablet screenshot -- two crisp cursors, not a
+                            // smear). Render only the newest of a burst, release
+                            // the rest without rendering.
+                            var pendingRenderIndex = -1
+                            var lastSentAtMs: Long? = null
+                            while (true) {
+                                when {
+                                    outIndex >= 0 -> {
+                                        if (pendingRenderIndex >= 0) {
+                                            codec!!.releaseOutputBuffer(pendingRenderIndex, false)
+                                        }
+                                        pendingRenderIndex = outIndex
+                                        // One decoded buffer == one queued input
+                                        // frame, rendered or not -- pop on every
+                                        // buffer or the FIFO desyncs over time.
+                                        lastSentAtMs = pendingSentTimesMs.poll() ?: lastSentAtMs
+                                        outIndex = codec!!.dequeueOutputBuffer(bufferInfo, 0)
+                                    }
+                                    outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                                        Log.i(tag, "output format changed: ${codec!!.outputFormat}")
+                                        outIndex = codec!!.dequeueOutputBuffer(bufferInfo, 0)
+                                    }
+                                    outIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> break
+                                    else -> {
+                                        Log.w(tag, "dequeueOutputBuffer returned $outIndex")
+                                        break
+                                    }
+                                }
+                            }
+                            if (pendingRenderIndex < 0) continue
+
+                            codec!!.releaseOutputBuffer(pendingRenderIndex, true)
+                            renderedCount++
+                            if (renderedCount == 1L) hideStatus()
+                            var latencyMs = 0L
+                            lastSentAtMs?.let { sentAtMs ->
+                                latencyMs = (System.currentTimeMillis() - clockOffsetMs) - sentAtMs
+                                latencySumMs += latencyMs
+                                if (latencyMs < latencyMinMs) latencyMinMs = latencyMs
+                                if (latencyMs > latencyMaxMs) latencyMaxMs = latencyMs
+                                latencySampleCount++
+                            }
+                            if (renderedCount == 1L || renderedCount % 30 == 0L) {
+                                val avg = if (latencySampleCount > 0) latencySumMs / latencySampleCount else 0
+                                Log.i(
+                                    tag,
+                                    "queued=${queuedCount.get()} rendered=$renderedCount, " +
+                                        "pending=${pendingSentTimesMs.size} latency avg=${avg}ms " +
+                                        "min=${latencyMinMs}ms max=${latencyMaxMs}ms (this frame: ${latencyMs}ms)"
+                                )
+                            }
+                        }
                     } catch (e: Exception) {
-                        Log.i(tag, "stream ended: ${e.message}")
-                        break
+                        // Expected on teardown: the reader loop below exits,
+                        // the finally block stops/releases the codec, and this
+                        // thread's in-flight dequeue throws rather than
+                        // returning. Not worth an error-level log.
+                        Log.i(tag, "render thread stopping: ${e.message}")
                     }
-                    val length = input.readInt()
-                    if (length > 16 * 1024 * 1024) {
-                        Log.w(tag, "bogus frame length $length, stopping")
-                        break
-                    }
-                    lastDataAtMs.set(System.currentTimeMillis())
-                    if (length == 0) {
-                        // Heartbeat (portal_capture.rs's run_capture, ~800ms
-                        // interval) -- no payload, just proof the daemon is
-                        // still alive during a legitimately idle screen
-                        // (no motion = no new video frames at all,
-                        // expected). Nothing to decode, just keep looping.
-                        continue
-                    }
-                    val frameBytes = input.readExact(length)
+                }.also { it.start() }
 
-                    val inIndex = codec!!.dequeueInputBuffer(10_000)
-                    if (inIndex >= 0) {
+                try {
+                    var presentationTimeUs = 0L
+                    while (running) {
+                        val frameSentAtMs = try {
+                            input.readLong()
+                        } catch (e: Exception) {
+                            Log.i(tag, "stream ended: ${e.message}")
+                            break
+                        }
+                        val length = input.readInt()
+                        if (length > 16 * 1024 * 1024) {
+                            Log.w(tag, "bogus frame length $length, stopping")
+                            break
+                        }
+                        // Frame header carries an explicit keyframe flag as of
+                        // the GOP change (portal_capture.rs). Before that every
+                        // frame really was an IDR and this side hardcoded
+                        // BUFFER_FLAG_KEY_FRAME; since the GOP landed that has
+                        // been a lie on every P frame.
+                        val isKeyFrame = input.readExact(1)[0].toInt() != 0
+                        lastDataAtMs.set(System.currentTimeMillis())
+                        if (length == 0) {
+                            // Heartbeat (portal_capture.rs's run_capture, ~800ms
+                            // interval) -- no payload, just proof the daemon is
+                            // still alive during a legitimately idle screen (no
+                            // motion = no new video frames at all, expected).
+                            continue
+                        }
+                        val frameBytes = input.readExact(length)
+
+                        // Never drop a frame here. This used to log a warning
+                        // and discard the frame it had already read off the
+                        // wire whenever dequeueInputBuffer returned < 0. That
+                        // was harmless under all-intra (the next frame was a
+                        // fresh IDR), but since the GOP landed a single
+                        // discarded P frame corrupts every frame after it until
+                        // the next IDR -- up to a full second of visible
+                        // garbage. Wait for a buffer instead.
+                        var inIndex = -1
+                        while (running && inIndex < 0) {
+                            inIndex = codec!!.dequeueInputBuffer(10_000)
+                            if (inIndex < 0) {
+                                Log.w(tag, "waiting for a free input buffer (dequeueInputBuffer=$inIndex)")
+                            }
+                        }
+                        if (inIndex < 0) break // shutting down
+
                         val inputBuffer = codec!!.getInputBuffer(inIndex)!!
                         inputBuffer.clear()
                         inputBuffer.put(frameBytes)
                         codec!!.queueInputBuffer(
-                            inIndex, 0, frameBytes.size,
-                            presentationTimeUs, MediaCodec.BUFFER_FLAG_KEY_FRAME
+                            inIndex, 0, frameBytes.size, presentationTimeUs,
+                            if (isKeyFrame) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0
                         )
-                        presentationTimeUs += 16_666 // ~60fps spacing, cosmetic only for v0
-                        pendingSentTimesMs.addLast(frameSentAtMs)
-                        queuedCount++
-                    } else {
-                        Log.w(tag, "no input buffer available (dequeueInputBuffer=$inIndex)")
+                        presentationTimeUs += 16_666 // ~60fps spacing, cosmetic: render is immediate
+                        pendingSentTimesMs.add(frameSentAtMs)
+                        queuedCount.incrementAndGet()
                     }
-
-                    var latencyMs = 0L
-                    // Confirmed live via a real tablet screenshot: two
-                    // crisp, non-blurred cursor icons visible at once --
-                    // not a compositor/encode artifact (both the daemon's
-                    // raw captured frame and its encoded H.264 output were
-                    // independently verified clean for the same motion).
-                    // Root cause: this loop used to call
-                    // releaseOutputBuffer(index, render=true) on every
-                    // single output buffer it found ready, with zero
-                    // pacing. Right as motion stops, several real frames
-                    // (queued during the stop) land in a tight burst --
-                    // rendering all of them back to back, faster than the
-                    // panel/eye can cleanly separate them, showed as two
-                    // overlapping valid frames ("ghosting" that got worse
-                    // the faster frames arrived -- confirmed live, it
-                    // shrank when the pipeline was artificially throttled).
-                    // Same fix as the daemon's own capture-side drop-stale
-                    // logic: only *render* the newest buffer in a burst,
-                    // discard (don't render) the rest.
-                    var outIndex = codec!!.dequeueOutputBuffer(bufferInfo, 10_000)
-                    var pendingRenderIndex = -1
-                    var lastSentAtMs: Long? = null
-                    while (true) {
-                        when {
-                            outIndex >= 0 -> {
-                                if (pendingRenderIndex >= 0) {
-                                    // An older buffer from this same burst --
-                                    // release without rendering it.
-                                    codec!!.releaseOutputBuffer(pendingRenderIndex, false)
-                                }
-                                pendingRenderIndex = outIndex
-                                // One decoded buffer == one queued input
-                                // frame, rendered or not -- pop the FIFO
-                                // here (every buffer, not just the one that
-                                // ends up rendered) or it desyncs from
-                                // queuedCount over time.
-                                lastSentAtMs = pendingSentTimesMs.removeFirstOrNull() ?: lastSentAtMs
-                                outIndex = codec!!.dequeueOutputBuffer(bufferInfo, 0)
-                            }
-                            outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                                Log.i(tag, "output format changed: ${codec!!.outputFormat}")
-                                outIndex = codec!!.dequeueOutputBuffer(bufferInfo, 0)
-                            }
-                            outIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> break
-                            else -> {
-                                Log.w(tag, "dequeueOutputBuffer returned $outIndex")
-                                break
-                            }
-                        }
-                    }
-                    if (pendingRenderIndex >= 0) {
-                        codec!!.releaseOutputBuffer(pendingRenderIndex, true)
-                        renderedCount++
-                        if (renderedCount == 1L) hideStatus()
-                        // Milestone 7 fix: match this render to the
-                        // send-timestamp of the frame that actually fed it
-                        // (FIFO, oldest pending), not whatever frame this
-                        // loop iteration just happened to read off the
-                        // socket -- the decoder buffers several frames
-                        // internally, so those aren't the same frame.
-                        lastSentAtMs?.let { sentAtMs ->
-                            latencyMs = (System.currentTimeMillis() - clockOffsetMs) - sentAtMs
-                            latencySumMs += latencyMs
-                            if (latencyMs < latencyMinMs) latencyMinMs = latencyMs
-                            if (latencyMs > latencyMaxMs) latencyMaxMs = latencyMs
-                            latencySampleCount++
-                        }
-                    }
-
-                    frameCount++
-                    if (frameCount == 1L || frameCount % 30 == 0L) {
-                        val avg = if (latencySampleCount > 0) latencySumMs / latencySampleCount else 0
-                        Log.i(
-                            tag,
-                            "frame $frameCount ($length bytes): queued=$queuedCount rendered=$renderedCount, " +
-                                "pending=${pendingSentTimesMs.size} latency avg=${avg}ms min=${latencyMinMs}ms max=${latencyMaxMs}ms (this frame: ${latencyMs}ms)"
-                        )
-                    }
+                } finally {
+                    renderThread.interrupt()
+                    renderThread.join(2000)
                 }
             }
         } catch (e: Exception) {

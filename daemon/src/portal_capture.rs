@@ -50,6 +50,7 @@ pub struct CaptureStats {
     pub capture_latency_samples: u64,
     pub encode_ms_sum: f64,
     pub convert_encode_samples: u64,
+    pub logged_buffer_type: bool,
 }
 
 /// Decodes the 48-bit CLOCK_MONOTONIC barcode painted by
@@ -75,6 +76,95 @@ fn decode_latency_barcode(bytes: &[u8], stride: usize) -> Option<u64> {
         value = (value << 1) | (bright as u64);
     }
     Some(value)
+}
+
+/// "Let the allocator pick" -- the implicit-modifier sentinel from
+/// `drm_fourcc.h`. Offering this alongside LINEAR keeps the daemon out of the
+/// business of enumerating Intel's tiling modifiers: whatever KWin's allocator
+/// picks comes back in the negotiated format, and VAAPI's PRIME_2 import takes
+/// the modifier as a parameter rather than requiring a specific one.
+const DRM_FORMAT_MOD_INVALID: i64 = 0x00ff_ffff_ffff_ffff;
+const DRM_FORMAT_MOD_LINEAR: i64 = 0;
+
+/// Serializes one `EnumFormat` pod. With `dmabuf`, it carries a
+/// `SPA_FORMAT_VIDEO_modifier` choice marked MANDATORY + DONT_FIXATE -- the
+/// standard two-step modifier negotiation (the producer picks one from our
+/// list and echoes it back in the fixated format), and the exact property
+/// KWin's screencast looks for before it will export GPU buffers at all.
+fn build_format_pod(dmabuf: bool) -> Vec<u8> {
+    use pw::spa::pod::{ChoiceValue, Property, PropertyFlags, Value};
+    use pw::spa::utils::{Choice, ChoiceEnum, ChoiceFlags};
+
+    let mut obj = pw::spa::pod::object!(
+        pw::spa::utils::SpaTypes::ObjectParamFormat,
+        pw::spa::param::ParamType::EnumFormat,
+        pw::spa::pod::property!(
+            pw::spa::param::format::FormatProperties::MediaType,
+            Id,
+            pw::spa::param::format::MediaType::Video
+        ),
+        pw::spa::pod::property!(
+            pw::spa::param::format::FormatProperties::MediaSubtype,
+            Id,
+            pw::spa::param::format::MediaSubtype::Raw
+        ),
+        // BGRx matches evdi's XR24 byte order exactly (B,G,R,X in memory) --
+        // matches VA_FOURCC_BGRX in vaapi_encoder.rs's GPU conversion path.
+        pw::spa::pod::property!(
+            pw::spa::param::format::FormatProperties::VideoFormat,
+            Choice,
+            Enum,
+            Id,
+            pw::spa::param::video::VideoFormat::BGRx,
+            pw::spa::param::video::VideoFormat::BGRx,
+            pw::spa::param::video::VideoFormat::RGBx,
+        ),
+        pw::spa::pod::property!(
+            pw::spa::param::format::FormatProperties::VideoSize,
+            Choice,
+            Range,
+            Rectangle,
+            pw::spa::utils::Rectangle { width: 1920, height: 1080 },
+            pw::spa::utils::Rectangle { width: 1, height: 1 },
+            pw::spa::utils::Rectangle { width: 8192, height: 8192 }
+        ),
+        pw::spa::pod::property!(
+            pw::spa::param::format::FormatProperties::VideoFramerate,
+            Choice,
+            Range,
+            Fraction,
+            pw::spa::utils::Fraction { num: 60, denom: 1 },
+            pw::spa::utils::Fraction { num: 0, denom: 1 },
+            pw::spa::utils::Fraction { num: 1000, denom: 1 }
+        ),
+    );
+
+    if dmabuf {
+        // Built by hand rather than with `property!`: that macro has no way to
+        // set pod property flags, and both flags matter here. MANDATORY is what
+        // makes SPA's format matching route us to KWin's dmabuf format entry
+        // instead of its shm one; DONT_FIXATE says "these are candidates, you
+        // choose", which is what the two-step modifier handshake is.
+        obj.properties.push(Property {
+            key: pw::spa::param::format::FormatProperties::VideoModifier.as_raw(),
+            flags: PropertyFlags::MANDATORY | PropertyFlags::DONT_FIXATE,
+            value: Value::Choice(ChoiceValue::Long(Choice(
+                ChoiceFlags::empty(),
+                ChoiceEnum::Enum {
+                    default: DRM_FORMAT_MOD_INVALID,
+                    alternatives: vec![DRM_FORMAT_MOD_INVALID, DRM_FORMAT_MOD_LINEAR],
+                },
+            ))),
+        });
+    }
+
+    pw::spa::pod::serialize::PodSerializer::serialize(
+        std::io::Cursor::new(Vec::new()),
+        &Value::Object(obj),
+    )
+    .unwrap()
+    .0
+    .into_inner()
 }
 
 /// Where the portal's restore token (see below) is cached between runs.
@@ -156,7 +246,9 @@ struct CaptureData {
     format: spa::param::video::VideoInfoRaw,
     encoder: Option<VaapiEncoder>,
     flip_180: bool,
-    out_file: File,
+    /// `None` unless `QUILL_DUMP_H264` is set -- see the write site in
+    /// `process` for why this stopped being unconditional.
+    out_file: Option<File>,
     // Shared with the outer main loop (see run_capture's heartbeat check)
     // rather than owned outright -- both need to write to the same
     // transport, and the heartbeat needs to fire even when this stream's
@@ -274,6 +366,104 @@ pub fn setup_transport(
     Some((writer, width, height))
 }
 
+/// Shared by both capture paths so the "time from content changing on screen to
+/// the daemon having a buffer for it" number stays directly comparable between
+/// them -- that comparison is the whole point of the DMA-BUF work.
+fn record_capture_latency(stats: &Rc<RefCell<CaptureStats>>, barcode_ns: u64) {
+    let now_ns = crate::clock_sync::monotonic_ns();
+    let latency_ms = (now_ns - barcode_ns as i64) as f64 / 1_000_000.0;
+    if !(0.0..60_000.0).contains(&latency_ms) {
+        return;
+    }
+    let mut stats = stats.borrow_mut();
+    stats.capture_latency_ms_sum += latency_ms;
+    stats.capture_latency_samples += 1;
+    if stats.capture_latency_samples == 1 || stats.capture_latency_samples % 30 == 0 {
+        eprintln!(
+            "[pipewire] capture latency (barcode -> dequeue): {latency_ms:.2}ms (avg {:.2}ms over {} samples)",
+            stats.capture_latency_ms_sum / stats.capture_latency_samples as f64,
+            stats.capture_latency_samples
+        );
+    }
+}
+
+/// Everything that happens to a frame once it's encoded, shared by the DMA-BUF
+/// and shm paths: stats, the opt-in bitstream dump, and the wire write.
+///
+/// `start`: when the `process` callback began, so `dequeue->encoded` still
+/// measures the whole callback and stays comparable with every number recorded
+/// in MILESTONES.md. `encode_elapsed`: just the encoder call.
+fn emit_frame(
+    user_data: &mut CaptureData,
+    frame: crate::vaapi_encoder::EncodedFrame,
+    start: Instant,
+    encode_elapsed: Duration,
+) {
+    let encoded = frame.data;
+    {
+        let mut stats = user_data.stats.borrow_mut();
+        stats.encode_ms_sum += encode_elapsed.as_secs_f64() * 1000.0;
+        stats.convert_encode_samples += 1;
+        if stats.convert_encode_samples == 1 || stats.convert_encode_samples % 30 == 0 {
+            eprintln!(
+                "[timing] upload+VPP+encode avg={:.2}ms (this frame: {:.2}ms)",
+                stats.encode_ms_sum / stats.convert_encode_samples as f64,
+                encode_elapsed.as_secs_f64() * 1000.0,
+            );
+        }
+    }
+    let elapsed = start.elapsed();
+    {
+        let mut stats = user_data.stats.borrow_mut();
+        stats.frame_count += 1;
+        stats.durations.push(elapsed);
+        if stats.frame_count == 1 || stats.frame_count % 30 == 0 {
+            eprintln!(
+                "[capture] frame {}: {} bytes, {:?} (dequeue->encoded), {} stale dropped so far",
+                stats.frame_count,
+                encoded.len(),
+                elapsed,
+                stats.dropped_stale
+            );
+        }
+    }
+    // Opt-in, not always-on: this was an unbuffered write() syscall per frame,
+    // in the middle of the hot path, into a file that grew without bound (~50MB
+    // after one session) and that nothing reads unless someone is debugging the
+    // bitstream. Same env-var convention as QUILL_DUMP_FRAME.
+    if let Some(f) = user_data.out_file.as_mut() {
+        let _ = f.write_all(&encoded);
+    }
+    if let Some(sock) = user_data.transport.borrow_mut().as_mut() {
+        // Milestone 7: prefix every frame with the daemon's send time (its own
+        // clock) so Android can compute a per-frame latency estimate using the
+        // offset from the earlier clock-sync exchange -- see clock_sync.rs.
+        //
+        // Combined into one buffer and one write_all() call rather than three
+        // separate ones: with TCP_NODELAY set, each write_all was its own TCP
+        // segment / adb protocol packet -- three small packets ahead of the
+        // real payload adds per-packet adb/USB overhead for no reason.
+        let mut frame_buf = Vec::with_capacity(13 + encoded.len());
+        frame_buf.extend_from_slice(&crate::clock_sync::now_millis().to_be_bytes());
+        frame_buf.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+        frame_buf.push(frame.is_idr as u8);
+        frame_buf.extend_from_slice(&encoded);
+        if let Err(e) = sock.write_all(&frame_buf) {
+            // Same reasoning as the two startup failure paths in
+            // `setup_transport`: this only runs with `Some(sock)` when a real
+            // transport connected successfully, so a write failure here means a
+            // mid-session drop (app force-stopped/relaunched, USB unplugged),
+            // not `TransportConfig::None`'s legitimate no-client mode.
+            // Previously this just set `transport = None` and kept running --
+            // confirmed live, that left the daemon "running" but permanently
+            // unable to reconnect. Exiting lets systemd's `Restart=on-failure`
+            // re-run the whole connect sequence from scratch instead.
+            eprintln!("[transport] write failed ({e}), exiting so systemd can retry");
+            std::process::exit(1);
+        }
+    }
+}
+
 /// `transport`: the already-connected write half from `setup_transport`,
 /// called by `main.rs` before the portal was ever opened (see that
 /// function's doc) -- `None` only for the capture-only diagnostic mode
@@ -298,7 +488,12 @@ pub fn run_capture(
     // + manual loop iteration, same shape as the old evdi_capture.rs.
     crate::set_up_sigint_handler();
 
-    let out_file = File::create(out_path).expect("create output file");
+    let out_file = if std::env::var("QUILL_DUMP_H264").is_ok() {
+        eprintln!("[capture] QUILL_DUMP_H264 set -- writing the encoded stream to {out_path}");
+        Some(File::create(out_path).expect("create output file"))
+    } else {
+        None
+    };
     let transport = Rc::new(RefCell::new(transport));
     let stats = Rc::new(RefCell::new(CaptureStats::default()));
     let data = CaptureData {
@@ -347,8 +542,12 @@ pub fn run_capture(
 
             let width = user_data.format.size().width;
             let height = user_data.format.size().height;
+            // Whether a modifier came back at all is the single fact that says
+            // if KWin took its DMA-BUF path or fell back to MemFd -- see the
+            // two-pod negotiation in `run_capture`.
+            let modifier = user_data.format.modifier();
             eprintln!(
-                "[pipewire] negotiated format: {:?} {width}x{height} @{}/{}",
+                "[pipewire] negotiated format: {:?} {width}x{height} @{}/{} modifier=0x{modifier:016x}",
                 user_data.format.format(),
                 user_data.format.framerate().num,
                 user_data.format.framerate().denom
@@ -428,10 +627,68 @@ pub fn run_capture(
             if datas.is_empty() {
                 return;
             }
-            let chunk_size = datas[0].chunk().size() as usize;
+            {
+                // One line, once, saying which memory path this session
+                // actually negotiated. The whole point of the DMA-BUF work is
+                // to move this from MemFd/MemPtr to DmaBuf, and without it the
+                // only symptom of falling back is "capture latency didn't
+                // improve", which is exactly the kind of silent regression
+                // this project keeps having to re-diagnose.
+                let mut stats = user_data.stats.borrow_mut();
+                if !stats.logged_buffer_type {
+                    stats.logged_buffer_type = true;
+                    eprintln!(
+                        "[pipewire] buffer data type: {:?} ({} plane(s))",
+                        datas[0].type_(),
+                        datas.len()
+                    );
+                }
+            }
+            let is_dmabuf = datas[0].type_() == pw::spa::buffer::DataType::DmaBuf;
             let stride = datas[0].chunk().stride() as usize;
+
+            // Zero-copy path. Taken whenever KWin negotiated DMA-BUF (see the
+            // format pods in `run_capture`); everything below it is the shm
+            // fallback, kept intact for producers that only offer mapped
+            // memory.
+            if is_dmabuf {
+                let raw = datas[0].as_raw();
+                let plane = crate::vaapi_encoder::DmabufPlane {
+                    fd: datas[0].fd() as std::os::fd::RawFd,
+                    offset: datas[0].chunk().offset(),
+                    stride: stride as u32,
+                    size: raw.maxsize,
+                    modifier: user_data.format.modifier(),
+                };
+                let Some(encoder) = user_data.encoder.as_mut() else {
+                    return;
+                };
+                // Opt-in: mapping a GPU surface costs a sync, which is the
+                // exact overhead this path removes -- but without it the
+                // barcode probe (the only instrument that measures the capture
+                // segment DMA-BUF is meant to shrink) goes blind here, since it
+                // reads a CPU mapping that no longer exists.
+                if std::env::var("QUILL_BARCODE_PROBE").is_ok() {
+                    if let Ok(Some(barcode_ns)) =
+                        encoder.with_mapped_dmabuf(&plane, |b, s| decode_latency_barcode(b, s))
+                    {
+                        record_capture_latency(&user_data.stats, barcode_ns);
+                    }
+                }
+                let encode_start = Instant::now();
+                match encoder.encode_frame_dmabuf(&plane) {
+                    Ok(frame) => {
+                        let elapsed = encode_start.elapsed();
+                        emit_frame(user_data, frame, start, elapsed);
+                    }
+                    Err(e) => eprintln!("[capture] encode_frame_dmabuf error: {e}"),
+                }
+                return;
+            }
+
+            let chunk_size = datas[0].chunk().size() as usize;
             let Some(bytes) = datas[0].data() else {
-                eprintln!("[pipewire] frame has no mapped data (DMA-BUF-only buffer, not handled in v0), skipping");
+                eprintln!("[pipewire] frame has no mapped data and is not DMA-BUF, skipping");
                 return;
             };
             if chunk_size == 0 || stride == 0 {
@@ -471,20 +728,7 @@ pub fn run_capture(
             // needed; this is exactly "time from content changing on
             // screen to the daemon having a buffer for it."
             if let Some(barcode_ns) = decode_latency_barcode(bytes, stride) {
-                let now_ns = crate::clock_sync::monotonic_ns();
-                let latency_ms = (now_ns - barcode_ns as i64) as f64 / 1_000_000.0;
-                if latency_ms >= 0.0 && latency_ms < 60_000.0 {
-                    let mut stats = user_data.stats.borrow_mut();
-                    stats.capture_latency_ms_sum += latency_ms;
-                    stats.capture_latency_samples += 1;
-                    if stats.capture_latency_samples == 1 || stats.capture_latency_samples % 30 == 0 {
-                        eprintln!(
-                            "[pipewire] capture latency (barcode -> dequeue): {latency_ms:.2}ms (avg {:.2}ms over {} samples)",
-                            stats.capture_latency_ms_sum / stats.capture_latency_samples as f64,
-                            stats.capture_latency_samples
-                        );
-                    }
-                }
+                record_capture_latency(&user_data.stats, barcode_ns);
             }
 
             let Some(encoder) = user_data.encoder.as_mut() else {
@@ -502,73 +746,7 @@ pub fn run_capture(
             // `vaapi_encoder.rs`'s `run_vpp_conversion`).
             let encode_start = Instant::now();
             match encoder.encode_frame(bytes, stride) {
-                Ok(encoded) => {
-                    let encode_elapsed = encode_start.elapsed();
-                    {
-                        let mut stats = user_data.stats.borrow_mut();
-                        stats.encode_ms_sum += encode_elapsed.as_secs_f64() * 1000.0;
-                        stats.convert_encode_samples += 1;
-                        if stats.convert_encode_samples == 1 || stats.convert_encode_samples % 30 == 0 {
-                            eprintln!(
-                                "[timing] upload+VPP+encode avg={:.2}ms (this frame: {:.2}ms)",
-                                stats.encode_ms_sum / stats.convert_encode_samples as f64,
-                                encode_elapsed.as_secs_f64() * 1000.0,
-                            );
-                        }
-                    }
-                    let elapsed = start.elapsed();
-                    let mut stats = user_data.stats.borrow_mut();
-                    stats.frame_count += 1;
-                    stats.durations.push(elapsed);
-                    if stats.frame_count == 1 || stats.frame_count % 30 == 0 {
-                        eprintln!(
-                            "[capture] frame {}: {} bytes, {:?} (dequeue->encoded), {} stale dropped so far",
-                            stats.frame_count,
-                            encoded.len(),
-                            elapsed,
-                            stats.dropped_stale
-                        );
-                    }
-                    drop(stats);
-                    let _ = user_data.out_file.write_all(&encoded);
-                    if let Some(sock) = user_data.transport.borrow_mut().as_mut() {
-                        // Milestone 7: prefix every frame with the daemon's
-                        // send time (its own clock) so Android can compute a
-                        // per-frame latency estimate using the offset from
-                        // the earlier clock-sync exchange -- see clock_sync.rs.
-                        //
-                        // Combined into one buffer and one write_all() call
-                        // rather than three separate ones: with TCP_NODELAY
-                        // set, each write_all was its own TCP segment / adb
-                        // protocol packet -- three small packets (8, 4 bytes)
-                        // ahead of the real payload adds per-packet adb/USB
-                        // overhead three times over for no reason.
-                        let mut frame_buf = Vec::with_capacity(12 + encoded.len());
-                        frame_buf.extend_from_slice(&crate::clock_sync::now_millis().to_be_bytes());
-                        frame_buf.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
-                        frame_buf.extend_from_slice(&encoded);
-                        if let Err(e) = sock.write_all(&frame_buf) {
-                            // Same reasoning as the two startup failure paths
-                            // in `setup_transport`: this closure only runs
-                            // with `Some(sock)` in the first place when a
-                            // real transport connected successfully, so a
-                            // write failure here means a mid-session drop
-                            // (app force-stopped/relaunched, USB unplugged,
-                            // etc.), not `TransportConfig::None`'s
-                            // legitimate no-client mode. Previously this just
-                            // set `transport = None` and kept running --
-                            // confirmed live, that left the daemon "running"
-                            // but permanently unable to reconnect (the AOA
-                            // USB interface claim and the input thread's read
-                            // half are both already gone, a relaunched
-                            // Android app has nothing to talk to). Exiting
-                            // lets systemd's `Restart=on-failure` re-run the
-                            // whole connect sequence from scratch instead.
-                            eprintln!("[transport] write failed ({e}), exiting so systemd can retry");
-                            std::process::exit(1);
-                        }
-                    }
-                }
+                Ok(frame) => emit_frame(user_data, frame, start, encode_start.elapsed()),
                 Err(e) => eprintln!("[capture] encode_frame error: {e}"),
             }
         })
@@ -576,63 +754,50 @@ pub fn run_capture(
 
     eprintln!("[pipewire] created stream, connecting to node {node_id}...");
 
-    let obj = pw::spa::pod::object!(
-        pw::spa::utils::SpaTypes::ObjectParamFormat,
-        pw::spa::param::ParamType::EnumFormat,
-        pw::spa::pod::property!(
-            pw::spa::param::format::FormatProperties::MediaType,
-            Id,
-            pw::spa::param::format::MediaType::Video
-        ),
-        pw::spa::pod::property!(
-            pw::spa::param::format::FormatProperties::MediaSubtype,
-            Id,
-            pw::spa::param::format::MediaSubtype::Raw
-        ),
-        // BGRx matches evdi's XR24 byte order exactly (B,G,R,X in memory) --
-        // matches VA_FOURCC_BGRX in vaapi_encoder.rs's GPU conversion path.
-        pw::spa::pod::property!(
-            pw::spa::param::format::FormatProperties::VideoFormat,
-            Choice,
-            Enum,
-            Id,
-            pw::spa::param::video::VideoFormat::BGRx,
-            pw::spa::param::video::VideoFormat::BGRx,
-            pw::spa::param::video::VideoFormat::RGBx,
-        ),
-        pw::spa::pod::property!(
-            pw::spa::param::format::FormatProperties::VideoSize,
-            Choice,
-            Range,
-            Rectangle,
-            pw::spa::utils::Rectangle { width: 1920, height: 1080 },
-            pw::spa::utils::Rectangle { width: 1, height: 1 },
-            pw::spa::utils::Rectangle { width: 8192, height: 8192 }
-        ),
-        pw::spa::pod::property!(
-            pw::spa::param::format::FormatProperties::VideoFramerate,
-            Choice,
-            Range,
-            Fraction,
-            pw::spa::utils::Fraction { num: 60, denom: 1 },
-            pw::spa::utils::Fraction { num: 0, denom: 1 },
-            pw::spa::utils::Fraction { num: 1000, denom: 1 }
-        ),
-    );
-    let values: Vec<u8> = pw::spa::pod::serialize::PodSerializer::serialize(
-        std::io::Cursor::new(Vec::new()),
-        &pw::spa::pod::Value::Object(obj),
-    )
-    .unwrap()
-    .0
-    .into_inner();
-    let mut params = [Pod::from_bytes(&values).unwrap()];
+    // Two EnumFormat params, offered in preference order: DMA-BUF first, plain
+    // shared memory second.
+    //
+    // KWin will only ever hand out DMA-BUF if the negotiated format carries a
+    // `SPA_FORMAT_VIDEO_modifier` property -- `ScreenCastStream::onStreamParam
+    // Changed()` does a literal `spa_pod_find_prop(format, nullptr,
+    // SPA_FORMAT_VIDEO_modifier)` and only sets up its dmabuf path if that
+    // finds something. This pod never had one, so every frame took KWin's
+    // MemFd fallback, which means a synchronous `glReadnPixels` of the whole
+    // 2560x1600 render target into CPU memory once per frame -- and then this
+    // daemon copied those same 16.4MB straight back onto the GPU in
+    // `upload_bgrx_surface`. KWin's own comment in `record()` ("Sample it
+    // before video rendering, readback and buffer synchronization add
+    // latency") confirms that readback sits inside the ~28-30ms this project
+    // measures as capture latency.
+    //
+    // The shm variant is kept as a real fallback rather than removed: if the
+    // dmabuf allocation test fails on some other GPU/driver, the stream still
+    // negotiates and the existing upload path takes over.
+    //
+    // `QUILL_FORCE_SHM` drops the dmabuf offer entirely, which is how the two
+    // paths get A/B'd against each other on the same machine in the same
+    // sitting -- without it there's no way to re-measure the old behavior once
+    // the new one works.
+    let force_shm = std::env::var("QUILL_FORCE_SHM").is_ok();
+    let dmabuf_values = build_format_pod(true);
+    let shm_values = build_format_pod(false);
+    let mut dmabuf_first = vec![
+        Pod::from_bytes(&dmabuf_values).unwrap(),
+        Pod::from_bytes(&shm_values).unwrap(),
+    ];
+    let mut shm_only = vec![Pod::from_bytes(&shm_values).unwrap()];
+    let params: &mut [&Pod] = if force_shm {
+        eprintln!("[pipewire] QUILL_FORCE_SHM set -- offering shared memory only");
+        &mut shm_only
+    } else {
+        &mut dmabuf_first
+    };
 
     stream.connect(
         spa::utils::Direction::Input,
         Some(node_id),
         pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
-        &mut params,
+        params,
     )?;
 
     eprintln!("[pipewire] connected, running (Ctrl+C to stop)...");
@@ -655,9 +820,14 @@ pub fn run_capture(
         if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
             last_heartbeat = Instant::now();
             if let Some(sock) = transport.borrow_mut().as_mut() {
-                let mut hb = Vec::with_capacity(12);
+                // Same 13-byte header shape as a real frame, just with a
+                // zero-length payload -- keeping the framing uniform means the
+                // client's read loop has no special case before it knows the
+                // length.
+                let mut hb = Vec::with_capacity(13);
                 hb.extend_from_slice(&crate::clock_sync::now_millis().to_be_bytes());
                 hb.extend_from_slice(&0u32.to_be_bytes());
+                hb.push(0); // not a keyframe; no payload at all
                 if let Err(e) = sock.write_all(&hb) {
                     eprintln!("[transport] heartbeat write failed ({e}), exiting so systemd can retry");
                     std::process::exit(1);
