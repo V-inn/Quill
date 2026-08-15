@@ -7,6 +7,7 @@ mod orientation;
 mod portal_capture;
 mod protocol;
 mod remote_desktop_input;
+mod single_instance;
 mod uinput_tablet;
 mod vaapi_encoder;
 
@@ -37,6 +38,11 @@ pub fn sigint_received() -> bool {
 // nowhere for a signal to land except where we're polling for it.
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    // Before anything with a side effect: no USB claim, no portal call, no
+    // `pkill -f krfb-virtualmonitor`. See `single_instance` for what a second
+    // instance breaks.
+    single_instance::acquire_or_exit();
+
     let out_path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "/tmp/daemon_capture.h264".to_string());

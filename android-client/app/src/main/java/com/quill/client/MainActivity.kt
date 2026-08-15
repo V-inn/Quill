@@ -74,6 +74,9 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     /** Only used in client-side cursor mode; otherwise stays empty and hidden. */
     private lateinit var cursorOverlay: CursorOverlay
 
+    /** The one settings entry point that survives streaming -- see [GearButton]. */
+    private lateinit var gearButton: GearButton
+
     @Volatile
     private var output: DataOutputStream? = null
 
@@ -110,6 +113,9 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             setPadding(48, 48, 48, 48)
         }
         cursorOverlay = CursorOverlay(this)
+        gearButton = GearButton(this)
+        val gearSize = (GEAR_SIZE_DP * resources.displayMetrics.density).toInt()
+        val gearMargin = (GEAR_MARGIN_DP * resources.displayMetrics.density).toInt()
         val root = FrameLayout(this).apply {
             addView(surfaceView, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
             // Above the video, below the status text.
@@ -118,14 +124,27 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 statusText,
                 FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, android.view.Gravity.CENTER)
             )
+            // Topmost, so it gets first crack at touch/hover dispatch and can
+            // consume its own taps before the SurfaceView's forwarder (which
+            // hit-tests nothing) turns them into desktop clicks. Inset from the
+            // very top edge so the immersive-mode swipe that brings the system
+            // bars back still has somewhere to start.
+            addView(
+                gearButton,
+                FrameLayout.LayoutParams(gearSize, gearSize, android.view.Gravity.TOP or android.view.Gravity.END).apply {
+                    setMargins(0, gearMargin, gearMargin, 0)
+                }
+            )
         }
         setContentView(root)
         // The app runs edge-to-edge immersive with no system chrome, so the
         // status overlay doubles as the way into settings -- there is nowhere
-        // else to hang a menu.
-        statusText.setOnClickListener {
-            startActivity(Intent(this, SettingsActivity::class.java))
-        }
+        // else to hang a menu. It only exists while disconnected, though
+        // (`hideStatus` on the first rendered frame), which is why the gear
+        // above it stays put for the streaming case.
+        statusText.setOnClickListener { openSettings() }
+        gearButton.setOnClickListener { openSettings() }
+        gearButton.fadeSoon()
         showStatus("Waiting for connection...\n(tap here for settings)")
         surfaceView.holder.addCallback(this)
         surfaceView.setOnTouchListener { _, event -> handleMotionEvent(event, down = true) }
@@ -146,6 +165,13 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         // system one here: the video's own embedded cursor is the only one
         // that should be visible.
         surfaceView.pointerIcon = android.view.PointerIcon.getSystemIcon(this, android.view.PointerIcon.TYPE_NULL)
+    }
+
+    /** Settings apply at connect time, so leaving here and coming back is what
+     * makes a changed toggle take effect -- the surface is destroyed and the
+     * decode loop reconnects on return. */
+    private fun openSettings() {
+        startActivity(Intent(this, SettingsActivity::class.java))
     }
 
     private fun showStatus(message: String) {
@@ -176,7 +202,12 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
      * focus regain, the standard pattern for sticky immersive mode. */
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
-        if (hasFocus) hideSystemBars()
+        if (hasFocus) {
+            hideSystemBars()
+            // Coming back from settings (or any dialog): show the gear at full
+            // opacity briefly so it's obvious where it lives, then dim again.
+            if (::gearButton.isInitialized) gearButton.wake()
+        }
     }
 
     /** Fallback for a manual relaunch (tapping the app icon after the decode
@@ -472,7 +503,14 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
      * not, byte-for-byte reproducible across runs). Always refilling from a
      * buffer at least as large as the daemon's largest single write (video
      * frames can be ~100KB) avoids both problems at once. */
-    private class BufferedAccessoryInput(private val underlying: java.io.InputStream, size: Int = 1 shl 20) {
+    private class BufferedAccessoryInput(
+        private val underlying: java.io.InputStream,
+        /** The `ParcelFileDescriptor` the stream was built from, when there is
+         * one. It, not the stream, actually owns the accessory fd -- see
+         * [close]. */
+        private val owner: java.io.Closeable? = null,
+        size: Int = 1 shl 20,
+    ) {
         private val buf = ByteArray(size)
         private var pos = 0
         private var limit = 0
@@ -483,12 +521,27 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
          * the stream out from under a blocked read is the standard way to
          * make it throw instead of hanging forever. Called only from the
          * watchdog thread, never from the thread actually doing the
-         * reading. */
+         * reading.
+         *
+         * **The `ParcelFileDescriptor` has to be closed too, and it is the one
+         * that matters.** Confirmed live: a `FileInputStream` built from
+         * `pfd.fileDescriptor` does not own that descriptor, so closing the
+         * stream left the blocked `read()` blocked. The watchdog logged
+         * "forcing reconnect" and then nothing further ever happened -- the
+         * decode thread never returned, the retry loop in `surfaceCreated`
+         * never fired, and both sides deadlocked: the app blocked reading, the
+         * daemon blocked waiting for a handshake the app would now never send.
+         * Only a manual app relaunch recovered it, which is the exact symptom
+         * Milestone 11 set out to remove. */
         fun close() {
             try {
                 underlying.close()
             } catch (e: Exception) {
                 // Already closed/broken -- fine, that's the whole point.
+            }
+            try {
+                owner?.close()
+            } catch (e: Exception) {
             }
         }
 
@@ -651,7 +704,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         }
         pfd.use {
             val fd = it.fileDescriptor
-            val input = BufferedAccessoryInput(FileInputStream(fd))
+            val input = BufferedAccessoryInput(FileInputStream(fd), it)
             val out = DataOutputStream(BufferedOutputStream(FileOutputStream(fd)))
             try {
                 runDecodeLoop(holder, input, out)
@@ -1023,5 +1076,9 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         private const val EV_UP = 5
         private const val EV_BUTTON_DOWN = 6
         private const val EV_BUTTON_UP = 7
+
+        /** Touch target; the drawn gear is 60% of this (see [GearButton]). */
+        private const val GEAR_SIZE_DP = 48f
+        private const val GEAR_MARGIN_DP = 12f
     }
 }

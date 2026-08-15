@@ -16,8 +16,13 @@
 //! USB_ACCESSORY_ATTACHED intent to our app at all.
 
 use std::io::{self, Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// Guards the `QUILL_USB_RESET` experiment to one reset per process --
+/// see `try_open_accessory`.
+static USB_RESET_DONE: AtomicBool = AtomicBool::new(false);
 
 const GOOGLE_VID: u16 = 0x18D1;
 const AOA_PID_ACCESSORY: u16 = 0x2D00;
@@ -217,6 +222,34 @@ fn try_open_accessory() -> Option<AoaTransport> {
         }
 
         let Ok(handle) = device.open() else { continue };
+
+        // Opt-in experiment (MILESTONES.md Milestone 21): a host-side USB reset
+        // is the lever the daemon could pull itself instead of telling the user
+        // to unplug the cable, which is the app's current status-overlay
+        // advice. The one recorded attempt is confounded -- the cable was
+        // replugged at the same moment -- so this stays behind an env var until
+        // an isolated test says whether the reset alone is enough to make
+        // Android re-fire USB_ACCESSORY_ATTACHED.
+        //
+        // Once per process, not once per scan: `connect`'s retry loop calls
+        // this repeatedly, and resetting every time would never let the device
+        // finish re-enumerating.
+        if std::env::var("QUILL_USB_RESET").is_ok() && !USB_RESET_DONE.swap(true, Ordering::SeqCst) {
+            eprintln!(
+                "[aoa] QUILL_USB_RESET: resetting bus {} addr {} and waiting for it to re-enumerate...",
+                device.bus_number(),
+                device.address()
+            );
+            match handle.reset() {
+                // Either way the handle is invalid now -- the device
+                // disappears and comes back at a new address, which is what
+                // `connect`'s scan loop is already built to wait out.
+                Ok(()) => eprintln!("[aoa] reset issued"),
+                Err(e) => eprintln!("[aoa] reset failed ({e}) -- carrying on without it"),
+            }
+            return None;
+        }
+
         let Ok(config) = device.active_config_descriptor() else { continue };
         let Some(interface) = config.interfaces().next() else { continue };
         let Some(interface_desc) = interface.descriptors().next() else { continue };

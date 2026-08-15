@@ -88,67 +88,137 @@ fn read_u16(r: &mut impl Read) -> io::Result<u16> {
     Ok(u16::from_be_bytes(b))
 }
 
-/// Reads the v2 handshake (see `protocol.rs`).
+const KNOWN_BODY: usize = 4 + 4 + 4 + 4 + 4 + 4 + 8 + 1;
+/// Nothing legitimate is anywhere near this; a larger `body_len` is a corrupt
+/// read, not a newer client with a lot to say.
+const MAX_BODY: usize = 1024;
+
+/// Sanity bounds on the reported panel size, not a real capability limit.
+/// Milestone 13: a desynced read produced `67108868x369098755 px`, and these
+/// dimensions drive both `uinput` and `orientation::set_rotation`, which shells
+/// out to `kscreen-doctor` and reconfigures the real KWin output with no
+/// validation of its own. No tablet panel is near this range in either
+/// direction.
+const MIN_DIM: u32 = 64;
+const MAX_DIM: u32 = 16384;
+
+/// How much garbage to walk past looking for a handshake before giving up. A
+/// stale-USB-data desync is a few hundred bytes at most; a megabyte means this
+/// is not a Quill client at all.
+const MAX_RESYNC_BYTES: usize = 1 << 20;
+/// Bounded so a stream of plausible-looking `"QUIL"` noise can't spin forever.
+const MAX_HANDSHAKE_ATTEMPTS: usize = 8;
+
+/// Walks the stream one byte at a time until the last four read are `MAGIC`,
+/// returning how many bytes were thrown away to get there.
 ///
-/// The magic and version are checked before anything is believed. v1 had no
-/// such marker, so a desynced or foreign peer produced a plausible-looking
-/// screen size that then drove `kscreen-doctor` and `uinput` -- the bounds
-/// check below was added in Milestone 13 precisely because garbage got that
-/// far. It stays as a second line of defence, but the magic is the real one.
+/// This is what protocol v2's magic was *for*. Before it, a desynced connection
+/// was undetectable and got interpreted as a screen size (Milestone 13); with
+/// it, the daemon could at least diagnose the problem, but still only by dying.
+/// Stale queued USB bulk data surviving a reconnect is the known remaining
+/// cause (MILESTONES.md Milestone 11) and it is recoverable: the real handshake
+/// is sitting right behind the garbage.
+fn sync_to_magic(r: &mut impl Read) -> io::Result<usize> {
+    let mut window = [0u8; 4];
+    r.read_exact(&mut window)?;
+    let mut discarded = 0usize;
+    while u32::from_be_bytes(window) != crate::protocol::MAGIC {
+        if discarded >= MAX_RESYNC_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("no handshake magic in the first {MAX_RESYNC_BYTES} bytes -- not a Quill client"),
+            ));
+        }
+        window.rotate_left(1);
+        window[3] = read_u8(r)?;
+        discarded += 1;
+    }
+    Ok(discarded)
+}
+
+/// Reads everything after the magic. `Ok(None)` means "this candidate isn't a
+/// real handshake, keep scanning" -- the body is consumed either way, so the
+/// stream stays aligned for the next attempt.
 ///
 /// Trailing bytes beyond the fields understood here are skipped using
 /// `body_len`, so a newer client that appends config fields still talks to an
 /// older daemon.
-fn read_handshake(r: &mut impl Read) -> io::Result<Handshake> {
-    let magic = read_u32(r)?;
-    if magic != crate::protocol::MAGIC {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "handshake magic was {magic:#010x}, expected {:#010x} -- either a stale/desynced \
-                 connection or a client that predates protocol v2",
-                crate::protocol::MAGIC
-            ),
-        ));
-    }
+fn read_handshake_body(r: &mut impl Read) -> io::Result<Option<Handshake>> {
     let version = read_u16(r)?;
-    if version != crate::protocol::PROTOCOL_VERSION {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "client speaks protocol v{version}, this daemon speaks v{} -- update whichever is older",
-                crate::protocol::PROTOCOL_VERSION
-            ),
-        ));
-    }
     let body_len = read_u16(r)? as usize;
 
-    const KNOWN_BODY: usize = 4 + 4 + 4 + 4 + 4 + 4 + 8 + 1;
-    if body_len < KNOWN_BODY {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("handshake body is {body_len} bytes, need at least {KNOWN_BODY}"),
-        ));
+    // Length first, so the body can be consumed even when the version is the
+    // thing that's wrong -- otherwise a rejected candidate would leave its own
+    // body in the stream for the next scan to trip over.
+    if !(KNOWN_BODY..=MAX_BODY).contains(&body_len) {
+        eprintln!("[input] rejecting handshake candidate: body_len {body_len} outside {KNOWN_BODY}..={MAX_BODY}");
+        return Ok(None);
+    }
+    let mut body = vec![0u8; body_len];
+    r.read_exact(&mut body)?;
+
+    if version != crate::protocol::PROTOCOL_VERSION {
+        eprintln!(
+            "[input] rejecting handshake candidate: client speaks protocol v{version}, this daemon \
+             speaks v{} -- update whichever is older (or this was corrupted bytes that happened to \
+             contain the magic)",
+            crate::protocol::PROTOCOL_VERSION
+        );
+        return Ok(None);
     }
 
+    let mut body = io::Cursor::new(&body[..]);
     let handshake = Handshake {
-        width: read_u32(r)?,
-        height: read_u32(r)?,
-        pressure_min: read_i32(r)?,
-        pressure_max: read_i32(r)?,
-        tilt_min: read_i32(r)?,
-        tilt_max: read_i32(r)?,
-        android_send_ms: read_i64(r)?,
-        config_flags: read_u8(r)?,
+        width: read_u32(&mut body)?,
+        height: read_u32(&mut body)?,
+        pressure_min: read_i32(&mut body)?,
+        pressure_max: read_i32(&mut body)?,
+        tilt_min: read_i32(&mut body)?,
+        tilt_max: read_i32(&mut body)?,
+        android_send_ms: read_i64(&mut body)?,
+        config_flags: read_u8(&mut body)?,
     };
 
-    // Fields this build doesn't know about yet.
-    let mut skip = vec![0u8; body_len - KNOWN_BODY];
-    if !skip.is_empty() {
-        r.read_exact(&mut skip)?;
-        eprintln!("[input] skipped {} trailing handshake byte(s) from a newer client", skip.len());
+    if !(MIN_DIM..=MAX_DIM).contains(&handshake.width) || !(MIN_DIM..=MAX_DIM).contains(&handshake.height) {
+        eprintln!(
+            "[input] rejecting handshake candidate: {}x{} px is outside the sane {MIN_DIM}..={MAX_DIM} \
+             range, so this is a corrupted read rather than a real panel size",
+            handshake.width, handshake.height
+        );
+        return Ok(None);
     }
-    Ok(handshake)
+
+    if body_len > KNOWN_BODY {
+        eprintln!(
+            "[input] skipped {} trailing handshake byte(s) from a newer client",
+            body_len - KNOWN_BODY
+        );
+    }
+    Ok(Some(handshake))
+}
+
+/// Reads the v2 handshake (see `protocol.rs`), resyncing past leading garbage
+/// instead of treating it as fatal. Returns the handshake and how many bytes
+/// were discarded ahead of it.
+///
+/// Before this, any of the three rejections below returned an error, the input
+/// thread exited, the `clock_tx` sender dropped, and `setup_transport`'s
+/// `recv_timeout` saw `Disconnected` and exited the process -- so a few stale
+/// bytes cost a full systemd restart plus (on AOA) another device scan. The
+/// bytes worth having were in the buffer the whole time.
+fn read_handshake(r: &mut impl Read) -> io::Result<(Handshake, usize)> {
+    let mut discarded = 0usize;
+    for attempt in 1..=MAX_HANDSHAKE_ATTEMPTS {
+        discarded += sync_to_magic(r)?;
+        if let Some(handshake) = read_handshake_body(r)? {
+            return Ok((handshake, discarded));
+        }
+        eprintln!("[input] handshake candidate {attempt}/{MAX_HANDSHAKE_ATTEMPTS} rejected, resyncing...");
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("no valid handshake in {MAX_HANDSHAKE_ATTEMPTS} attempts"),
+    ))
 }
 
 const EV_HOVER_ENTER: u8 = 0;
@@ -159,6 +229,10 @@ const EV_MOVE: u8 = 4;
 const EV_UP: u8 = 5;
 const EV_BUTTON_DOWN: u8 = 6;
 const EV_BUTTON_UP: u8 = 7;
+
+/// Consecutive out-of-range event types tolerated before the stream is called
+/// desynced. One is survivable noise; three in a row is a wrong read offset.
+const MAX_BAD_EVENTS: u32 = 3;
 
 /// Blocks reading the handshake, creates the uinput tablet from the real
 /// reported ranges, then loops injecting input events until the stream
@@ -187,35 +261,21 @@ pub fn run(
     clock_tx: Sender<HandshakeInfo>,
     remote_input_rx: Option<Receiver<RemoteDesktopInput>>,
 ) {
-    let handshake = match read_handshake(&mut stream) {
+    let (handshake, discarded) = match read_handshake(&mut stream) {
         Ok(h) => h,
         Err(e) => {
             eprintln!("[input] failed to read capability handshake: {e}");
             return;
         }
     };
-
-    // Sanity bounds, not a real capability limit: reusing an
-    // already-in-accessory-mode device (see `aoa::connect`'s "already in
-    // accessory mode, reusing it" path) can desync framing if Android
-    // doesn't resend a fresh handshake at the same instant this side starts
-    // reading -- confirmed live (Milestone 13), this landed leftover stream
-    // bytes here and produced `handshake: 67108868x369098755 px`. Harmless
-    // on its own (uinput's ioctl validation clamps it), but width/height
-    // now also drive `orientation::set_rotation`, which shells out to
-    // `kscreen-doctor` and directly reconfigures the real KWin output with
-    // no validation of its own. No real tablet panel is anywhere near this
-    // range in either direction.
-    const MIN_DIM: u32 = 64;
-    const MAX_DIM: u32 = 16384;
-    if !(MIN_DIM..=MAX_DIM).contains(&handshake.width) || !(MIN_DIM..=MAX_DIM).contains(&handshake.height) {
-        eprintln!(
-            "[input] handshake reports {}x{} px -- outside the sane {MIN_DIM}..={MAX_DIM} range, \
-             almost certainly a corrupted/stale read rather than a real panel size. Refusing to act \
-             on it (dropping this connection so the client reconnects with a fresh handshake).",
-            handshake.width, handshake.height
-        );
-        return;
+    if discarded > 0 {
+        // The stale-USB-data race from Milestone 11: reusing an
+        // already-in-accessory-mode device (see `aoa::connect`'s "already in
+        // accessory mode, reusing it" path) can leave a previous session's
+        // bytes queued ahead of the real handshake. Recovered rather than
+        // fatal now, but still worth counting -- if this number is ever large
+        // or growing, the `clear_halt`/reset work in `aoa.rs` is the lever.
+        eprintln!("[input] resynced after {discarded} discarded byte(s) of stale/garbage stream data");
     }
 
     let daemon_recv_ms = crate::clock_sync::now_millis();
@@ -252,7 +312,7 @@ pub fn run(
                 Ok(ri) => Some(ri),
                 Err(e) => {
                     eprintln!("[input] never received the RemoteDesktop input handle: {e}");
-                    return;
+                    std::process::exit(1);
                 }
             }
         }
@@ -264,8 +324,13 @@ pub fn run(
         None => match UinputTablet::create(&ranges) {
             Ok(t) => Some(t),
             Err(e) => {
+                // Milestone 11 saw this fail with "Invalid argument" after a
+                // corrupted handshake. Exiting (rather than returning and
+                // leaving video streaming with no input at all) puts the
+                // restart in systemd's hands, where every other fatal
+                // transport problem in this daemon already lives.
                 eprintln!("[input] failed to create uinput tablet: {e}");
-                return;
+                std::process::exit(1);
             }
         },
         Some(_) => None,
@@ -295,6 +360,7 @@ pub fn run(
     let flip_180 = ranges.height > ranges.width;
 
     let mut event_count = 0u64;
+    let mut consecutive_bad = 0u32;
     loop {
         let event_type = match read_u8(&mut stream) {
             Ok(v) => v,
@@ -329,6 +395,27 @@ pub fn run(
             Err(_) => break,
         };
         let is_finger = buttons & 0b10 != 0;
+
+        // Upstream records are raw fixed-size structs with no framing of their
+        // own, so a desync here is permanent: every subsequent read is 22 bytes
+        // taken at the wrong offset. Before this check an out-of-range type
+        // (Milestone 11 logged `type=51`) fell through the arms below and the
+        // loop went on consuming misaligned records forever, injecting nothing.
+        // One bad record can be a bit flip; several in a row is a desync, and
+        // the only fix from here is a fresh connection with a fresh handshake.
+        if event_type > EV_BUTTON_UP {
+            consecutive_bad += 1;
+            eprintln!(
+                "[input] event type {event_type} is outside the valid 0..={EV_BUTTON_UP} range \
+                 ({consecutive_bad}/{MAX_BAD_EVENTS} consecutive)"
+            );
+            if consecutive_bad >= MAX_BAD_EVENTS {
+                eprintln!("[input] stream is desynced -- dropping the connection so the client re-handshakes");
+                break;
+            }
+            continue;
+        }
+        consecutive_bad = 0;
 
         let in_contact = matches!(event_type, EV_DOWN | EV_MOVE);
         if matches!(
@@ -372,4 +459,99 @@ pub fn run(
         }
     }
     eprintln!("[input] receiver thread exiting after {event_count} events");
+
+    // A daemon that keeps streaming video with no input is not usefully alive:
+    // the tablet is a drawing surface, and this is exactly the state Milestone
+    // 11 recorded as "input can end up silently wrong for that session until
+    // the next reconnect cycles it out on its own". Exit so systemd restarts
+    // us with a clean transport and a fresh handshake -- the same recovery the
+    // five transport-write failures in `portal_capture.rs` already use.
+    // Ctrl-C is the one case where the stream ending is expected: leave the
+    // main thread alone so it can print its summary.
+    if !crate::sigint_received() {
+        std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A well-formed v2 handshake, as `MainActivity.sendHandshake` writes it.
+    fn handshake_bytes(width: u32, height: u32) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&width.to_be_bytes());
+        body.extend_from_slice(&height.to_be_bytes());
+        body.extend_from_slice(&0i32.to_be_bytes()); // pressure_min
+        body.extend_from_slice(&4095i32.to_be_bytes()); // pressure_max
+        body.extend_from_slice(&0i32.to_be_bytes()); // tilt_min
+        body.extend_from_slice(&90i32.to_be_bytes()); // tilt_max
+        body.extend_from_slice(&1_700_000_000_000i64.to_be_bytes());
+        body.push(0); // config_flags
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&crate::protocol::MAGIC.to_be_bytes());
+        out.extend_from_slice(&crate::protocol::PROTOCOL_VERSION.to_be_bytes());
+        out.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        out.extend_from_slice(&body);
+        out
+    }
+
+    #[test]
+    fn reads_a_clean_handshake_with_nothing_discarded() {
+        let bytes = handshake_bytes(1848, 2960);
+        let (h, discarded) = read_handshake(&mut io::Cursor::new(bytes)).unwrap();
+        assert_eq!((h.width, h.height), (1848, 2960));
+        assert_eq!(h.pressure_max, 4095);
+        assert_eq!(discarded, 0);
+    }
+
+    #[test]
+    fn walks_past_leading_garbage() {
+        // The Milestone 11 case: a previous session's queued bytes ahead of the
+        // real handshake.
+        let mut bytes = vec![0xAB; 37];
+        bytes.extend_from_slice(&handshake_bytes(1848, 2960));
+        let (h, discarded) = read_handshake(&mut io::Cursor::new(bytes)).unwrap();
+        assert_eq!((h.width, h.height), (1848, 2960));
+        assert_eq!(discarded, 37);
+    }
+
+    #[test]
+    fn skips_a_candidate_with_an_implausible_screen_size() {
+        // The exact garbage Milestone 13 recorded, magic and all, followed by
+        // the real thing.
+        let mut bad = handshake_bytes(67_108_868, 369_098_755);
+        bad.extend_from_slice(&handshake_bytes(1848, 2960));
+        let (h, _) = read_handshake(&mut io::Cursor::new(bad)).unwrap();
+        assert_eq!((h.width, h.height), (1848, 2960));
+    }
+
+    #[test]
+    fn skips_a_candidate_with_a_bogus_body_len_without_losing_alignment() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&crate::protocol::MAGIC.to_be_bytes());
+        bytes.extend_from_slice(&crate::protocol::PROTOCOL_VERSION.to_be_bytes());
+        bytes.extend_from_slice(&7u16.to_be_bytes()); // shorter than KNOWN_BODY
+        bytes.extend_from_slice(&handshake_bytes(1848, 2960));
+        let (h, _) = read_handshake(&mut io::Cursor::new(bytes)).unwrap();
+        assert_eq!((h.width, h.height), (1848, 2960));
+    }
+
+    #[test]
+    fn accepts_trailing_fields_from_a_newer_client() {
+        let mut bytes = handshake_bytes(1848, 2960);
+        // Bump body_len and append two bytes this build doesn't know about.
+        let new_len = (KNOWN_BODY + 2) as u16;
+        bytes[6..8].copy_from_slice(&new_len.to_be_bytes());
+        bytes.extend_from_slice(&[0xEE, 0xEE]);
+        let (h, _) = read_handshake(&mut io::Cursor::new(bytes)).unwrap();
+        assert_eq!((h.width, h.height), (1848, 2960));
+    }
+
+    #[test]
+    fn gives_up_on_a_stream_that_never_contains_a_handshake() {
+        let bytes = vec![0x5Au8; 4096];
+        assert!(read_handshake(&mut io::Cursor::new(bytes)).is_err());
+    }
 }

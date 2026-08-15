@@ -2254,3 +2254,208 @@ whether Android re-fires `USB_ACCESSORY_ATTACHED`.
 
 Verified end to end after the move: **avg 26ms, min 9ms, `pending=0`**, encode
 ~8-10ms, old package uninstalled so nothing competes for the accessory intent.
+
+## 22. A settings gear that survives streaming, and Milestone 11's remaining
+## desync gap made recoverable
+
+Two pieces of work, validated live on 2026-08-15 against the Tab S9 FE+ over
+AOA (Plasma 6.3.6, `Virtual-QuillDisplay` 2560x1600). Results at the end,
+including one real bug the testing turned up and the isolated USB-reset answer
+Milestone 21 was waiting for.
+
+### The settings screen had no entry point once video started
+
+`SettingsActivity` landed in Milestone 19 reachable by tapping the status
+overlay, because the app runs edge-to-edge immersive with no system chrome to
+hang a menu off. But `hideStatus()` sets that overlay `GONE` on the first
+rendered frame -- so from the moment the thing works, there is no way into
+settings at all. The toggles existed and could not be exercised.
+
+`GearButton.kt`: a small `View`, topmost child of the root `FrameLayout`,
+`TOP|END` with a 12dp inset (clear of the edge-swipe strip that brings the
+system bars back). Full opacity when touched, dimming to 15% after 3s, and
+never hidden and never made unclickable -- a gear you cannot tap is the bug
+this exists to fix. The glyph is drawn with `Canvas`/`Path` because this app
+still ships no `res/drawable`, `res/layout` or `res/values` of any kind.
+
+The load-bearing part is that it **swallows its own input on all three
+streams**. `MainActivity`'s touch, hover, and generic-motion listeners live on
+the `SurfaceView` and hit-test nothing: every pointer event they see, finger or
+pen, is forwarded to the daemon and injected into the desktop. As the topmost
+sibling the gear gets first crack at dispatch, and `onTouchEvent`,
+`onHoverEvent` and `onGenericMotionEvent` all return `true`, so a tap on the
+gear never also clicks whatever is behind it on the Linux side. Clickable alone
+would have covered touch only.
+
+Opening settings destroys the surface, so the decode loop stops and reconnects
+on return. That is not a regression -- it is what the status-overlay path
+already did, and since settings apply at connect time (Milestone 19), the
+reconnect is what makes a changed toggle take effect.
+
+### Milestone 11's known gap: the magic was diagnostic, now it recovers
+
+Milestone 11 closed five bugs and left one: stale queued USB bulk data
+surviving a reconnect corrupts the handshake, or the input record stream, and
+nothing detects it -- input then runs with nonsense ranges, or silently
+misaligned, until something else cycles the connection.
+
+- **Handshake resync** (`input_receiver.rs`). Protocol v2's `MAGIC` made a
+  desync *detectable*; the daemon still only died of it. `sync_to_magic` now
+  walks the stream a byte at a time (1 MiB budget) until the last four bytes
+  read are `"QUIL"`, and `read_handshake` retries up to 8 candidates. Version
+  mismatch, an implausible `body_len`, and the Milestone 13 dimension check
+  (64..=16384, moved here from `run`) all now *reject a candidate and keep
+  scanning* instead of ending the connection. The body is consumed either way,
+  so a rejected candidate leaves the stream aligned for the next attempt. The
+  real handshake was sitting right behind the garbage the whole time; before
+  this, a few stale bytes cost a full systemd restart plus another 20s AOA
+  device scan. Six unit tests cover it, including the exact
+  `67108868x369098755` garbage from Milestone 13.
+- **Input-record desync** (`input_receiver.rs`). Upstream records are raw
+  fixed-size structs with no framing, so the observed `type=51` fell through
+  the match arms while the loop went on consuming 22 bytes at a permanently
+  wrong offset, forever. Out-of-range types are now counted; three in a row is
+  called a desync. That, the stream ending, a `uinput` creation failure, and a
+  missing `RemoteDesktop` handle all now `exit(1)` unless SIGINT is what ended
+  it -- a daemon streaming video with dead or misaligned input is not usefully
+  alive, and this is the same "exit so systemd can retry" recovery the six
+  transport-write sites already use.
+- **Single-instance lock** (`single_instance.rs`). Nothing stopped the
+  udev-launched unit and a hand-run daemon from overlapping, and when they do,
+  three unrelated-looking things break: the single-use portal restore token
+  gets consumed by whichever wins (the loser gets a picker dialog at a user who
+  may not be there), `orientation::ensure`'s `pkill -f krfb-virtualmonitor` is
+  process-wide and tears down the *other* instance's monitor, and the AOA
+  interface claim is exclusive. `flock` on
+  `$XDG_RUNTIME_DIR/quill-daemon.lock`, taken before any side effect. `flock`
+  rather than a pid file specifically because the kernel drops it however the
+  process exits -- including through the `exit(1)` paths, which skip
+  destructors -- so a stale lock file is never stale. A duplicate launch exits
+  **0**, not 1: `Restart=on-failure` must not restart it and
+  `StartLimitBurst=3` must not be burned by it. Verified both directions
+  locally (holder writes its pid; the second instance reports that pid and
+  exits 0).
+- **Restore token lifetime** (`portal_capture.rs`). The token file was deleted
+  *before* the fallback pick, so a failed or dismissed picker left nothing
+  behind at all. Now the old file stays until a replacement exists, and the
+  write goes through a temp file and a rename -- this daemon exits abruptly by
+  design, and a truncated token reads back as a rejected one, i.e. as a picker
+  dialog for someone who isn't there. A stale token costs one dialog; no token
+  costs one every time. Also logs the previously silent case where the portal
+  returns no token at all.
+- **USB reset, still an experiment** (`aoa.rs`). Milestone 21's `USBDEVFS_RESET`
+  result is confounded (the cable was replugged at the same moment), so this is
+  behind `QUILL_USB_RESET=1` rather than on: one `handle.reset()` per process
+  before the interface claim, then let `connect`'s existing scan loop wait out
+  the re-enumeration. The question it exists to answer is whether a host-side
+  reset alone makes Android re-fire `USB_ACCESSORY_ATTACHED` -- i.e. whether
+  the daemon can recover itself instead of telling the user to unplug the
+  cable, which is what the app's status overlay currently advises.
+
+### The bug the testing found: closing the stream never unblocked the read
+
+Restarting the daemon while the app was streaming deadlocked both sides, every
+time -- not a stress-only artifact, reproduced with a single
+`systemctl --user restart`. The app logged
+
+```
+17:02:32.679 W Quill: no data for 15000ms, forcing reconnect
+```
+
+and then **nothing further, ever**. The decode thread never returned, so the
+retry loop in `surfaceCreated` never fired, so the app never sent a new
+handshake, so the daemon sat in `[transport] AOA connected, waiting for the
+Android app to open the accessory...` forever. Both sides blocked on each
+other. Only a manual app relaunch recovered it -- the exact symptom Milestone
+11 set out to remove, still present in a case Milestone 11 believed it had
+covered.
+
+Cause: `BufferedAccessoryInput.close()` closed the `FileInputStream`, but that
+stream was built from `pfd.fileDescriptor` and does not own the descriptor --
+the `ParcelFileDescriptor` does. Closing the wrapper left the accessory fd open
+and the blocked `read()` blocked. Milestone 11's item 3 ("closing the stream out
+from under a blocked read is the standard way to make it throw") was right about
+the technique and wrong about which object to close; the watchdog was firing
+correctly the whole time and its close was a no-op.
+
+Fixed by handing `BufferedAccessoryInput` the `ParcelFileDescriptor` and closing
+that too. Immediately after:
+
+```
+17:04:18.307 W Quill: no data for 15000ms, forcing reconnect
+17:04:18.309 I Quill: stream ended: read interrupted by close() on another thread
+17:04:20.352 I Quill: connection ended, retrying in 1s...
+17:04:21.372 I Quill: clock-sync: offset=599ms (android-daemon), round-trip sum=1ms
+```
+
+Two milliseconds from close to unblocked, full reconnect in the same process,
+clean calibration (round-trip sum 1ms -- the number Milestone 19 established as
+the one to check alongside the offset). Six rapid restarts afterwards recovered
+every time with no corruption.
+
+### Live results
+
+- **Gear.** Renders over live video, dims as designed (confirmed by tablet
+  screenshot). `adb shell input tap` on it opened `SettingsActivity` while
+  streaming, and the daemon logged **zero** `[input] event` records -- nothing
+  leaked through to the desktop, which was the one thing that could have gone
+  wrong. Back-out reconnected cleanly.
+- **Handshake resync.** Exercised over a real transport with a fake client that
+  sent 37 bytes of garbage ahead of a valid handshake:
+  `[input] resynced after 37 discarded byte(s) of stale/garbage stream data`,
+  then the handshake read correctly. Previously this exact input killed the
+  process. (Six rapid daemon restarts produced no natural corruption to resync
+  from, so the live proof is the injected case; the unit tests cover the rest.)
+- **Input desync.** One valid record then three `type=51` records:
+  `(1/3 consecutive)`, `(2/3)`, `(3/3)`,
+  `[input] stream is desynced -- dropping the connection so the client
+  re-handshakes`, process exit code 1.
+- **Single-instance lock, proved in the wild rather than in a contrived test.**
+  During the USB-reset run below, re-enumeration made the udev rule fire the
+  systemd unit while a hand-run daemon was already streaming:
+  `[lock] another quill daemon is already running (pid 178401) -- exiting`, exit
+  0, first instance untouched. That is precisely the token/interface/`pkill
+  krfb-virtualmonitor` race the lock exists for, and it happens on ordinary
+  hardware events, not just when someone runs two daemons on purpose.
+- **Restore token.** Corrupted the token file; the portal rejected it
+  (`Restore token is not a valid UUID string`), the daemon fell back to the
+  picker, and **the old file was still on disk afterwards** -- the old code
+  would have deleted it before knowing whether a replacement was coming.
+
+### The isolated USB-reset test: it works
+
+Run with the app force-stopped, the daemon stopped, the tablet already in
+accessory mode, and **nobody touching the cable** -- the confound that
+invalidated Milestone 21's attempt.
+
+```
+[aoa] QUILL_USB_RESET: resetting bus 3 addr 12 and waiting for it to re-enumerate...
+[aoa] reset failed (Entity not found) -- carrying on without it
+[aoa] found AOA-capable device (protocol v2) at bus 3 addr 13, switching to accessory mode...
+[aoa] connected: bus 3 addr 14, interface 0, bulk in=0x81 out=0x01
+[input] handshake: 2560x1600 px, pressure 0..4095, tilt -90..90 deg
+[capture] frame 1: 92397 bytes, 14.13ms
+```
+
+`rusb`'s `reset()` reporting failure is the same artifact Milestone 21 already
+identified: the device disappears mid-reset, so libusb loses the handle and
+returns `Entity not found` (libusb's `ENODEV`) even though the reset itself
+went through. The addresses prove it did -- 12 → 13 → 14 -- and the device came
+back **out** of accessory mode, so the daemon ran the normal AOA switch
+handshake against it, which re-fired `USB_ACCESSORY_ATTACHED` on the tablet.
+Android relaunched the force-stopped app from that intent (permission still
+granted, no dialog), the app opened the accessory and handshook cleanly
+(`round-trip sum=2ms`), and frames flowed.
+
+**So the answer Milestone 21 wanted is yes: a host-side reset alone recovers a
+stuck accessory session, with no physical replug and nobody at the machine.**
+
+Left behind `QUILL_USB_RESET` rather than making it automatic, deliberately.
+One clean run is enough to answer the question and not enough to make it the
+default: an unconditional reset would tear down a *healthy* accessory session
+on every daemon start and cost an app relaunch (~5s) each time. The case that
+actually wants it is narrower -- "the device is present in accessory mode but
+the handshake never arrives" -- which surfaces as `setup_transport`'s 120s
+clock-sync timeout, not inside `aoa::connect`, so wiring it there is its own
+small change. And the deadlock fixed above was the cause of most of the stuck
+sessions this would have been papering over.

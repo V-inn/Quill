@@ -261,6 +261,26 @@ impl CursorRendering {
     }
 }
 
+/// Writes a token via a temp file and a rename, so the file on disk is either
+/// the old token or the new one and never half of either. This daemon exits
+/// abruptly by design (six `std::process::exit` sites), and a truncated token
+/// reads back as a rejected one -- i.e. as a picker dialog for someone who
+/// isn't there.
+fn save_restore_token(path: &std::path::Path, token: &str) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp = path.with_extension("tmp");
+    if let Err(e) = std::fs::write(&tmp, token) {
+        eprintln!("[portal] failed to save restore token: {e}");
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        eprintln!("[portal] failed to install restore token: {e}");
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
 pub async fn open_portal(cursor: CursorRendering) -> ashpd::Result<(PortalStream, OwnedFd)> {
     let proxy = Screencast::new().await?;
     let session = proxy.create_session().await?;
@@ -283,8 +303,14 @@ pub async fn open_portal(cursor: CursorRendering) -> ashpd::Result<(PortalStream
         // Saved token no longer valid (virtual monitor was recreated,
         // permission revoked, etc.) -- fall back to a fresh interactive
         // pick rather than failing outright.
+        //
+        // The old token file is deliberately left on disk until a replacement
+        // exists: if this fresh pick fails, or nobody is at the keyboard to
+        // dismiss the dialog, deleting it first would have thrown away a token
+        // that might still work on the next boot and guaranteed a picker
+        // prompt. A stale token costs one dialog; no token costs one every
+        // time.
         eprintln!("[portal] saved restore token rejected ({e}), falling back to picker...");
-        let _ = std::fs::remove_file(&token_path);
         proxy
             .select_sources(
                 &session,
@@ -301,13 +327,14 @@ pub async fn open_portal(cursor: CursorRendering) -> ashpd::Result<(PortalStream
 
     let response = proxy.start(&session, None).await?.response()?;
 
-    if let Some(token) = response.restore_token() {
-        if let Some(parent) = token_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Err(e) = std::fs::write(&token_path, token) {
-            eprintln!("[portal] failed to save restore token: {e}");
-        }
+    match response.restore_token() {
+        Some(token) => save_restore_token(&token_path, token),
+        // The token we came in with (if any) has just been consumed and is now
+        // invalid, but there is nothing to replace it with. Say so rather than
+        // letting the next run's picker dialog look like a new bug.
+        None => eprintln!(
+            "[portal] the portal returned no restore token -- the next run may show the picker dialog"
+        ),
     }
 
     let stream = response

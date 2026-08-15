@@ -29,8 +29,9 @@ keep matching the identification strings `daemon/src/aoa.rs` sends).
 |---|---|
 | `MainActivity.kt` | Transport, protocol, decode loop, S Pen capture |
 | `Settings.kt` | Persisted options, packed into the handshake's `config_flags` |
-| `SettingsActivity.kt` | The settings screen — reached by tapping the status overlay |
+| `SettingsActivity.kt` | The settings screen — reached from the gear, or the status overlay while disconnected |
 | `CursorOverlay.kt` | Draws the desktop pointer, for client-side cursor mode |
+| `GearButton.kt` | Dimmed corner gear; the settings entry point that survives streaming |
 
 The wire protocol both sides speak is documented in one place,
 [`daemon/src/protocol.rs`](../daemon/src/protocol.rs). The constants at the
