@@ -2127,3 +2127,59 @@ so a bad calibration is indistinguishable from a real regression unless the
 round-trip sum is checked alongside it. It is printed next to the offset for
 exactly this reason -- 10ms versus 1119ms said immediately which reading to
 trust.
+
+## 20. Camera confirmation: ~55ms glass-to-glass, target met
+
+Ran the readable-clock camera test (Milestone 7's method, unchanged): two
+`readable_clock` instances, one on `eDP-1` at X11 `500,500`, one on
+`Virtual-QuillDisplay` at `2304,0`-ish, filmed together in slow motion, reading
+both values off the same frame.
+
+**Four readings (main screen vs tablet):** .542/.491 (51ms), .593/.541 (52ms),
+.727/.659 (68ms), .811/.760 (51ms) -- **mean 55.5ms, median 51.5ms.**
+
+Against every previous measurement by the same method:
+
+| | camera glass-to-glass |
+|---|---|
+| Milestone 4 | ~300ms |
+| Milestone 7 (post-VPP) | ~144ms |
+| Milestone 17 | ~113-126ms |
+| **Milestone 18-20** | **~55ms** |
+
+The ~60ms goal is met, and this is the number to quote, because it is the same
+method as every historical figure -- whatever bias it carries, it carries
+identically across all of them.
+
+### Reconciling ~55ms camera against ~69ms instrumented -- both are right
+
+The instrumented segments sum to 30.6ms capture + 8.6ms encode + 29-30ms
+decode/render = ~69ms, which is *larger* than the camera number. That is not a
+contradiction, and it is worth writing down so nobody "fixes" it later:
+
+- The camera compares two **screens**. The reference clock on `eDP-1` is itself
+  delayed by the laptop's own compositing and panel latency. Reading
+  `X_main - X_tablet` at one photon instant yields
+  `L_total - L_laptop`, not `L_total` -- the laptop's own display latency is
+  subtracted out.
+- The instrumented sum measures a different span: from the probe *painting* its
+  buffer to `releaseOutputBuffer` on the tablet. It excludes the tablet's own
+  SurfaceFlinger/panel presentation on one end.
+
+The two reconcile at roughly 30ms of laptop-side display latency, which is
+unremarkable for a 60Hz panel under KWin. So there is no unexplained gap here --
+the situation Milestone 7 hit twice, where a summed figure hid real latency, does
+not recur. Absolute pixel-change-to-tablet-photon is probably ~80-85ms; the
+~55ms figure is the honest apples-to-apples number for tracking progress, and
+~69ms is the honest figure for "what this project's own code is responsible
+for".
+
+### Where the remaining time is
+
+Of the ~69ms this project controls: **capture is now the largest single
+segment at ~30ms**, and Milestone 18 established that removing KWin's readback
+only bought 2.6ms of it -- the rest is the compositor's own render/deliver
+cadence against a 60Hz virtual output, roughly two output frames. Raising that
+output's refresh rate is the remaining lever, and it needs an
+`outputmanagement_v2` Wayland client since this build's `kscreen-doctor` has no
+`addCustomMode` verb.
