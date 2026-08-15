@@ -327,6 +327,13 @@ struct CaptureData {
     flip_180: bool,
     /// `QUILL_NO_ENCODE` -- see the early return in `process`.
     no_encode: bool,
+    /// Whether the client draws the pointer itself. Only in `ClientSide` does
+    /// the capture path forward cursor messages.
+    cursor: CursorRendering,
+    /// Last cursor shape id sent to the client. KWin only supplies a bitmap
+    /// when the shape changes, so the client caches by id and this tracks what
+    /// it has already been given.
+    last_cursor_id: Option<u32>,
     /// Dimensions already announced to the client, if any.
     ///
     /// `param_changed` fires more than once on the DMA-BUF path: modifier
@@ -369,7 +376,7 @@ struct CaptureData {
 pub fn setup_transport(
     config: TransportConfig,
     remote_input_rx: Option<std::sync::mpsc::Receiver<crate::remote_desktop_input::RemoteDesktopInput>>,
-) -> Option<(TransportWriter, u32, u32)> {
+) -> Option<(TransportWriter, crate::input_receiver::HandshakeInfo)> {
     // AOA needs a much longer clock-sync wait than TCP: adb-forward's
     // ServerSocket::accept() already guarantees a connected, ready peer by
     // the time we get here, but AOA's USB_ACCESSORY_ATTACHED flow involves
@@ -438,18 +445,23 @@ pub fn setup_transport(
     // mid-handshake, and systemd's `Restart=on-failure` (see
     // `packaging/quill-daemon.service`) never got a chance to retry the AOA
     // connect because the process never actually exited.
-    let (width, height) = match clock_rx.recv_timeout(clock_sync_timeout) {
-        Ok((android_send_ms, daemon_recv_ms, width, height)) => {
+    let info = match clock_rx.recv_timeout(clock_sync_timeout) {
+        Ok(info) => {
             let daemon_send_ms = crate::clock_sync::now_millis();
-            let mut reply = Vec::with_capacity(24);
-            reply.extend_from_slice(&daemon_send_ms.to_be_bytes());
-            reply.extend_from_slice(&android_send_ms.to_be_bytes());
-            reply.extend_from_slice(&daemon_recv_ms.to_be_bytes());
-            if let Err(e) = writer.write_all(&reply) {
+            let mut payload = Vec::with_capacity(24);
+            payload.extend_from_slice(&daemon_send_ms.to_be_bytes());
+            payload.extend_from_slice(&info.android_send_ms.to_be_bytes());
+            payload.extend_from_slice(&info.daemon_recv_ms.to_be_bytes());
+            let msg = crate::protocol::encode_message(
+                crate::protocol::MSG_CLOCK_SYNC,
+                daemon_send_ms,
+                &payload,
+            );
+            if let Err(e) = writer.write_all(&msg) {
                 eprintln!("[clock-sync] failed to send calibration reply: {e}");
                 std::process::exit(1);
             }
-            (width, height)
+            info
         }
         Err(e) => {
             eprintln!("[clock-sync] never received clock ping: {e} -- exiting so systemd can retry");
@@ -457,7 +469,7 @@ pub fn setup_transport(
         }
     };
 
-    Some((writer, width, height))
+    Some((writer, info))
 }
 
 /// Shared by both capture paths so the "time from content changing on screen to
@@ -542,11 +554,14 @@ fn emit_frame(
         // separate ones: with TCP_NODELAY set, each write_all was its own TCP
         // segment / adb protocol packet -- three small packets ahead of the
         // real payload adds per-packet adb/USB overhead for no reason.
-        let mut frame_buf = Vec::with_capacity(13 + encoded.len());
-        frame_buf.extend_from_slice(&crate::clock_sync::now_millis().to_be_bytes());
-        frame_buf.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
-        frame_buf.push(frame.is_idr as u8);
-        frame_buf.extend_from_slice(&encoded);
+        let mut payload = Vec::with_capacity(1 + encoded.len());
+        payload.push(frame.is_idr as u8);
+        payload.extend_from_slice(&encoded);
+        let frame_buf = crate::protocol::encode_message(
+            crate::protocol::MSG_VIDEO,
+            crate::clock_sync::now_millis(),
+            &payload,
+        );
         if let Err(e) = sock.write_all(&frame_buf) {
             // Same reasoning as the two startup failure paths in
             // `setup_transport`: this only runs with `Some(sock)` when a real
@@ -573,6 +588,7 @@ pub fn run_capture(
     out_path: &str,
     transport: Option<TransportWriter>,
     flip_180: bool,
+    cursor: CursorRendering,
 ) -> Result<CaptureStats, pw::Error> {
     pw::init();
 
@@ -600,6 +616,8 @@ pub fn run_capture(
         encoder: None,
         flip_180,
         no_encode: std::env::var("QUILL_NO_ENCODE").is_ok(),
+        cursor,
+        last_cursor_id: None,
         sent_format: None,
         out_file,
         transport: transport.clone(),
@@ -702,9 +720,14 @@ pub fn run_capture(
             }
             user_data.sent_format = Some((width, height));
             if let Some(sock) = user_data.transport.borrow_mut().as_mut() {
-                let mut header = Vec::with_capacity(8);
-                header.extend_from_slice(&width.to_be_bytes());
-                header.extend_from_slice(&height.to_be_bytes());
+                let mut payload = Vec::with_capacity(8);
+                payload.extend_from_slice(&width.to_be_bytes());
+                payload.extend_from_slice(&height.to_be_bytes());
+                let header = crate::protocol::encode_message(
+                    crate::protocol::MSG_VIDEO_FORMAT,
+                    crate::clock_sync::now_millis(),
+                    &payload,
+                );
                 if let Err(e) = sock.write_all(&header) {
                     eprintln!("[transport] failed to send video format header ({e}), exiting so systemd can retry");
                     std::process::exit(1);
@@ -764,74 +787,75 @@ pub fn run_capture(
                 eprintln!("[pipewire] buffer has no MetaHeader (no pts available from this producer)");
             }
 
-            // Cursor metadata, when the session asked for client-side cursor.
-            // KWin writes position on every pointer move and a fresh bitmap only
-            // when the shape changes (`spa_meta_bitmap` present but zero-sized
-            // means "same shape as last time"), so the bitmap is cached by id
-            // rather than resent per frame.
-            {
-                // Report presence/absence once, not just successful reads --
-                // Milestone 7's `SPA_META_Header` check looked like it was
-                // "not firing" for the same reason it was actually absent, and
-                // the difference matters: absent means this whole design is
-                // dead, invalid-but-present just means the pointer is on
-                // another output right now.
-                let mut stats = user_data.stats.borrow_mut();
-                if !stats.logged_cursor_meta {
-                    stats.logged_cursor_meta = true;
-                    match buffer.find_meta::<pw::spa::buffer::meta::MetaCursor>() {
-                        Some(c) => eprintln!(
-                            "[cursor] SPA_META_Cursor present (id={}, valid={}) -- client-side cursor is viable",
-                            c.id(),
-                            c.is_valid()
-                        ),
-                        None => eprintln!(
-                            "[cursor] SPA_META_Cursor ABSENT from buffers -- this producer does not \
-                             supply cursor metadata, client-side cursor is not possible this way"
-                        ),
-                    }
-                }
-            }
-            if let Some(cur) = buffer.find_meta::<pw::spa::buffer::meta::MetaCursor>() {
-                if cur.is_valid() {
+            // Cursor forwarding, client-side mode only.
+            //
+            // A pointer move on its own does not produce a video frame in this
+            // mode (that is the point -- under CursorMode::Embedded KWin ORs
+            // Content::Video in unconditionally and re-composites the whole
+            // output for every pixel of pointer motion), so this message is
+            // what makes the pointer move on the tablet at all.
+            if user_data.cursor == CursorRendering::ClientSide {
+                if let Some(cur) = buffer.find_meta::<pw::spa::buffer::meta::MetaCursor>() {
+                    let visible = cur.is_valid();
                     let pos = cur.position();
-                    let hot = cur.hotspot();
-                    let bitmap = cur.bitmap().filter(|b| b.is_valid()).map(|b| {
-                        let size = b.size();
-                        (b.format(), size.width, size.height, b.stride())
-                    });
+                    // A bitmap is present only when the shape actually changed;
+                    // otherwise the region is left empty and the client reuses
+                    // the last shape it was sent.
+                    let bitmap = cur
+                        .bitmap()
+                        .filter(|b| b.is_valid() && b.size().width > 0 && b.size().height > 0)
+                        .and_then(|b| {
+                            let size = b.size();
+                            let hotspot = cur.hotspot();
+                            b.bitmap_data().map(|pixels| crate::protocol::CursorBitmap {
+                                width: size.width,
+                                height: size.height,
+                                hotspot_x: hotspot.x,
+                                hotspot_y: hotspot.y,
+                                pixels,
+                                stride: b.stride() as usize,
+                            })
+                        });
+                    if bitmap.is_some() {
+                        user_data.last_cursor_id = Some(cur.id());
+                    }
+                    let update = crate::protocol::CursorUpdate {
+                        x: pos.x,
+                        y: pos.y,
+                        visible,
+                        bitmap,
+                    };
+                    let msg = crate::protocol::encode_message(
+                        crate::protocol::MSG_CURSOR,
+                        crate::clock_sync::now_millis(),
+                        &crate::protocol::encode_cursor(&update),
+                    );
+                    if let Some(sock) = user_data.transport.borrow_mut().as_mut() {
+                        if let Err(e) = sock.write_all(&msg) {
+                            eprintln!("[transport] cursor write failed ({e}), exiting so systemd can retry");
+                            std::process::exit(1);
+                        }
+                    }
                     let mut stats = user_data.stats.borrow_mut();
                     stats.cursor_meta_samples += 1;
-                    if stats.cursor_meta_samples == 1 || stats.cursor_meta_samples % 60 == 0 {
+                    if stats.cursor_meta_samples == 1 || stats.cursor_meta_samples % 300 == 0 {
                         eprintln!(
-                            "[cursor] id={} pos=({},{}) hotspot=({},{}) bitmap={bitmap:?} (sample {})",
-                            cur.id(), pos.x, pos.y, hot.x, hot.y, stats.cursor_meta_samples
+                            "[cursor] id={} pos=({},{}) visible={visible} (sent {} updates)",
+                            cur.id(), pos.x, pos.y, stats.cursor_meta_samples
+                        );
+                    }
+                } else {
+                    let mut stats = user_data.stats.borrow_mut();
+                    if !stats.logged_cursor_meta {
+                        stats.logged_cursor_meta = true;
+                        eprintln!(
+                            "[cursor] client-side cursor requested but SPA_META_Cursor is absent \
+                             from buffers -- the pointer will not appear on the tablet"
                         );
                     }
                 }
             }
 
-            let datas = buffer.datas_mut();
-            if datas.is_empty() {
-                return;
-            }
-            {
-                // One line, once, saying which memory path this session
-                // actually negotiated. The whole point of the DMA-BUF work is
-                // to move this from MemFd/MemPtr to DmaBuf, and without it the
-                // only symptom of falling back is "capture latency didn't
-                // improve", which is exactly the kind of silent regression
-                // this project keeps having to re-diagnose.
-                let mut stats = user_data.stats.borrow_mut();
-                if !stats.logged_buffer_type {
-                    stats.logged_buffer_type = true;
-                    eprintln!(
-                        "[pipewire] buffer data type: {:?} ({} plane(s))",
-                        datas[0].type_(),
-                        datas.len()
-                    );
-                }
-            }
             // Diagnostic for "is our own processing what caps the delivered
             // frame rate?". KWin's `record()` dequeues a pool buffer and, if
             // the 2-4 buffer pool is exhausted, simply returns with no retry
@@ -845,6 +869,13 @@ pub fn run_capture(
                 return;
             }
 
+            // Taken after the cursor block above, not before: `datas_mut()`
+            // borrows the buffer mutably, which rules out reading any metadata
+            // off it afterwards.
+            let datas = buffer.datas_mut();
+            if datas.is_empty() {
+                return;
+            }
             let is_dmabuf = datas[0].type_() == pw::spa::buffer::DataType::DmaBuf;
             let stride = datas[0].chunk().stride() as usize;
 
@@ -1025,10 +1056,11 @@ pub fn run_capture(
                 // zero-length payload -- keeping the framing uniform means the
                 // client's read loop has no special case before it knows the
                 // length.
-                let mut hb = Vec::with_capacity(13);
-                hb.extend_from_slice(&crate::clock_sync::now_millis().to_be_bytes());
-                hb.extend_from_slice(&0u32.to_be_bytes());
-                hb.push(0); // not a keyframe; no payload at all
+                let hb = crate::protocol::encode_message(
+                    crate::protocol::MSG_HEARTBEAT,
+                    crate::clock_sync::now_millis(),
+                    &[],
+                );
                 if let Err(e) = sock.write_all(&hb) {
                     eprintln!("[transport] heartbeat write failed ({e}), exiting so systemd can retry");
                     std::process::exit(1);

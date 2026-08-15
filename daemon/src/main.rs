@@ -5,6 +5,7 @@ mod h264_headers;
 mod input_receiver;
 mod orientation;
 mod portal_capture;
+mod protocol;
 mod remote_desktop_input;
 mod uinput_tablet;
 mod vaapi_encoder;
@@ -60,16 +61,6 @@ async fn main() {
     // either one starts, not worked around after the fact.
     let use_uinput = uinput_tablet::uinput_accessible();
 
-    // Client-side cursor: KWin ships pointer position/bitmap as metadata instead
-    // of compositing it into every frame. Env var for now -- this becomes a real
-    // setting sent up in the client's handshake.
-    let cursor = if std::env::var("QUILL_CURSOR").as_deref() == Ok("client") {
-        eprintln!("[portal] cursor: client-side (CursorMode::Metadata)");
-        portal_capture::CursorRendering::ClientSide
-    } else {
-        portal_capture::CursorRendering::Embedded
-    };
-
     // Connects the transport and blocks for the tablet's capability
     // handshake *before* any portal call (Milestone 15): the virtual
     // monitor's rotation needs to match the tablet's aspect before the
@@ -83,15 +74,40 @@ async fn main() {
     let transport_setup =
         portal_capture::setup_transport(transport_config, if use_uinput { None } else { Some(remote_input_rx) });
 
+    // Cursor rendering is the client's choice, carried in the handshake, which
+    // is why the transport is brought up before any portal call (Milestone 15
+    // established that ordering for the orientation logic). `QUILL_CURSOR`
+    // still overrides, for capture-only runs where there is no client at all.
+    let cursor = match (
+        std::env::var("QUILL_CURSOR").as_deref(),
+        transport_setup.as_ref(),
+    ) {
+        (Ok("client"), _) => portal_capture::CursorRendering::ClientSide,
+        (Ok("embedded"), _) => portal_capture::CursorRendering::Embedded,
+        (_, Some((_, info)))
+            if info.config_flags & protocol::CONFIG_CLIENT_SIDE_CURSOR != 0 =>
+        {
+            portal_capture::CursorRendering::ClientSide
+        }
+        _ => portal_capture::CursorRendering::Embedded,
+    };
+    eprintln!(
+        "[portal] cursor rendering: {}",
+        match cursor {
+            portal_capture::CursorRendering::ClientSide => "client-side (CursorMode::Metadata)",
+            portal_capture::CursorRendering::Embedded => "embedded in video",
+        }
+    );
+
     // Portrait needs a 180-degree flip on this machine (USB cable position)
     // -- applied GPU-side by the encoder and mirrored in the uinput touch
     // mapping (see vaapi_encoder.rs / input_receiver.rs), not via KWin
     // rotation, which Milestone 16 found has no effect on this output type
     // at all.
-    let flip_180 = transport_setup.as_ref().is_some_and(|(_, w, h)| h > w);
+    let flip_180 = transport_setup.as_ref().is_some_and(|(_, i)| i.height > i.width);
 
-    if let Some((_, width, height)) = &transport_setup {
-        orientation::ensure(*width, *height);
+    if let Some((_, info)) = &transport_setup {
+        orientation::ensure(info.width, info.height);
     }
 
     let (stream, fd) = if use_uinput {
@@ -118,9 +134,9 @@ async fn main() {
         stream.position()
     );
 
-    let transport = transport_setup.map(|(writer, _, _)| writer);
+    let transport = transport_setup.map(|(writer, _)| writer);
     let stats =
-        portal_capture::run_capture(node_id, fd, &out_path, transport, flip_180).expect("capture failed");
+        portal_capture::run_capture(node_id, fd, &out_path, transport, flip_180, cursor).expect("capture failed");
 
     if stats.frame_count == 0 {
         println!("No frames captured.");

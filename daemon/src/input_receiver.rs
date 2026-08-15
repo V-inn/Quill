@@ -59,18 +59,79 @@ fn read_u8(r: &mut impl Read) -> io::Result<u8> {
     Ok(b[0])
 }
 
-struct Handshake {
-    width: u32,
-    height: u32,
-    pressure_min: i32,
-    pressure_max: i32,
-    tilt_min: i32,
-    tilt_max: i32,
-    android_send_ms: i64,
+/// What the main thread needs out of the handshake: the clock-calibration
+/// timestamps, the geometry that drives `orientation::ensure`, and the client's
+/// config choices. Sent over a channel because the handshake is read on the
+/// input thread but acted on by `main`.
+pub struct HandshakeInfo {
+    pub android_send_ms: i64,
+    pub daemon_recv_ms: i64,
+    pub width: u32,
+    pub height: u32,
+    pub config_flags: u8,
 }
 
+pub struct Handshake {
+    pub width: u32,
+    pub height: u32,
+    pub pressure_min: i32,
+    pub pressure_max: i32,
+    pub tilt_min: i32,
+    pub tilt_max: i32,
+    pub android_send_ms: i64,
+    pub config_flags: u8,
+}
+
+fn read_u16(r: &mut impl Read) -> io::Result<u16> {
+    let mut b = [0u8; 2];
+    r.read_exact(&mut b)?;
+    Ok(u16::from_be_bytes(b))
+}
+
+/// Reads the v2 handshake (see `protocol.rs`).
+///
+/// The magic and version are checked before anything is believed. v1 had no
+/// such marker, so a desynced or foreign peer produced a plausible-looking
+/// screen size that then drove `kscreen-doctor` and `uinput` -- the bounds
+/// check below was added in Milestone 13 precisely because garbage got that
+/// far. It stays as a second line of defence, but the magic is the real one.
+///
+/// Trailing bytes beyond the fields understood here are skipped using
+/// `body_len`, so a newer client that appends config fields still talks to an
+/// older daemon.
 fn read_handshake(r: &mut impl Read) -> io::Result<Handshake> {
-    Ok(Handshake {
+    let magic = read_u32(r)?;
+    if magic != crate::protocol::MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "handshake magic was {magic:#010x}, expected {:#010x} -- either a stale/desynced \
+                 connection or a client that predates protocol v2",
+                crate::protocol::MAGIC
+            ),
+        ));
+    }
+    let version = read_u16(r)?;
+    if version != crate::protocol::PROTOCOL_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "client speaks protocol v{version}, this daemon speaks v{} -- update whichever is older",
+                crate::protocol::PROTOCOL_VERSION
+            ),
+        ));
+    }
+    let body_len = read_u16(r)? as usize;
+
+    const KNOWN_BODY: usize = 4 + 4 + 4 + 4 + 4 + 4 + 8 + 1;
+    if body_len < KNOWN_BODY {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("handshake body is {body_len} bytes, need at least {KNOWN_BODY}"),
+        ));
+    }
+
+    let handshake = Handshake {
         width: read_u32(r)?,
         height: read_u32(r)?,
         pressure_min: read_i32(r)?,
@@ -78,7 +139,16 @@ fn read_handshake(r: &mut impl Read) -> io::Result<Handshake> {
         tilt_min: read_i32(r)?,
         tilt_max: read_i32(r)?,
         android_send_ms: read_i64(r)?,
-    })
+        config_flags: read_u8(r)?,
+    };
+
+    // Fields this build doesn't know about yet.
+    let mut skip = vec![0u8; body_len - KNOWN_BODY];
+    if !skip.is_empty() {
+        r.read_exact(&mut skip)?;
+        eprintln!("[input] skipped {} trailing handshake byte(s) from a newer client", skip.len());
+    }
+    Ok(handshake)
 }
 
 const EV_HOVER_ENTER: u8 = 0;
@@ -94,7 +164,7 @@ const EV_BUTTON_UP: u8 = 7;
 /// reported ranges, then loops injecting input events until the stream
 /// closes. Meant to run on its own thread.
 ///
-/// `clock_tx`: sends `(android_send_ms, daemon_recv_ms, width, height)` the
+/// `clock_tx`: sends a `HandshakeInfo` the
 /// instant the handshake is read, so the main thread (which owns the
 /// video-writing half of the socket) can complete Milestone 7's clock-offset
 /// calibration handshake -- see `clock_sync.rs` -- and, separately, rotate
@@ -114,7 +184,7 @@ const EV_BUTTON_UP: u8 = 7;
 /// anyway.
 pub fn run(
     mut stream: TransportReader,
-    clock_tx: Sender<(i64, i64, u32, u32)>,
+    clock_tx: Sender<HandshakeInfo>,
     remote_input_rx: Option<Receiver<RemoteDesktopInput>>,
 ) {
     let handshake = match read_handshake(&mut stream) {
@@ -149,7 +219,13 @@ pub fn run(
     }
 
     let daemon_recv_ms = crate::clock_sync::now_millis();
-    let _ = clock_tx.send((handshake.android_send_ms, daemon_recv_ms, handshake.width, handshake.height));
+    let _ = clock_tx.send(HandshakeInfo {
+        android_send_ms: handshake.android_send_ms,
+        daemon_recv_ms,
+        width: handshake.width,
+        height: handshake.height,
+        config_flags: handshake.config_flags,
+    });
     eprintln!(
         "[input] handshake: {}x{} px, pressure {}..{}, tilt {}..{} deg",
         handshake.width,

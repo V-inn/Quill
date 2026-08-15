@@ -1996,3 +1996,100 @@ Worth stating plainly: this shipped in the previous commit and could not have
 been caught without hardware. Capture-only runs looked perfectly healthy, because
 nothing was reading the stream.
 
+
+## 19. Config screen, protocol v2, and client-side cursor -- which turns out not
+## to work on a KWin virtual output
+
+User asked for a settings screen on either side, with client-side cursor as one
+of the options. Built on the Android side: the daemon is headless and
+systemd-launched, so a settings UI there would mean a whole toolkit for one
+dialog, the tablet is where the user physically is, and the Android->daemon
+handshake already exists to carry the values.
+
+### Protocol v2, because the old framing had cost enough already
+
+v1 was three framings sharing one connection: a fixed 32-byte handshake up, then
+down an unframed 24-byte clock-sync reply, an unframed 8-byte video-format
+header, and only then length-prefixed frames. Nothing on the wire said which was
+which, so any disagreement about bytes consumed was permanent and silent. That
+is Milestones 8, 13, 14, 17, and again in 18 when a second video-format header
+slipped in. Adding cursor messages to that would have been asking for a sixth.
+
+v2 (`daemon/src/protocol.rs`, mirrored in `MainActivity.kt`):
+
+- Handshake carries `MAGIC` (`"QUIL"`) and a version, checked before anything is
+  believed. A stale peer is now diagnosed rather than interpreted as a screen
+  size and acted on -- v1's Milestone 13 bounds check exists precisely because
+  garbage reached `kscreen-doctor`.
+- Handshake body is length-prefixed, so fields can be appended without breaking
+  an older peer; it reads what it knows and skips the rest.
+- **Every** downstream byte is a typed, length-prefixed message (`MSG_VIDEO`,
+  `MSG_CURSOR`, `MSG_HEARTBEAT`, `MSG_CLOCK_SYNC`, `MSG_VIDEO_FORMAT`). The
+  client's read loop is uniform from the first byte; there are no pre-loop reads
+  left to fall out of step with.
+
+Verified on hardware before changing cursor behaviour: avg 30ms, `pending` 0-1,
+`clock-sync offset=598ms round-trip sum=23ms`. No regression.
+
+### Settings screen
+
+`SettingsActivity` + `Settings` (SharedPreferences), reached by tapping the
+status overlay -- the app runs edge-to-edge immersive with no system chrome to
+hang a menu off. Values go up in the handshake's `config_flags`. Everything
+applies at connect time, not live, and the UI says so: cursor mode decides which
+kind of portal session the daemon opens, and Milestone 13's lesson was that
+reconfiguring an already-open portal/PipeWire session is the part that breaks.
+
+Each cursor mode also gets its own portal restore token file, since a token is
+bound to the session it was issued for; sharing one would make every toggle look
+like a rejected token and pop the picker at someone who may not be at the
+keyboard.
+
+### The cursor metadata itself: two omissions, then a wall
+
+First omission, ours: `CursorMode::Metadata` on the portal does nothing on its
+own. PipeWire only attaches a metadata region the *consumer* declared via
+`SPA_PARAM_Meta`, so `find_meta::<MetaCursor>()` returned `None` on every buffer
+and the probe reported the meta simply absent. Requesting it -- after format
+negotiation, since buffers are allocated then -- made it appear immediately.
+Same shape as the DMA-BUF gap in Milestone 18: the compositor was willing, we had
+never asked. That is now three findings of one shape in two days.
+
+With that fixed the whole path worked: position, hotspot, and an RGBA 48x48
+bitmap on shape change only, forwarded as `MSG_CURSOR`, drawn by a `CursorOverlay`
+view above the `SurfaceView`.
+
+**And then the wall. KWin composites the cursor into the video anyway, so
+enabling this gives you two pointers.** User reported it immediately: "the cursor
+appears to be leaving a single cursor as a trail behind it from the frame
+before". Exactly one stale pointer, not an accumulating trail -- which pointed at
+the video containing one rather than at an overlay bug.
+
+Confirmed from the pixels, not inferred. Recorded 900 frames in metadata mode
+with `QUILL_DUMP_H264`, extracted the frames at two different logged cursor
+positions, and found the pointer bitmap present at both, tracking the metadata.
+(The scene was GIMP, which draws its own crosshair, so a single frame would have
+been ambiguous -- two frames at two positions were not.)
+
+Mechanism: a DRM output keeps the cursor on a hardware plane, out of the primary
+framebuffer, which is what `setRenderCursor(false)` has to suppress. A virtual
+output has no cursor plane, so KWin composites a software cursor straight into
+the framebuffer the screencast captures. `Metadata` mode therefore supplies
+cursor data *in addition to* the embedded cursor, not instead of it. Directly
+analogous to Milestone 16's finding that KWin's rotation property has no effect
+on what this output type exports.
+
+**And the payoff was small regardless.** User's own comparison: the
+tablet-drawn pointer ran "5 to 10 ms maximum" ahead of the content behind it.
+After Milestone 18 the video is fast enough that skipping decode buys very
+little.
+
+Kept the toggle, defaulted off, and labelled it honestly in the UI -- including
+the two-pointer issue and the measured 5-10ms -- rather than shipping a setting
+that quietly makes things worse. Other compositors, or a real DRM output, may
+behave differently, and the daemon and protocol support is now in place if so.
+
+**Also still true:** this does nothing for pen *ink* either way. Ink is drawn by
+the host application and returns through the video path regardless. For a
+drawing tablet that is the number that matters, which makes Milestone 18's
+34ms decoder win the one that actually helps.

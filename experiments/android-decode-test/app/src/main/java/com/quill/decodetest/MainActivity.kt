@@ -71,6 +71,9 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     // no indication anything is wrong.
     private lateinit var statusText: TextView
 
+    /** Only used in client-side cursor mode; otherwise stays empty and hidden. */
+    private lateinit var cursorOverlay: CursorOverlay
+
     @Volatile
     private var output: DataOutputStream? = null
 
@@ -106,15 +109,24 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             gravity = android.view.Gravity.CENTER
             setPadding(48, 48, 48, 48)
         }
+        cursorOverlay = CursorOverlay(this)
         val root = FrameLayout(this).apply {
             addView(surfaceView, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+            // Above the video, below the status text.
+            addView(cursorOverlay, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
             addView(
                 statusText,
                 FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, android.view.Gravity.CENTER)
             )
         }
         setContentView(root)
-        showStatus("Waiting for connection...")
+        // The app runs edge-to-edge immersive with no system chrome, so the
+        // status overlay doubles as the way into settings -- there is nowhere
+        // else to hang a menu.
+        statusText.setOnClickListener {
+            startActivity(Intent(this, SettingsActivity::class.java))
+        }
+        showStatus("Waiting for connection...\n(tap here for settings)")
         surfaceView.holder.addCallback(this)
         surfaceView.setOnTouchListener { _, event -> handleMotionEvent(event, down = true) }
         surfaceView.setOnHoverListener { _, event -> handleMotionEvent(event, down = false) }
@@ -420,15 +432,29 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 "pressure $pMin..$pMax, tilt -$tMaxDeg..$tMaxDeg (stylus device: ${stylusDevice?.name})"
         )
 
-        out.writeInt(widthPx)
-        out.writeInt(heightPx)
-        out.writeInt(pMin)
-        out.writeInt(pMax)
-        out.writeInt(-tMaxDeg)
-        out.writeInt(tMaxDeg)
-        // Milestone 7 clock-sync ping -- see clock_sync.rs on the daemon
-        // side for the two-message offset calibration this kicks off.
-        out.writeLong(System.currentTimeMillis())
+        // Protocol v2 (see protocol.rs). The magic and version let the daemon
+        // reject a stale or mismatched peer outright instead of interpreting
+        // whatever bytes arrive as a screen size and acting on them -- which is
+        // what v1 did, repeatedly and expensively.
+        val body = java.io.ByteArrayOutputStream()
+        DataOutputStream(body).apply {
+            writeInt(widthPx)
+            writeInt(heightPx)
+            writeInt(pMin)
+            writeInt(pMax)
+            writeInt(-tMaxDeg)
+            writeInt(tMaxDeg)
+            // Milestone 7 clock-sync ping -- see clock_sync.rs on the daemon
+            // side for the two-message offset calibration this kicks off.
+            writeLong(System.currentTimeMillis())
+            writeByte(Settings(this@MainActivity).configFlags())
+        }
+        val bodyBytes = body.toByteArray()
+
+        out.writeInt(PROTOCOL_MAGIC)
+        out.writeShort(PROTOCOL_VERSION)
+        out.writeShort(bodyBytes.size)
+        out.write(bodyBytes)
         out.flush()
     }
 
@@ -502,16 +528,76 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     }
 
     /**
-     * Reads the daemon's clock-sync reply (sent once, before any video
-     * frame) and computes the android-clock-minus-daemon-clock offset via
-     * the standard NTP two-message estimate -- see clock_sync.rs for the
-     * derivation. Assumes symmetric one-way transport delay, reasonable for
-     * a single local adb-forward/USB link.
+     * Applies a cursor message (see `protocol.rs` for the payload layout).
+     *
+     * A bitmap is only present when the shape actually changed; the overlay
+     * keeps drawing the last one it was given until then, which is why this can
+     * pass `null` through without clearing anything.
+     */
+    private fun applyCursorUpdate(payload: ByteArray) {
+        val b = java.io.DataInputStream(payload.inputStream())
+        val x = b.readInt()
+        val y = b.readInt()
+        val visible = b.readByte().toInt() != 0
+        val hasBitmap = b.readByte().toInt() != 0
+        var bitmap: android.graphics.Bitmap? = null
+        var hotX = 0
+        var hotY = 0
+        if (hasBitmap) {
+            val w = b.readInt()
+            val h = b.readInt()
+            hotX = b.readInt()
+            hotY = b.readInt()
+            val pixels = ByteArray(w * h * 4)
+            b.readFully(pixels)
+            // Tightly packed RGBA from the daemon (it repacks away the
+            // producer's stride), which is exactly ARGB_8888's byte order on a
+            // little-endian device once wrapped.
+            bitmap = android.graphics.Bitmap.createBitmap(w, h, android.graphics.Bitmap.Config.ARGB_8888)
+            bitmap.copyPixelsFromBuffer(java.nio.ByteBuffer.wrap(pixels))
+        }
+        cursorOverlay.update(x, y, visible, bitmap, hotX, hotY)
+    }
+
+    /** One downstream message: type, daemon send time, and payload. */
+    private class Message(val type: Int, val sentAtMs: Long, val payload: ByteArray)
+
+    /**
+     * Reads exactly one message. Protocol v2 makes *every* downstream byte part
+     * of a typed, length-prefixed message, so this is the only read the loop
+     * ever performs -- there are no pre-loop reads left to fall out of step
+     * with, which is the entire class of bug that cost Milestones 8, 13, 14, 17
+     * and 18.
+     */
+    private fun readMessage(input: BufferedAccessoryInput): Message {
+        val type = input.readExact(1)[0].toInt() and 0xFF
+        val sentAtMs = input.readLong()
+        val length = input.readInt()
+        if (length < 0 || length > 16 * 1024 * 1024) {
+            throw java.io.IOException("bogus payload length \$length for message type \$type")
+        }
+        return Message(type, sentAtMs, if (length == 0) ByteArray(0) else input.readExact(length))
+    }
+
+    private fun expect(input: BufferedAccessoryInput, type: Int): Message {
+        val m = readMessage(input)
+        if (m.type != type) {
+            throw java.io.IOException("expected message type \$type, got \${m.type}")
+        }
+        return m
+    }
+
+    /**
+     * Computes the android-clock-minus-daemon-clock offset via the standard NTP
+     * two-message estimate -- see clock_sync.rs for the derivation. Assumes
+     * symmetric one-way transport delay, reasonable for a single local
+     * adb-forward/USB link.
      */
     private fun readClockOffset(input: BufferedAccessoryInput): Long {
-        val daemonSendMs = input.readLong()
-        val androidSendEchoMs = input.readLong()
-        val daemonRecvMs = input.readLong()
+        val b = java.io.DataInputStream(expect(input, MSG_CLOCK_SYNC).payload.inputStream())
+        val daemonSendMs = b.readLong()
+        val androidSendEchoMs = b.readLong()
+        val daemonRecvMs = b.readLong()
         val androidRecvMs = System.currentTimeMillis()
         val offset = ((androidRecvMs - daemonSendMs) - (daemonRecvMs - androidSendEchoMs)) / 2
         val roundTripSum = (daemonRecvMs - androidSendEchoMs) + (androidRecvMs - daemonSendMs)
@@ -525,8 +611,9 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
      * `param_changed` handler). Not a fixed constant: the host's virtual
      * monitor size isn't under this app's control and shouldn't be assumed. */
     private fun readVideoFormat(input: BufferedAccessoryInput): Pair<Int, Int> {
-        val videoWidth = input.readInt()
-        val videoHeight = input.readInt()
+        val b = java.io.DataInputStream(expect(input, MSG_VIDEO_FORMAT).payload.inputStream())
+        val videoWidth = b.readInt()
+        val videoHeight = b.readInt()
         Log.i(tag, "video format: ${videoWidth}x${videoHeight}")
         return videoWidth to videoHeight
     }
@@ -627,6 +714,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 sendHandshake(out)
                 val clockOffsetMs = readClockOffset(input)
                 val (width, height) = readVideoFormat(input)
+                runOnUiThread { cursorOverlay.setVideoSize(width, height) }
                 lastDataAtMs.set(System.currentTimeMillis())
                 inputWriterThread = Thread { runInputWriterLoop(out) }.also { it.start() }
 
@@ -817,32 +905,38 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 try {
                     var presentationTimeUs = 0L
                     while (running) {
-                        val frameSentAtMs = try {
-                            input.readLong()
+                        val msg = try {
+                            readMessage(input)
                         } catch (e: Exception) {
                             Log.i(tag, "stream ended: ${e.message}")
                             break
                         }
-                        val length = input.readInt()
-                        if (length > 16 * 1024 * 1024) {
-                            Log.w(tag, "bogus frame length $length, stopping")
-                            break
-                        }
-                        // Frame header carries an explicit keyframe flag as of
-                        // the GOP change (portal_capture.rs). Before that every
-                        // frame really was an IDR and this side hardcoded
-                        // BUFFER_FLAG_KEY_FRAME; since the GOP landed that has
-                        // been a lie on every P frame.
-                        val isKeyFrame = input.readExact(1)[0].toInt() != 0
                         lastDataAtMs.set(System.currentTimeMillis())
-                        if (length == 0) {
+                        when (msg.type) {
                             // Heartbeat (portal_capture.rs's run_capture, ~800ms
-                            // interval) -- no payload, just proof the daemon is
-                            // still alive during a legitimately idle screen (no
-                            // motion = no new video frames at all, expected).
-                            continue
+                            // interval) -- proof the daemon is alive during a
+                            // legitimately idle screen, which produces no video
+                            // frames at all. Nothing to do but reset the
+                            // watchdog, which the line above already did.
+                            MSG_HEARTBEAT -> continue
+                            MSG_CURSOR -> {
+                                applyCursorUpdate(msg.payload)
+                                continue
+                            }
+                            MSG_VIDEO -> {}
+                            else -> {
+                                Log.w(tag, "ignoring unknown message type ${msg.type}")
+                                continue
+                            }
                         }
-                        val frameBytes = input.readExact(length)
+                        // Video payload: keyframe flag then the access unit. The
+                        // flag matters since Milestone 17 added a real GOP --
+                        // before that every frame was an IDR and this side
+                        // hardcoded BUFFER_FLAG_KEY_FRAME, which has been a lie
+                        // on every P frame since.
+                        val frameSentAtMs = msg.sentAtMs
+                        val isKeyFrame = msg.payload[0].toInt() != 0
+                        val frameBytes = msg.payload.copyOfRange(1, msg.payload.size)
 
                         // Never drop a frame here. This used to log a warning
                         // and discard the frame it had already read off the
@@ -880,6 +974,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         } catch (e: Exception) {
             Log.e(tag, "decode loop error", e)
         } finally {
+            cursorOverlay.clear()
             watchdogRunning.set(false)
             watchdogThread.interrupt()
             codec?.stop()
@@ -891,6 +986,15 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     }
 
     companion object {
+        // Mirrors daemon/src/protocol.rs. Must change together.
+        const val PROTOCOL_MAGIC = 0x5155494C // "QUIL"
+        const val PROTOCOL_VERSION = 2
+        const val MSG_VIDEO = 0
+        const val MSG_CURSOR = 1
+        const val MSG_HEARTBEAT = 2
+        const val MSG_CLOCK_SYNC = 3
+        const val MSG_VIDEO_FORMAT = 4
+
         private const val EV_HOVER_ENTER = 0
         private const val EV_HOVER_MOVE = 1
         private const val EV_HOVER_EXIT = 2

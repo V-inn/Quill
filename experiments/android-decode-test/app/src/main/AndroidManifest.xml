@@ -28,5 +28,12 @@
                 android:name="android.hardware.usb.action.USB_ACCESSORY_ATTACHED"
                 android:resource="@xml/accessory_filter" />
         </activity>
+        <!-- Reached by tapping the status overlay; the main activity runs
+             edge-to-edge immersive with no system chrome to hang a menu off. -->
+        <activity
+            android:name=".SettingsActivity"
+            android:exported="false"
+            android:label="Quill settings"
+            android:theme="@android:style/Theme.Black" />
     </application>
 </manifest>
