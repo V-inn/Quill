@@ -51,6 +51,8 @@ pub struct CaptureStats {
     pub encode_ms_sum: f64,
     pub convert_encode_samples: u64,
     pub logged_buffer_type: bool,
+    pub cursor_meta_samples: u64,
+    pub logged_cursor_meta: bool,
 }
 
 /// Decodes the 48-bit CLOCK_MONOTONIC barcode painted by
@@ -167,12 +169,65 @@ fn build_format_pod(dmabuf: bool) -> Vec<u8> {
     .into_inner()
 }
 
+/// Asks PipeWire to allocate a `SPA_META_Cursor` region on every buffer.
+///
+/// Metadata is opt-in: the producer only attaches a meta the consumer declared
+/// via `SPA_PARAM_Meta`, so `CursorMode::Metadata` on the portal side is only
+/// half of it -- without this the buffers simply have no cursor region and
+/// `find_meta::<MetaCursor>()` returns `None` forever. Exactly the same shape as
+/// the DMA-BUF gap: KWin was willing, we never asked.
+///
+/// `size` has to cover the fixed `spa_meta_cursor` header, the `spa_meta_bitmap`
+/// that follows it, and the pixels themselves. 256x256 is the largest cursor
+/// KWin will hand out.
+fn build_cursor_meta_pod() -> Vec<u8> {
+    use pw::spa::pod::{Property, PropertyFlags, Value};
+
+    const MAX_CURSOR_DIM: u32 = 256;
+    let size = std::mem::size_of::<pw::spa::sys::spa_meta_cursor>() as u32
+        + std::mem::size_of::<pw::spa::sys::spa_meta_bitmap>() as u32
+        + MAX_CURSOR_DIM * MAX_CURSOR_DIM * 4;
+
+    let obj = pw::spa::pod::Object {
+        type_: pw::spa::utils::SpaTypes::ObjectParamMeta.as_raw(),
+        id: pw::spa::param::ParamType::Meta.as_raw(),
+        properties: vec![
+            Property {
+                key: pw::spa::sys::SPA_PARAM_META_type,
+                flags: PropertyFlags::empty(),
+                value: Value::Id(pw::spa::utils::Id(pw::spa::sys::SPA_META_Cursor)),
+            },
+            Property {
+                key: pw::spa::sys::SPA_PARAM_META_size,
+                flags: PropertyFlags::empty(),
+                value: Value::Int(size as i32),
+            },
+        ],
+    };
+
+    pw::spa::pod::serialize::PodSerializer::serialize(
+        std::io::Cursor::new(Vec::new()),
+        &Value::Object(obj),
+    )
+    .unwrap()
+    .0
+    .into_inner()
+}
+
 /// Where the portal's restore token (see below) is cached between runs.
 /// Plain `$HOME`-relative path rather than pulling in a `dirs` crate for one
 /// file.
-fn restore_token_path() -> std::path::PathBuf {
+/// One token per cursor mode. The portal binds a restore token to the session
+/// it was issued for, cursor mode included, so a single shared file would make
+/// every toggle look like a rejected token and pop the picker dialog at someone
+/// who may not be at the keyboard.
+fn restore_token_path(cursor: CursorRendering) -> std::path::PathBuf {
     let home = std::env::var("HOME").expect("HOME not set");
-    std::path::Path::new(&home).join(".config/quill/portal_restore_token")
+    let name = match cursor {
+        CursorRendering::Embedded => "portal_restore_token",
+        CursorRendering::ClientSide => "portal_restore_token_cursor_metadata",
+    };
+    std::path::Path::new(&home).join(".config/quill").join(name)
 }
 
 /// Negotiates a ScreenCast session via the portal. First run ever (or after
@@ -182,17 +237,41 @@ fn restore_token_path() -> std::path::PathBuf {
 /// token, so the portal skips the dialog entirely -- required for the daemon
 /// to be auto-launched (e.g. from a udev rule) with no one at the keyboard
 /// to click through it.
-pub async fn open_portal() -> ashpd::Result<(PortalStream, OwnedFd)> {
+/// Whether the cursor is composited into the video by KWin, or shipped to the
+/// client as position/bitmap metadata for it to draw itself.
+///
+/// `Embedded` costs a full-output composite on *every* pointer move, whether or
+/// not any window content changed -- KWin's `ScreenCastStream::record()` ORs
+/// `Content::Video` into the work list unconditionally in that mode. `Metadata`
+/// only writes a small `SPA_META_Cursor` record, so pointer motion stops
+/// dragging a whole frame through encode and transport, and the client can draw
+/// the pointer at local latency instead of a full pipeline round trip.
+#[derive(Clone, Copy, PartialEq)]
+pub enum CursorRendering {
+    Embedded,
+    ClientSide,
+}
+
+impl CursorRendering {
+    fn portal_mode(self) -> CursorMode {
+        match self {
+            CursorRendering::Embedded => CursorMode::Embedded,
+            CursorRendering::ClientSide => CursorMode::Metadata,
+        }
+    }
+}
+
+pub async fn open_portal(cursor: CursorRendering) -> ashpd::Result<(PortalStream, OwnedFd)> {
     let proxy = Screencast::new().await?;
     let session = proxy.create_session().await?;
 
-    let token_path = restore_token_path();
+    let token_path = restore_token_path(cursor);
     let saved_token = std::fs::read_to_string(&token_path).ok();
 
     let select_result = proxy
         .select_sources(
             &session,
-            CursorMode::Embedded, // bake the cursor into frames, simplest for v0
+            cursor.portal_mode(),
             SourceType::Monitor.into(),
             false,
             saved_token.as_deref(),
@@ -209,7 +288,7 @@ pub async fn open_portal() -> ashpd::Result<(PortalStream, OwnedFd)> {
         proxy
             .select_sources(
                 &session,
-                CursorMode::Embedded,
+                cursor.portal_mode(),
                 SourceType::Monitor.into(),
                 false,
                 None,
@@ -542,7 +621,7 @@ pub fn run_capture(
         .state_changed(|_, _, old, new| {
             eprintln!("[pipewire] state: {old:?} -> {new:?}");
         })
-        .param_changed(|_, user_data, id, param| {
+        .param_changed(|stream, user_data, id, param| {
             let Some(param) = param else { return };
             if id != pw::spa::param::ParamType::Format.as_raw() {
                 return;
@@ -583,6 +662,16 @@ pub fn run_capture(
                 let encoder = VaapiEncoder::new(width, height, user_data.flip_180)
                     .expect("VAAPI encoder init failed");
                 user_data.encoder = Some(encoder);
+            }
+
+            // Declare the metadata we want on each buffer now that the
+            // format is settled. Has to happen here rather than at connect():
+            // buffers are allocated after format negotiation, so a meta
+            // declared later than this never appears on them.
+            let cursor_meta = build_cursor_meta_pod();
+            let mut meta_params = [Pod::from_bytes(&cursor_meta).unwrap()];
+            if let Err(e) = stream.update_params(&mut meta_params) {
+                eprintln!("[pipewire] failed to request cursor metadata: {e}");
             }
 
             // Milestone 9 follow-up: the video resolution comes from
@@ -673,6 +762,53 @@ pub fn run_capture(
                 }
             } else {
                 eprintln!("[pipewire] buffer has no MetaHeader (no pts available from this producer)");
+            }
+
+            // Cursor metadata, when the session asked for client-side cursor.
+            // KWin writes position on every pointer move and a fresh bitmap only
+            // when the shape changes (`spa_meta_bitmap` present but zero-sized
+            // means "same shape as last time"), so the bitmap is cached by id
+            // rather than resent per frame.
+            {
+                // Report presence/absence once, not just successful reads --
+                // Milestone 7's `SPA_META_Header` check looked like it was
+                // "not firing" for the same reason it was actually absent, and
+                // the difference matters: absent means this whole design is
+                // dead, invalid-but-present just means the pointer is on
+                // another output right now.
+                let mut stats = user_data.stats.borrow_mut();
+                if !stats.logged_cursor_meta {
+                    stats.logged_cursor_meta = true;
+                    match buffer.find_meta::<pw::spa::buffer::meta::MetaCursor>() {
+                        Some(c) => eprintln!(
+                            "[cursor] SPA_META_Cursor present (id={}, valid={}) -- client-side cursor is viable",
+                            c.id(),
+                            c.is_valid()
+                        ),
+                        None => eprintln!(
+                            "[cursor] SPA_META_Cursor ABSENT from buffers -- this producer does not \
+                             supply cursor metadata, client-side cursor is not possible this way"
+                        ),
+                    }
+                }
+            }
+            if let Some(cur) = buffer.find_meta::<pw::spa::buffer::meta::MetaCursor>() {
+                if cur.is_valid() {
+                    let pos = cur.position();
+                    let hot = cur.hotspot();
+                    let bitmap = cur.bitmap().filter(|b| b.is_valid()).map(|b| {
+                        let size = b.size();
+                        (b.format(), size.width, size.height, b.stride())
+                    });
+                    let mut stats = user_data.stats.borrow_mut();
+                    stats.cursor_meta_samples += 1;
+                    if stats.cursor_meta_samples == 1 || stats.cursor_meta_samples % 60 == 0 {
+                        eprintln!(
+                            "[cursor] id={} pos=({},{}) hotspot=({},{}) bitmap={bitmap:?} (sample {})",
+                            cur.id(), pos.x, pos.y, hot.x, hot.y, stats.cursor_meta_samples
+                        );
+                    }
+                }
             }
 
             let datas = buffer.datas_mut();

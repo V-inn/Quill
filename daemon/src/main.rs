@@ -60,6 +60,16 @@ async fn main() {
     // either one starts, not worked around after the fact.
     let use_uinput = uinput_tablet::uinput_accessible();
 
+    // Client-side cursor: KWin ships pointer position/bitmap as metadata instead
+    // of compositing it into every frame. Env var for now -- this becomes a real
+    // setting sent up in the client's handshake.
+    let cursor = if std::env::var("QUILL_CURSOR").as_deref() == Ok("client") {
+        eprintln!("[portal] cursor: client-side (CursorMode::Metadata)");
+        portal_capture::CursorRendering::ClientSide
+    } else {
+        portal_capture::CursorRendering::Embedded
+    };
+
     // Connects the transport and blocks for the tablet's capability
     // handshake *before* any portal call (Milestone 15): the virtual
     // monitor's rotation needs to match the tablet's aspect before the
@@ -86,7 +96,7 @@ async fn main() {
 
     let (stream, fd) = if use_uinput {
         eprintln!("Opening portal ScreenCast session -- pick the virtual monitor in the dialog...");
-        portal_capture::open_portal().await.expect("portal negotiation failed")
+        portal_capture::open_portal(cursor).await.expect("portal negotiation failed")
     } else {
         eprintln!(
             "[input] /dev/uinput not accessible (no root-granted permission on this machine) \
