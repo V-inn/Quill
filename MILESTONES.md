@@ -1845,3 +1845,88 @@ existing `QUILL_DUMP_FRAME` convention.
    override after the fact -- must be re-applied after every krfb launch, and
    before the daemon connects, since `screencaststream.cpp` renegotiates on size
    changes only.
+
+### Follow-up same session: the capture segment finally measured, and three
+### hypotheses killed
+
+**The barcode probe works again, and the number in this file was stale.**
+Milestone 7 recorded `xdotool windowmove <win> 1920 0` as the recipe for putting
+the probe on the virtual monitor, with 1920 explained as "eDP-1's physical
+width". That is no longer right and the explanation was never quite the reason.
+`xrandr --listmonitors` gives it directly:
+
+```
+ 0: +*eDP-1 2304/344x1296/194+0+305  eDP-1
+ 1: +Virtual-QuillDisplay 2560/2560x1600/1600+2304+0  Virtual-QuillDisplay
+```
+
+XWayland renders its root in units of the *largest* output scale (1.5 here), so
+eDP-1's 1536x864 logical becomes 2304x1296 and the virtual output starts at
+**2304**, not 1920. At 1920 the probe landed on eDP-1 and the daemon decoded
+nothing -- confirmed by scanning a `QUILL_DUMP_FRAME` dump for any barcode-like
+run pattern anywhere in the frame and finding none. Don't hardcode this
+again: read the offset out of `xrandr --listmonitors`.
+
+**Capture latency, the number DMA-BUF was supposed to move.** Both legs 35s,
+same probe, back to back, first sample dropped as warmup (Milestone 7 saw the
+same one-off, 664ms then; 1240ms now):
+
+| | mean | median | min | max | n |
+|---|---|---|---|---|---|
+| shm (MemFd) | 33.16ms | 34.35ms | 20.69 | 45.54 | 52 |
+| DMA-BUF | **30.59ms** | **31.08ms** | 19.57 | 47.99 | 53 |
+
+To make that honest the timestamp is now sampled at the top of the `process`
+callback rather than at the barcode read: the DMA-BUF path has to map a GPU
+surface before it can read the barcode at all, and charging the zero-copy path
+for its own diagnostic's sync would have faked the comparison.
+
+**~2.6ms.** So removing KWin's `glReadnPixels` was worth real but small time,
+and the ~30ms capture segment is *not* dominated by the readback -- it's
+dominated by compositor scheduling. The going-in estimate for this change was
+10-20ms; it delivered a quarter of that, and the honest read is that the
+zero-copy work paid off mostly as ~0.8ms of encode-side copy plus this ~2.6ms,
+not as the structural win it was scoped as.
+
+**Killed: "our callback hold is what caps us at 45fps".** Added
+`QUILL_NO_ENCODE`, which drops the PipeWire buffer immediately instead of
+holding it across encode -- KWin's `record()` returns with no retry scheduled
+when its 2-4 buffer pool is exhausted, so a long hold silently costs frames, and
+that was a plausible source-grounded explanation. Measured: **45.0fps normal,
+45.2fps with encoding skipped entirely.** Identical. The cap is upstream of this
+daemon, so the planned writer-thread and early-buffer-release work is worth doing
+for jitter but will not buy throughput. Good thing to have checked for the cost
+of one env var rather than after building it.
+
+(That diagnostic also surfaced a latent panic: `main.rs` unwrapped
+`durations.iter().min()` while gating only on `frame_count`, so counting frames
+without encoding any killed the summary right after printing the frame count.
+Guarded.)
+
+**Killed: raising the virtual output above 60Hz via kscreen-doctor, on this
+system.** `kscreen-doctor output.Virtual-QuillDisplay.mode.2560x1600@120` returns
+"Output mode 2560x1600@120 not found", and this build has no `addCustomMode`
+verb at all ("Unable to parse arguments"). KWin does advertise
+`Capability::CustomModes` on virtual outputs and re-derives
+`m_renderLoop->setRefreshRate()` in `applyChanges()`, so the mechanism exists --
+but reaching it means writing an `outputmanagement_v2` Wayland client, which is
+its own project, not a tuning step.
+
+**Where this leaves the capture segment:** ~30ms, with the readback removed and
+the remaining cost sitting in KWin's own render/deliver cadence against a 60Hz
+virtual output. Content on that output can only change once per 16.67ms
+(`RenderLoopPrivate::scheduleRepaint()` quantises to whole vblank intervals;
+`DrmVirtualOutput` drives it from a `SoftwareVsyncMonitor`), so ~30ms is roughly
+two output frames. Getting it down means either a faster virtual output (blocked
+above) or not needing a full frame for the common case -- which is what
+`CursorMode::Metadata` would enable, since under `Embedded` KWin ORs
+`Content::Video` in unconditionally and every pen or cursor move re-composites
+the whole output. That is a real feature (the daemon would have to draw the
+cursor from `SPA_META_Cursor` itself), not a flag flip, and it would make pen
+tracking local rather than round-trip -- the most latency-sensitive thing this
+project does. Flagged as the most promising remaining capture-side lever.
+
+**Daemon-side totals for this session:** capture 33.2 -> 30.6ms, encode
+12.66 -> 9.73ms. ~5.5ms off a ~46ms daemon-side budget. The decode-side change
+(the SPS VUI, worth a predicted 33ms) is still the largest single unverified item
+and needs the tablet.

@@ -117,15 +117,23 @@ async fn main() {
         return;
     }
 
-    let total: std::time::Duration = stats.durations.iter().sum();
-    let avg = total / stats.frame_count as u32;
-    let min = stats.durations.iter().min().unwrap();
-    let max = stats.durations.iter().max().unwrap();
-
     println!("--- summary ---");
     println!("frames captured+encoded: {}", stats.frame_count);
     println!("stale frames dropped: {}", stats.dropped_stale);
-    println!("dequeue->encoded latency: avg={avg:?} min={min:?} max={max:?}");
+    // `durations` is empty whenever frames were counted but never encoded --
+    // reachable via QUILL_NO_ENCODE (see portal_capture.rs), which deliberately
+    // returns before the encoder to measure the capture path's own throughput.
+    // Previously this unwrapped and panicked right after printing the frame
+    // count, losing the rest of the summary.
+    if stats.durations.is_empty() {
+        println!("dequeue->encoded latency: not measured (no frames encoded)");
+    } else {
+        let total: std::time::Duration = stats.durations.iter().sum();
+        let avg = total / stats.durations.len() as u32;
+        let min = stats.durations.iter().min().unwrap();
+        let max = stats.durations.iter().max().unwrap();
+        println!("dequeue->encoded latency: avg={avg:?} min={min:?} max={max:?}");
+    }
     if stats.buffer_age_samples > 0 {
         println!(
             "buffer age (pts->dequeue) avg: {:.2}ms over {} samples",

@@ -246,6 +246,8 @@ struct CaptureData {
     format: spa::param::video::VideoInfoRaw,
     encoder: Option<VaapiEncoder>,
     flip_180: bool,
+    /// `QUILL_NO_ENCODE` -- see the early return in `process`.
+    no_encode: bool,
     /// `None` unless `QUILL_DUMP_H264` is set -- see the write site in
     /// `process` for why this stopped being unconditional.
     out_file: Option<File>,
@@ -369,9 +371,14 @@ pub fn setup_transport(
 /// Shared by both capture paths so the "time from content changing on screen to
 /// the daemon having a buffer for it" number stays directly comparable between
 /// them -- that comparison is the whole point of the DMA-BUF work.
-fn record_capture_latency(stats: &Rc<RefCell<CaptureStats>>, barcode_ns: u64) {
-    let now_ns = crate::clock_sync::monotonic_ns();
-    let latency_ms = (now_ns - barcode_ns as i64) as f64 / 1_000_000.0;
+///
+/// `dequeue_ns` is sampled at the very top of the `process` callback, not here:
+/// the DMA-BUF path has to map a GPU surface before it can read the barcode at
+/// all, and that map forces a sync. Timing from the map would charge the
+/// zero-copy path for a cost that only its own diagnostic incurs and make the
+/// A/B against the shm path meaningless.
+fn record_capture_latency(stats: &Rc<RefCell<CaptureStats>>, barcode_ns: u64, dequeue_ns: i64) {
+    let latency_ms = (dequeue_ns - barcode_ns as i64) as f64 / 1_000_000.0;
     if !(0.0..60_000.0).contains(&latency_ms) {
         return;
     }
@@ -500,6 +507,7 @@ pub fn run_capture(
         format: Default::default(),
         encoder: None,
         flip_180,
+        no_encode: std::env::var("QUILL_NO_ENCODE").is_ok(),
         out_file,
         transport: transport.clone(),
         stats: stats.clone(),
@@ -576,6 +584,10 @@ pub fn run_capture(
         })
         .process(|stream, user_data| {
             let start = Instant::now();
+            // Sampled here, before any per-path work, so the barcode's
+            // "content changed -> daemon has the buffer" number means the same
+            // thing on the DMA-BUF and shm paths.
+            let dequeue_ns = crate::clock_sync::monotonic_ns();
             // Milestone 4 root-caused ~300ms glass-to-glass latency to this
             // pipeline being structurally slower than the source's refresh
             // rate: with no staleness check, a backlog of queued buffers
@@ -644,6 +656,19 @@ pub fn run_capture(
                     );
                 }
             }
+            // Diagnostic for "is our own processing what caps the delivered
+            // frame rate?". KWin's `record()` dequeues a pool buffer and, if
+            // the 2-4 buffer pool is exhausted, simply returns with no retry
+            // scheduled -- the next chance is the next damage event. So holding
+            // a buffer across encode can silently cost frames. Setting this
+            // returns immediately, dropping the buffer at once; if the frame
+            // rate jumps, the hold is the cap, and if it doesn't, it's upstream.
+            if user_data.no_encode {
+                let mut stats = user_data.stats.borrow_mut();
+                stats.frame_count += 1;
+                return;
+            }
+
             let is_dmabuf = datas[0].type_() == pw::spa::buffer::DataType::DmaBuf;
             let stride = datas[0].chunk().stride() as usize;
 
@@ -672,7 +697,7 @@ pub fn run_capture(
                     if let Ok(Some(barcode_ns)) =
                         encoder.with_mapped_dmabuf(&plane, |b, s| decode_latency_barcode(b, s))
                     {
-                        record_capture_latency(&user_data.stats, barcode_ns);
+                        record_capture_latency(&user_data.stats, barcode_ns, dequeue_ns);
                     }
                 }
                 let encode_start = Instant::now();
@@ -728,7 +753,7 @@ pub fn run_capture(
             // needed; this is exactly "time from content changing on
             // screen to the daemon having a buffer for it."
             if let Some(barcode_ns) = decode_latency_barcode(bytes, stride) {
-                record_capture_latency(&user_data.stats, barcode_ns);
+                record_capture_latency(&user_data.stats, barcode_ns, dequeue_ns);
             }
 
             let Some(encoder) = user_data.encoder.as_mut() else {
