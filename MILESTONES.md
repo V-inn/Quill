@@ -2093,3 +2093,37 @@ behave differently, and the daemon and protocol support is now in place if so.
 the host application and returns through the video path regardless. For a
 drawing tablet that is the number that matters, which makes Milestone 18's
 34ms decoder win the one that actually helps.
+
+### Watchdog vs. the portal picker: a measurement bug the picker made reachable
+
+Reconnecting after a portal re-prompt produced `latency avg=585ms` while video
+was visibly fine (`pending=1`, frames flowing, encode 9.1ms). Not a regression --
+a broken calibration. Two calibrations had run:
+
+```
+15:28:27  offset=610ms  round-trip sum=10ms     <- clean
+15:29:04  offset=52ms   round-trip sum=1119ms   <- garbage
+```
+
+The screen-picker dialog appears whenever the saved restore token is missing or
+rejected, and someone has to physically walk over and click it. That took ~37s.
+The Android watchdog's budget was 15s (set in Milestone 16 for the
+virtual-monitor recreate case), so it fired mid-wait and forced a reconnect,
+whose clock-sync then calibrated against a reply that had been sitting queued --
+hence the 1119ms round trip. Every per-frame latency for the rest of that session
+was off by roughly the difference between the two offsets.
+
+The watchdog cannot distinguish "daemon is blocked on a human" from "daemon
+died", and before the first frame arrives it has no basis to. Fixed by giving it
+a separate startup budget (180s) that applies until real video starts, then
+dropping to the existing 15s -- the steady-state case, detecting a peer that
+died mid-session, is the one that needs to be tight, and it stays tight.
+
+Clean reconnect afterwards: **avg 29ms, min 7ms, pending 0-2.**
+
+Worth noting for its own sake: the number was wrong while the *system* was
+right. Every latency figure this project records comes through this calibration,
+so a bad calibration is indistinguishable from a real regression unless the
+round-trip sum is checked alongside it. It is printed next to the offset for
+exactly this reason -- 10ms versus 1119ms said immediately which reading to
+trust.

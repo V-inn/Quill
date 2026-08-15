@@ -690,14 +690,33 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     // timeout + ready timeout + portal renegotiation, ~8-10s worst case).
     private val WATCHDOG_TIMEOUT_MS = 15000L
 
+    // Before the first frame arrives, the daemon may legitimately be blocked on
+    // a human: the portal's screen-picker dialog appears whenever the saved
+    // restore token is missing or rejected, and someone has to walk over and
+    // click it. Confirmed live -- a ~37s pick tripped the 15s watchdog, which
+    // forced a reconnect whose clock-sync then calibrated against a reply that
+    // had been sitting queued (round-trip sum 1119ms instead of 10ms, offset
+    // 52ms instead of 610ms). Video was fine; every reported per-frame latency
+    // was off by ~550ms for the rest of the session.
+    //
+    // A separate, much longer budget until the stream is actually running fixes
+    // that without blunting the steady-state watchdog, which is the one that
+    // matters for detecting a peer that died mid-session.
+    private val WATCHDOG_STARTUP_TIMEOUT_MS = 180000L
+
     private fun runDecodeLoop(holder: SurfaceHolder, input: BufferedAccessoryInput, out: DataOutputStream) {
         var codec: MediaCodec? = null
         val lastDataAtMs = java.util.concurrent.atomic.AtomicLong(System.currentTimeMillis())
         val watchdogRunning = java.util.concurrent.atomic.AtomicBoolean(true)
+        // Flips once real video starts, switching the watchdog from its
+        // human-in-the-loop startup budget to the steady-state one.
+        val streaming = java.util.concurrent.atomic.AtomicBoolean(false)
         val watchdogThread = Thread {
             while (watchdogRunning.get()) {
-                if (System.currentTimeMillis() - lastDataAtMs.get() > WATCHDOG_TIMEOUT_MS) {
-                    Log.w(tag, "no data for ${WATCHDOG_TIMEOUT_MS}ms, forcing reconnect")
+                val budget =
+                    if (streaming.get()) WATCHDOG_TIMEOUT_MS else WATCHDOG_STARTUP_TIMEOUT_MS
+                if (System.currentTimeMillis() - lastDataAtMs.get() > budget) {
+                    Log.w(tag, "no data for ${budget}ms, forcing reconnect")
                     input.close()
                     return@Thread
                 }
@@ -934,6 +953,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                         // before that every frame was an IDR and this side
                         // hardcoded BUFFER_FLAG_KEY_FRAME, which has been a lie
                         // on every P frame since.
+                        streaming.set(true)
                         val frameSentAtMs = msg.sentAtMs
                         val isKeyFrame = msg.payload[0].toInt() != 0
                         val frameBytes = msg.payload.copyOfRange(1, msg.payload.size)
