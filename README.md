@@ -1,37 +1,58 @@
 # Quill
 
-Linux equivalent of SuperDisplay: use a Samsung Galaxy Tab (S9 FE+, S10 FE+, or any
-Wacom-EMR S Pen tablet) as a real extended Linux display over USB, with full S Pen
-fidelity (pressure, tilt, hover, side button) and low latency.
+Linux equivalent of SuperDisplay: use a Samsung Galaxy Tab as an extended desktop
+display over USB, with S Pen input (pressure, tilt, hover, side button) working like a
+normal drawing tablet.
 
-Full architecture: [`linux-tablet-display-design.md`](./linux-tablet-display-design.md).
+Supported hardware: Samsung Galaxy Tab S9 FE and newer, S10 FE and newer — any tablet
+with a Wacom EMR S Pen.
 
-## Why this works without new kernel drivers
+## What it needs to work
 
-- **evdi** — existing, DisplayLink-maintained kernel module. Registers a real DRM/KMS
-  output the desktop treats as a normal monitor.
-- **uinput** — standard in-kernel facility for virtual input devices (used by Weylus,
-  GfxTablet today for pressure/tilt).
+- A supported Samsung Galaxy Tab with its S Pen
+- A Linux desktop running KDE Plasma (GNOME not supported yet)
+- A USB cable between the two
 
-So the actual new work is one Linux daemon (capture/encode + input injection) and one
-native Android app (decode + `MotionEvent` capture) — no new kernel code.
+No new kernel drivers or firmware required. The virtual display and screen capture go
+through standard desktop mechanisms (the `ScreenCast` portal and PipeWire — the same
+plumbing tools like OBS and Sunshine use); the pen input side uses the standard Linux
+virtual-input facility (uinput), the same one other Linux tablet-input tools use for
+pressure and tilt.
+
+## Features
+
+- Extended display over USB, connecting directly to the tablet (no `adb` relay
+  involved) — plug the tablet in and it starts on its own, no manual steps
+- Full S Pen input: pressure, tilt, hover, and the side button
+- Multi-touch gestures — two-finger scroll, pinch-to-zoom, tap-to-click — handled the
+  same way a laptop touchpad's gestures are
+- Portrait and landscape, with a display-flip setting for cable orientation
+- A settings screen on the tablet (display orientation, cursor mode, gesture mode)
+- Recovers on its own from a dropped cable, an app restart, or a daemon restart
+- ~55ms glass-to-glass latency (camera-measured)
+
+## Project status
+
+Core path works end to end on KDE Plasma: display, S Pen, multi-touch, auto-launch,
+and auto-reconnect are all in place and the latency target has been met. Two known
+gaps: GNOME isn't supported yet (KDE's virtual-display tooling doesn't have a GNOME
+equivalent), and the tablet currently shows as mirroring the main display rather than
+extending it. See [`MILESTONES.md`](./MILESTONES.md) for the full history and what's
+still open.
 
 ## Repo layout
 
-- `daemon/` — Linux side, Rust. evdi capture, VAAPI encode, uinput input injection.
-- `android-client/` — native Kotlin app. MediaCodec decode, MotionEvent capture.
-- `experiments/` — throwaway validation code, one directory per milestone spike. Not
-  part of the real daemon/client; kept so spikes don't contaminate real history.
-- `MILESTONES.md` — build plan, checked off as milestones are validated.
+- `daemon/` — the Linux-side program (written in Rust) that talks to the tablet:
+  captures the screen, sends video to it, and turns pen input back into something
+  Linux understands.
+- `android-client/` — the app that runs on the tablet: displays the video feed and
+  reports pen/touch input back to the daemon.
+- `experiments/` — throwaway spikes used to validate ideas before they become real
+  code; not part of the shipped daemon or client.
+- `MILESTONES.md` — the build plan and progress tracker.
+- `linux-tablet-display-design.md` — the full technical design, for readers who want
+  the details of how the pieces fit together.
 
-## Status
+## License
 
-Milestone 1 (evdi bring-up) — see `MILESTONES.md`.
-
-## Constraint that shapes everything
-
-No hardcoded resolution, DPI, refresh rate, or pressure/tilt ranges anywhere. The
-protocol opens with a capability handshake (Android reports `Display` metrics and
-`InputDevice.getMotionRange()` at connect time); the daemon configures evdi/uinput from
-that. This is what lets the same daemon/client pair work unmodified across tablets —
-treat any device-specific constant that creeps in as a bug.
+MIT — see [`LICENSE`](./LICENSE).
