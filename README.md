@@ -7,6 +7,27 @@ normal drawing tablet.
 Supported hardware: Samsung Galaxy Tab S9 FE and newer, S10 FE and newer — any tablet
 with a Wacom EMR S Pen.
 
+## Demo
+
+<table>
+<tr>
+<td width="50%">
+
+![A window being dragged from the desktop onto the tablet, which acts as an extended display](./assets/extended-display.gif)
+
+Dragging a window from the desktop onto the tablet as an extended display.
+
+</td>
+<td width="50%">
+
+![Drawing in GIMP with the S Pen, with pressure and tilt working live on the tablet](./assets/s-pen-gimp.gif)
+
+Drawing in GIMP with the S Pen — pressure and tilt working live.
+
+</td>
+</tr>
+</table>
+
 ## What it needs to work
 
 - A supported Samsung Galaxy Tab with its S Pen
@@ -42,6 +63,7 @@ still open.
 
 ## Repo layout
 
+- `assets/` — GIFs used in this README.
 - `daemon/` — the Linux-side program (written in Rust) that talks to the tablet:
   captures the screen, sends video to it, and turns pen input back into something
   Linux understands.
