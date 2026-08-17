@@ -12,7 +12,11 @@ if [ ! -f target/release/quill-daemon ]; then
     exit 1
 fi
 
-mkdir -p ~/.local/bin ~/.local/share/quill ~/.config/systemd/user
+# ~/.config/quill is created here rather than lazily by the daemon because the
+# unit's ProtectSystem=strict makes everything outside ReadWritePaths read-only
+# -- a missing directory there is a unit that refuses to start, not a directory
+# the daemon can still create for itself.
+mkdir -p ~/.local/bin ~/.local/share/quill ~/.config/quill ~/.config/systemd/user
 # Symlinked, not copied: a stable path for the unit file to reference no
 # matter where this repo is checked out, that stays current across rebuilds
 # without needing to reinstall.
