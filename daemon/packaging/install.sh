@@ -30,5 +30,12 @@ cp packaging/quill-daemon.service ~/.config/systemd/user/quill-daemon.service
 systemctl --user daemon-reload
 
 echo "user unit installed. Now run (needs root):"
+echo "  sudo cp $(pwd)/packaging/60-quill-uinput.rules /etc/udev/rules.d/60-quill-uinput.rules"
 echo "  sudo cp $(pwd)/packaging/99-quill-daemon.rules /etc/udev/rules.d/99-quill-daemon.rules"
 echo "  sudo udevadm control --reload"
+echo
+echo "The 60- rule grants /dev/uinput to the active-session user, which is what"
+echo "buys real pressure/tilt; without it the daemon still runs, on the portal"
+echo "fallback with no pressure or tilt. The 99- rule is only auto-launch."
+echo "Read both before running them -- see the comments in each file for what"
+echo "the grant does and does not cover."
