@@ -24,6 +24,7 @@ import java.io.BufferedOutputStream
 import java.io.DataOutputStream
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.util.concurrent.LinkedBlockingQueue
@@ -56,6 +57,10 @@ private data class PenEvent(
 class MainActivity : Activity(), SurfaceHolder.Callback {
     private val tag = "Quill"
     private val port = 7777
+
+    /** Exactly one daemon ever connects, and it's accepted immediately -- there
+     * is nothing for a queue to hold. */
+    private val backlog = 1
 
     private var decodeThread: Thread? = null
     private var inputWriterThread: Thread? = null
@@ -852,11 +857,19 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     }
 
     /** Original transport (Milestones 3-7): listens on a TCP port reached
-     * via `adb forward tcp:PORT tcp:PORT`. */
+     * via `adb forward tcp:PORT tcp:PORT`.
+     *
+     * Bound to loopback, not every interface. `adbd` runs on the phone and
+     * connects to this port from the phone itself, so loopback is all the adb
+     * path ever needed -- while a bare `ServerSocket(port)` binds 0.0.0.0, and
+     * this is the automatic fallback whenever the app is open with no USB
+     * accessory attached. That left any peer on the same Wi-Fi able to connect
+     * unauthenticated, feed arbitrary bytes to the H.264 decoder below, and
+     * receive the S Pen event stream. */
     private fun runAdbForwardDecodeLoop(holder: SurfaceHolder) {
-        Log.i(tag, "Listening on port $port, waiting for daemon (adb forward)...")
+        Log.i(tag, "Listening on 127.0.0.1:$port, waiting for daemon (adb forward)...")
         try {
-            ServerSocket(port).use { server ->
+            ServerSocket(port, backlog, InetAddress.getLoopbackAddress()).use { server ->
                 server.reuseAddress = true
                 val socket: Socket = server.accept()
                 Log.i(tag, "daemon connected from ${socket.remoteSocketAddress}")
