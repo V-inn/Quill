@@ -2,15 +2,11 @@ use std::env;
 use std::path::PathBuf;
 
 fn main() {
-    println!("cargo:rustc-link-lib=evdi");
     println!("cargo:rustc-link-lib=va");
     println!("cargo:rustc-link-lib=va-drm");
 
     let bindings = bindgen::Builder::default()
         .header("wrapper.h")
-        .allowlist_function("evdi_.*")
-        .allowlist_type("evdi_.*")
-        .allowlist_var("EVDI_.*")
         .allowlist_function("va[A-Z].*")
         .allowlist_type("VA.*")
         .allowlist_var("VA_.*")
