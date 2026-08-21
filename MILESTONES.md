@@ -2764,9 +2764,10 @@ longer mentions evdi and the 33 tests still pass.
 
 A list of build dependencies written from memory on the machine that already has
 all of them is worth nothing. This one was derived from `wrapper.h` and the crate
-set, then **built from a clean `debian:13` container installing only the packages
-the guide names** -- which is also what proved the evdi removal, since the
-container has no evdi anything.
+set, then **built from clean `debian:13` and `fedora:latest` containers installing
+only the packages the guide names** -- which is also what proved the evdi removal,
+since neither container has evdi anything. Both built clean, in under a minute of
+compile time each.
 
 First attempt filled the container's disk: `cp -r /src/daemon /tmp/daemon` drags
 in the multi-gigabyte `target/` directory. Copy the sources only.

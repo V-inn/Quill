@@ -42,7 +42,7 @@ sudo apt install build-essential pkg-config curl clang libclang-dev \
 Fedora:
 
 ```sh
-sudo dnf install gcc gcc-c++ pkgconf-pkg-config clang-devel \
+sudo dnf install gcc gcc-c++ pkgconf-pkg-config curl clang-devel \
                  libva-devel pipewire-devel libusb1-devel
 ```
 

@@ -28,12 +28,16 @@
                 android:name="android.hardware.usb.action.USB_ACCESSORY_ATTACHED"
                 android:resource="@xml/accessory_filter" />
         </activity>
-        <!-- Reached by tapping the status overlay; the main activity runs
-             edge-to-edge immersive with no system chrome to hang a menu off. -->
+        <!-- Reached from the gear, or from the status overlay while
+             disconnected; the main activity runs edge-to-edge immersive with no
+             system chrome to hang a menu off.
+
+             NoTitleBar, and no android:label: with a title bar this activity
+             drew "Quill settings" twice, once as system chrome from the label
+             and once as the screen's own first heading. -->
         <activity
             android:name=".SettingsActivity"
             android:exported="false"
-            android:label="Quill settings"
-            android:theme="@android:style/Theme.Black" />
+            android:theme="@android:style/Theme.Black.NoTitleBar" />
     </application>
 </manifest>

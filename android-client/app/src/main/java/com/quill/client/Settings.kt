@@ -43,6 +43,26 @@ class Settings(context: Context) {
         set(value) = prefs.edit().putBoolean(KEY_LATENCY_OVERLAY, value).apply()
 
     /**
+     * Keeps the panel lit while a desktop is actually on screen.
+     *
+     * Defaults to **on**: this app is a monitor, and a monitor that goes dark
+     * because you stopped drawing for a moment is the surprising behaviour, not
+     * the other way round. An idle desktop produces no video frames at all --
+     * that is what `MSG_HEARTBEAT` exists for -- so "nothing has arrived
+     * recently" is exactly the case this has to survive. Which is why
+     * `MainActivity` arms it on the first rendered frame and disarms it when the
+     * connection drops, rather than tracking frame arrival.
+     *
+     * Tablet-local, like [showLatencyOverlay]: it changes nothing about what the
+     * daemon captures, so it is deliberately **not** in [configFlags], unlike
+     * the three booleans around it. It also takes effect on return from
+     * settings rather than at the next connect.
+     */
+    var keepScreenAwake: Boolean
+        get() = prefs.getBoolean(KEY_KEEP_SCREEN_AWAKE, true)
+        set(value) = prefs.edit().putBoolean(KEY_KEEP_SCREEN_AWAKE, value).apply()
+
+    /**
      * Sends pinch as Ctrl+scroll instead of as a real pinch gesture.
      *
      * Off, the daemon hands both fingers to a virtual touchpad and libinput
@@ -83,6 +103,7 @@ class Settings(context: Context) {
     companion object {
         private const val KEY_CLIENT_SIDE_CURSOR = "client_side_cursor"
         private const val KEY_LATENCY_OVERLAY = "latency_overlay"
+        private const val KEY_KEEP_SCREEN_AWAKE = "keep_screen_awake"
         private const val KEY_CTRL_SCROLL_ZOOM = "ctrl_scroll_zoom"
         private const val KEY_FLIP_180 = "flip_180"
 

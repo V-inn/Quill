@@ -15,6 +15,7 @@ import android.view.InputDevice
 import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
+import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.TextView
 import androidx.core.view.WindowCompat
@@ -83,6 +84,12 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     @Volatile
     private var running = true
 
+    /** True between the first rendered frame and the next connection drop --
+     * i.e. exactly while a desktop is actually on the panel. Drives
+     * [setScreenAwake]; see [applyLocalSettings]. */
+    @Volatile
+    private var rendering = false
+
     // Milestone 8: set from the launching intent (or a later
     // USB_ACCESSORY_ATTACHED broadcast) when the daemon has switched the
     // tablet into AOA accessory mode -- see daemon/src/aoa.rs. Null means
@@ -112,11 +119,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             gravity = android.view.Gravity.CENTER
             setPadding(48, 48, 48, 48)
         }
-        cursorOverlay = CursorOverlay(this).apply {
-            // Same flag the daemon gets in the handshake, so the tablet-drawn
-            // pointer and the rotated video agree about which way is up.
-            setFlip180(Settings(this@MainActivity).flip180)
-        }
+        // Its flip is seeded by `applyLocalSettings` below, not here: returning
+        // from settings recreates the *surface*, not this activity, so an
+        // onCreate-only read went stale the moment anyone changed the setting.
+        cursorOverlay = CursorOverlay(this)
         gearButton = GearButton(this)
         val gearSize = (GEAR_SIZE_DP * resources.displayMetrics.density).toInt()
         val gearMargin = (GEAR_MARGIN_DP * resources.displayMetrics.density).toInt()
@@ -169,6 +175,51 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         // system one here: the video's own embedded cursor is the only one
         // that should be visible.
         surfaceView.pointerIcon = android.view.PointerIcon.getSystemIcon(this, android.view.PointerIcon.TYPE_NULL)
+        applyLocalSettings()
+    }
+
+    /** Re-reads the tablet-local settings every time this screen comes back.
+     *
+     * Opening settings destroys the *surface*, not this activity, so anything
+     * seeded once in [onCreate] kept its old value for the life of the process
+     * -- which is what made a changed 180-degree flip reach the daemon (it
+     * rides the next handshake) but not the tablet-drawn pointer. Reading here
+     * covers the settings round trip and an activity recreation alike, and
+     * needs no result plumbing: SharedPreferences is already the single source
+     * of truth for both sides. */
+    private fun applyLocalSettings() {
+        val settings = Settings(this)
+        cursorOverlay.setFlip180(settings.flip180)
+        setScreenAwake(rendering)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        applyLocalSettings()
+    }
+
+    /** Keeps the panel lit while, and only while, a desktop is on it.
+     *
+     * `FLAG_KEEP_SCREEN_ON` rather than a `PowerManager.WakeLock` because it
+     * needs no permission, and on the window rather than on the SurfaceView
+     * because that surface is destroyed and recreated on every trip through
+     * settings -- one lifecycle to reason about instead of two.
+     *
+     * Deliberately not driven by frame arrival. An idle desktop sends no
+     * frames at all (that is what MSG_HEARTBEAT exists for), and "you paused to
+     * think" is precisely the idle case this exists to survive. It is armed on
+     * the first rendered frame and disarmed when the connection drops, which is
+     * what [showStatus]/[hideStatus] already mean.
+     *
+     * The flag only acts while the window is visible and focused, so the
+     * settings round trip needs no handling of its own: backgrounding drops it,
+     * and coming back re-arms through [onResume] and the reconnect. */
+    private fun setScreenAwake(on: Boolean) {
+        if (on && Settings(this).keepScreenAwake) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
     }
 
     /** Settings apply at connect time, so leaving here and coming back is what
@@ -182,11 +233,17 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         runOnUiThread {
             statusText.text = message
             statusText.visibility = android.view.View.VISIBLE
+            rendering = false
+            setScreenAwake(false)
         }
     }
 
     private fun hideStatus() {
-        runOnUiThread { statusText.visibility = android.view.View.GONE }
+        runOnUiThread {
+            statusText.visibility = android.view.View.GONE
+            rendering = true
+            setScreenAwake(true)
+        }
     }
 
     /** Edge-to-edge immersive: hides both the status bar and navigation bar,

@@ -28,7 +28,7 @@ class SettingsActivity : Activity() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.BLACK)
-            setPadding(PAD, PAD, PAD, PAD)
+            setPadding(pad, pad, pad, pad)
         }
 
         root.addView(heading("Quill settings"))
@@ -108,6 +108,21 @@ class SettingsActivity : Activity() {
         )
 
         root.addView(divider())
+        root.addView(heading("Screen"))
+        root.addView(
+            switchRow("Keep the screen awake", settings.keepScreenAwake) {
+                settings.keepScreenAwake = it
+            }
+        )
+        root.addView(
+            note(
+                "While a desktop is showing. The tablet still sleeps when nothing " +
+                    "is connected.\n\nUnlike the settings above, this one takes effect " +
+                    "as soon as you leave this screen."
+            )
+        )
+
+        root.addView(divider())
         root.addView(heading("Diagnostics"))
         root.addView(
             switchRow("Show latency overlay", settings.showLatencyOverlay) {
@@ -132,21 +147,22 @@ class SettingsActivity : Activity() {
         this.text = text
         setTextColor(Color.WHITE)
         textSize = 22f
-        setPadding(0, PAD / 2, 0, PAD / 4)
+        setPadding(0, pad / 2, 0, pad / 4)
     }
 
     private fun note(text: String) = TextView(this).apply {
         this.text = text
         setTextColor(Color.LTGRAY)
         textSize = 14f
-        setPadding(0, 0, 0, PAD / 2)
+        setPadding(0, 0, 0, pad / 2)
     }
 
     private fun divider() = View(this).apply {
         setBackgroundColor(Color.DKGRAY)
-        layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 2).apply {
-            topMargin = PAD / 2
-            bottomMargin = PAD / 2
+        val hairline = maxOf(1, (resources.displayMetrics.density).toInt())
+        layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, hairline).apply {
+            topMargin = pad / 2
+            bottomMargin = pad / 2
         }
     }
 
@@ -158,11 +174,19 @@ class SettingsActivity : Activity() {
             setTextColor(Color.WHITE)
             isChecked = initial
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, PAD / 4, 0, PAD / 4)
+            setPadding(0, pad / 4, 0, pad / 4)
             setOnCheckedChangeListener { _, checked -> onChange(checked) }
         }
 
+    /** Base spacing unit, in real pixels.
+     *
+     * Was a bare `PAD = 48` used directly as a pixel count -- so on this
+     * tablet's 2x panel every gap came out at half the size it reads as, and on
+     * a 3x phone a third. Everything below divides it by 2 or 4, so it has to
+     * stay an even multiple. */
+    private val pad: Int by lazy { (PAD_DP * resources.displayMetrics.density).toInt() }
+
     companion object {
-        private const val PAD = 48
+        private const val PAD_DP = 24f
     }
 }
