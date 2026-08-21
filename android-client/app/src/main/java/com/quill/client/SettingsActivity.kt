@@ -93,6 +93,12 @@ class SettingsActivity : ComponentActivity() {
         }
     }
 
+    override fun onDestroy() {
+        super.onDestroy()
+        // The captured frame exists for this screen and nothing else.
+        FramePreview.clear()
+    }
+
     /** Same edge-to-edge immersive treatment `MainActivity` uses.
      *
      * Without it this screen came up with Samsung's status bar and navigation

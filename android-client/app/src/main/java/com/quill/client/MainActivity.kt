@@ -73,6 +73,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private lateinit var statusText: TextView
 
     /** Only used in client-side cursor mode; otherwise stays empty and hidden. */
+    private lateinit var surfaceView: SurfaceView
+
     private lateinit var cursorOverlay: CursorOverlay
 
     /** The one settings entry point that survives streaming -- see [GearButton]. */
@@ -112,7 +114,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         }
         usbAccessory = accessoryFromIntent(intent) ?: alreadyAttachedAccessory()
         hideSystemBars()
-        val surfaceView = SurfaceView(this)
+        surfaceView = SurfaceView(this)
         statusText = TextView(this).apply {
             setTextColor(android.graphics.Color.WHITE)
             textSize = 20f
@@ -196,6 +198,9 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     override fun onResume() {
         super.onResume()
         applyLocalSettings()
+        // Belt and braces with SettingsActivity.onDestroy: whichever runs,
+        // the captured frame does not outlive the screen that displayed it.
+        FramePreview.clear()
     }
 
     /** Keeps the panel lit while, and only while, a desktop is on it.
@@ -224,9 +229,17 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     /** Settings apply at connect time, so leaving here and coming back is what
      * makes a changed toggle take effect -- the surface is destroyed and the
-     * decode loop reconnects on return. */
+     * decode loop reconnects on return.
+     *
+     * Which is also why the frame grab happens here rather than over there:
+     * by the time `SettingsActivity` is running, the surface it would read is
+     * already gone. `captureThen` runs the callback exactly once, on whichever
+     * of the copy or its timeout lands first, so a stalled readback costs the
+     * preview and never the tap. */
     private fun openSettings() {
-        startActivity(Intent(this, SettingsActivity::class.java))
+        FramePreview.captureThen(surfaceView, window.decorView.handler) {
+            startActivity(Intent(this, SettingsActivity::class.java))
+        }
     }
 
     private fun showStatus(message: String) {
@@ -672,6 +685,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         }
         val widthPx = bounds.width()
         val heightPx = bounds.height()
+        // The settings screen's preview needs the panel's real geometry for its
+        // aspect, and this is where it is already worked out correctly (see the
+        // note above on why displayMetrics is not used).
+        FramePreview.setPanelSize(widthPx, heightPx)
 
         val stylusDevice = InputDevice.getDeviceIds()
             .map { InputDevice.getDevice(it) }
