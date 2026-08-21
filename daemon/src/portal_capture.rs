@@ -4,9 +4,16 @@
 //! under both Wayland and X11 on this machine; this path never touches
 //! DRM/KMS at all).
 //!
-//! The virtual monitor itself is created separately (by `krfb-virtualmonitor`
-//! for now); this module just captures whatever monitor the user picks in
-//! the portal's screen-selection dialog.
+//! The virtual monitor itself is created separately (by `krfb-virtualmonitor`);
+//! this module just captures whatever monitor the user picks in the portal's
+//! screen-selection dialog.
+//!
+//! All of that is the *KDE* route. On GNOME the portal isn't involved at all --
+//! `gnome_screencast.rs` asks mutter for a virtual monitor directly and gets a
+//! PipeWire node id back, with no dialog and no restore token. Everything from
+//! `run_capture` down is shared between the two: it takes a node id either way,
+//! and the only difference is whether there is a portal-provided PipeWire
+//! remote to connect through (`fd`) or the user's own daemon (`None`).
 
 use crate::vaapi_encoder::VaapiEncoder;
 use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType, Stream as PortalStream};
@@ -93,7 +100,7 @@ const DRM_FORMAT_MOD_LINEAR: i64 = 0;
 /// standard two-step modifier negotiation (the producer picks one from our
 /// list and echoes it back in the fixated format), and the exact property
 /// KWin's screencast looks for before it will export GPU buffers at all.
-fn build_format_pod(dmabuf: bool) -> Vec<u8> {
+fn build_format_pod(dmabuf: bool, preferred: (u32, u32)) -> Vec<u8> {
     use pw::spa::pod::{ChoiceValue, Property, PropertyFlags, Value};
     use pw::spa::utils::{Choice, ChoiceEnum, ChoiceFlags};
 
@@ -121,12 +128,20 @@ fn build_format_pod(dmabuf: bool) -> Vec<u8> {
             pw::spa::param::video::VideoFormat::BGRx,
             pw::spa::param::video::VideoFormat::RGBx,
         ),
+        // The *default* of this range is not decoration: mutter's virtual
+        // stream has no monitor to take a size from, so unless `RecordVirtual`
+        // was given an explicit mode (see `gnome_screencast::record_virtual`)
+        // the compositor sizes the virtual monitor from whatever this
+        // negotiation settles on -- and a fixed 1920x1080 default here would
+        // have handed a 2560x1600 tablet a 1920x1080 monitor. KWin, which
+        // always has a real output behind the stream, fixates to that output's
+        // size and ignores the default either way.
         pw::spa::pod::property!(
             pw::spa::param::format::FormatProperties::VideoSize,
             Choice,
             Range,
             Rectangle,
-            pw::spa::utils::Rectangle { width: 1920, height: 1080 },
+            pw::spa::utils::Rectangle { width: preferred.0, height: preferred.1 },
             pw::spa::utils::Rectangle { width: 1, height: 1 },
             pw::spa::utils::Rectangle { width: 8192, height: 8192 }
         ),
@@ -609,19 +624,31 @@ fn emit_frame(
 /// called by `main.rs` before the portal was ever opened (see that
 /// function's doc) -- `None` only for the capture-only diagnostic mode
 /// (`TransportConfig::None`).
+/// `fd`: the PipeWire remote the portal handed over, on the KDE path.
+/// `None` on GNOME -- mutter publishes the virtual monitor's node on the
+/// user's own PipeWire daemon and `RecordVirtual` returns only a node id, so
+/// there is no separate remote to connect through.
+///
+/// `preferred_size`: the tablet's `width x height`, offered as the default of
+/// the negotiated video size. See `build_format_pod` for why this matters on
+/// GNOME and is inert on KDE.
 pub fn run_capture(
     node_id: u32,
-    fd: OwnedFd,
+    fd: Option<OwnedFd>,
     out_path: &str,
     transport: Option<TransportWriter>,
     flip_180: bool,
     cursor: CursorRendering,
+    preferred_size: (u32, u32),
 ) -> Result<CaptureStats, pw::Error> {
     pw::init();
 
     let mainloop = pw::main_loop::MainLoopRc::new(None)?;
     let context = pw::context::ContextRc::new(&mainloop, None)?;
-    let core = context.connect_fd_rc(fd, None)?;
+    let core = match fd {
+        Some(fd) => context.connect_fd_rc(fd, None)?,
+        None => context.connect_rc(None)?,
+    };
 
     // pipewire's own add_signal_local mechanism turned out unreliable here
     // (registered fine, callback never fired -- SIGINT killed the process
@@ -1038,8 +1065,8 @@ pub fn run_capture(
     // sitting -- without it there's no way to re-measure the old behavior once
     // the new one works.
     let force_shm = std::env::var("QUILL_FORCE_SHM").is_ok();
-    let dmabuf_values = build_format_pod(true);
-    let shm_values = build_format_pod(false);
+    let dmabuf_values = build_format_pod(true, preferred_size);
+    let shm_values = build_format_pod(false, preferred_size);
     let mut dmabuf_first = vec![
         Pod::from_bytes(&dmabuf_values).unwrap(),
         Pod::from_bytes(&shm_values).unwrap(),

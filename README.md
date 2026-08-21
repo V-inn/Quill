@@ -31,14 +31,21 @@ Drawing in GIMP with the S Pen — pressure and tilt working live.
 ## What it needs to work
 
 - A supported Samsung Galaxy Tab with its S Pen
-- A Linux desktop running KDE Plasma (GNOME not supported yet)
+- A Linux desktop running KDE Plasma, or GNOME (GNOME support is new and not yet
+  tested on real hardware — see [Project status](#project-status))
 - A USB cable between the two
 
 No new kernel drivers or firmware required. The virtual display and screen capture go
-through standard desktop mechanisms (the `ScreenCast` portal and PipeWire — the same
-plumbing tools like OBS and Sunshine use); the pen input side uses the standard Linux
-virtual-input facility (uinput), the same one other Linux tablet-input tools use for
-pressure and tilt.
+through standard desktop mechanisms (PipeWire plus the `ScreenCast` portal on KDE, or
+GNOME's own screen-cast interface — the same plumbing tools like OBS and Sunshine
+use); the pen input side uses the standard Linux virtual-input facility (uinput), the
+same one other Linux tablet-input tools use for pressure and tilt.
+
+Quill needs root exactly once, to install a udev rule granting your user access to
+`/dev/uinput` — the device that lets it create the virtual pen and touchpad. Many
+systems already have an equivalent rule from another package; `install.sh` checks and
+tells you if you don't need it. Nothing else in Quill runs as root, and it never asks
+for a password again.
 
 ## Features
 
@@ -55,11 +62,23 @@ pressure and tilt.
 ## Project status
 
 Core path works end to end on KDE Plasma: display, S Pen, multi-touch, auto-launch,
-and auto-reconnect are all in place and the latency target has been met. Two known
-gaps: GNOME isn't supported yet (KDE's virtual-display tooling doesn't have a GNOME
-equivalent), and the tablet currently shows as mirroring the main display rather than
-extending it. See [`MILESTONES.md`](./MILESTONES.md) for the full history and what's
-still open.
+and auto-reconnect are all in place and the latency target has been met.
+
+**GNOME support is written but untested.** GNOME's compositor turns out to have its
+own virtual-monitor interface, which is a better fit than KDE's — it creates the
+display and streams it in one step, with no screen-picker dialog to click through.
+That path is implemented and the daemon picks it automatically on a GNOME session,
+but the only machine this project is developed on runs Plasma, so nobody has yet run
+it against a real GNOME desktop. If you try it, the daemon logs every step of the
+setup; bug reports with that output are exactly what it needs. On GNOME the S Pen
+requires the `/dev/uinput` rule above — there's no reduced-capability fallback there
+yet the way there is on KDE.
+
+One other known gap, on KDE: the tablet often comes up mirroring the main display
+rather than extending it, and has to be switched over by hand in display settings.
+Whether GNOME behaves the same way is one of the things a first real run there would
+answer. See [`MILESTONES.md`](./MILESTONES.md) for the full history and what's still
+open.
 
 ## Repo layout
 

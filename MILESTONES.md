@@ -1201,7 +1201,7 @@ Pinch-to-zoom, two-finger scroll, and similar — deferred from the Milestone 6b
 click/drag follow-up (see there for why: needs a real multitouch device model, not a
 small extension of the current single-pointer protocol).
 
-## 10. (Not started) GNOME support
+## 10. (Implemented, not yet live-tested) GNOME support
 
 Requested by the user after Milestone 8's no-sudo input fallback (`remote_desktop_input.rs`,
 see the follow-up work under Milestone 8 above) landed. Two genuinely separate problems,
@@ -1219,14 +1219,124 @@ not one:
   "Allow RemoteDesktop requests if they come from a non-sandboxed app", not yet in our
   installed version. GNOME's backend is a different codebase, unlikely to share this
   exact bug, but unconfirmed -- needs live testing on an actual GNOME machine.
-- **Display (the real blocker, not yet solved):** `krfb-virtualmonitor`, which creates
-  the virtual monitor in the first place, is KDE-only (part of `krfb`). GNOME/mutter has
-  no equivalent simple tool -- this is the same gap already flagged in Milestone 1's
-  evdi-to-portal pivot ("KWin has a native, compositor-level virtual-output mechanism...
-  no stable cross-desktop equivalent exists"). Making the *display* side work on GNOME
-  needs its own research pass (does mutter expose any virtual-output mechanism at all,
-  stable or not; would a different approach be needed entirely) before any code gets
-  written -- not started.
+- **Display (was the real blocker):** `krfb-virtualmonitor`, which creates the virtual
+  monitor in the first place, is KDE-only (part of `krfb`). GNOME/mutter has no
+  equivalent simple *tool* -- this is the same gap flagged in Milestone 1's
+  evdi-to-portal pivot ("KWin has a native, compositor-level virtual-output
+  mechanism... no stable cross-desktop equivalent exists").
+
+**The research pass that section asked for found the answer: mutter has one, and it is
+a better fit than KDE's.** `org.gnome.Mutter.ScreenCast.Session.RecordVirtual` --
+mutter's own private-but-stable-in-practice D-Bus interface, the one
+gnome-remote-desktop drives -- creates a virtual monitor *and* returns the PipeWire
+node carrying its pixels, in a single session. The KDE-only thing was the assumption
+that creating the output and capturing it are separate steps.
+
+### What this bought, beyond "GNOME now works"
+
+The GNOME path is structurally simpler than the KDE one at three points that have each
+cost this project a milestone:
+
+1. **No picker dialog, so no restore token.** The whole
+   `restore_token` / `PersistMode::ExplicitlyRevoked` apparatus in `portal_capture.rs`
+   (plus `single_instance.rs`'s first bullet, plus the per-cursor-mode token files)
+   exists because the portal shows a screen-selection dialog and a udev-launched daemon
+   has nobody at the keyboard to dismiss it. None of that machinery is needed here.
+2. **No `orientation::ensure`.** No pkill, no poll-until-ready, no
+   tear-down-and-recreate on an aspect change: the monitor is created at the size
+   `RecordVirtual` is asked for, which is the handshake's size, and it goes away with
+   the process. Nothing is left behind for the next run.
+3. **Nothing needs root.** Mutter's only access check on these calls is that the caller
+   is the same D-Bus sender that created the session (`check_permission` in
+   `meta-screen-cast-session.c`) -- it is a plain session-bus call as the logged-in
+   user.
+
+### What was written
+
+| File | What it does |
+| --- | --- |
+| `desktop.rs` | `Backend::{Kde, Gnome}` detection (`QUILL_BACKEND` override, then `XDG_CURRENT_DESKTOP`, then a session-bus name probe for the udev-launch case where the unit inherits no session environment), plus the one helper for running a D-Bus call from a synchronous caller. |
+| `gnome_screencast.rs` | The `CreateSession` / `RecordVirtual` / `Start` / `PipeWireStreamAdded` sequence. Holds the session on a thread of its own with its own runtime -- mutter ties the session's life to the D-Bus sender, and `run_capture` stops driving the main runtime the moment it's called. |
+| `gnome_display.rs` | `kscreen-doctor -j`'s replacement: `org.gnome.Mutter.DisplayConfig.GetCurrentState`, decoded into the same `DesktopLayout` the pointer warping already consumes. |
+| `orientation.rs` | Now dispatches `ensure`/`layout` on the backend; everything below the dispatchers is unchanged KDE code. |
+| `portal_capture.rs` | `run_capture` takes `fd: Option<OwnedFd>` (mutter publishes on the user's own PipeWire daemon, so there is no portal remote to connect through) and a preferred size. |
+| `packaging/70-quill-uinput.rules` | The one privileged step, isolated: `TAG+="uaccess"` on `/dev/uinput`. |
+
+The `70` in that filename is not cosmetic. `TAG+="uaccess"` does nothing on its own --
+the tag is *consumed* by systemd's `/usr/lib/udev/rules.d/73-seat-late.rules`
+(`TAG=="uaccess", ENV{MAJOR}!="", RUN{builtin}+="uaccess"`), and udev runs rules in
+lexical filename order, so a rule numbered above 73 sets the tag after the only thing
+that reads it has already run. Written first as `99-quill-uinput.rules`, which would
+have been silently inert: no error, no ACL, just a daemon that still can't open
+`/dev/uinput`. Caught in review before it shipped. Every uaccess-setting rule on a
+typical system sits below 73 (`51-android`, `60-steam-input`, systemd's own
+`70-uaccess`).
+
+`99-quill-daemon.rules` is a different mechanism and 99 is correct there: it sets
+`TAG+="systemd"` + `ENV{SYSTEMD_USER_WANTS}`, which systemd-udevd reads after all rule
+processing ends rather than from another rule file.
+
+### Two details that took reading mutter's source, not its docs
+
+- **Who sizes the monitor.** Without the `modes` property, mutter has no monitor to
+  take a size from and lets the *PipeWire format negotiation* decide -- meaning
+  `build_format_pod`'s `VideoSize` range default, which was hardcoded at 1920x1080,
+  would have silently given a 2560x1600 tablet a 1920x1080 display. It now carries the
+  handshake's size. (`modes` pins it explicitly where mutter is new enough to know the
+  property; the negotiated default is the fallback, and both land on the same size.)
+- **Identifying our own output in the layout.** KDE echoes back the `--name` we passed
+  `krfb-virtualmonitor`. Mutter names virtual monitors itself; what it *does* set, in
+  `meta-stream-source-virtual.c`, is a fixed vendor/product pair ("MetaVendor" /
+  "Virtual remote monitor"). That pair is the handle, with the requested size as a
+  tie-break if another app also has a virtual monitor up.
+
+Also worth recording: `RecordVirtual` streams get **no** `Parameters` at all --
+`set_stream_parameters` in `meta-screen-cast-stream.c` has branches for monitor, area
+and window streams and none for virtual ones. The obvious shortcut of reading
+`position`/`size` off the stream object instead of going to `DisplayConfig` is not
+available, and it is set at session-init time anyway, before any negotiation.
+
+### Status: written, compiles, unit-tested, never run against mutter
+
+This machine is Plasma-only, so none of the D-Bus path above has touched a real GNOME
+session. What *is* verified here:
+
+- The full setup path runs end to end and fails where it should
+  (`QUILL_BACKEND=gnome` on this KDE box: thread, runtime, connection, proxy and error
+  propagation all execute, ending at `CreateSession failed:
+  org.freedesktop.DBus.Error.ServiceUnknown`).
+- The KDE path is unchanged and still takes the portal branch.
+- 11 new unit tests. The ones that matter most are in `gnome_screencast.rs`: mutter
+  reads every `RecordVirtual` property with a `g_variant_lookup` naming an exact type
+  string, and **a type mismatch is silently skipped, not reported** -- `cursor-mode`
+  sent as `i` instead of `u` would not fail the call, it would just leave the cursor
+  hidden with no explanation. Those tests assert the D-Bus signature of every property
+  (`u`, `b`, `aa{sv}`, `(uu)`, `d`) against the type strings in mutter's source.
+  `gnome_display.rs`'s tests cover the layout geometry: scale division, the quarter-turn
+  axis swap, negative desktop origins, and picking between two virtual monitors.
+
+`modes` is the one property mutter *validates* rather than ignores, so
+`record_virtual` retries without it on error rather than giving up -- deliberately
+defensive, because the first real GNOME run is going to be someone else's.
+
+### Left open
+
+- **Live test on a GNOME machine.** Nothing here substitutes for it.
+- **No input fallback on GNOME.** `main` exits with the udev-rule instructions if
+  `/dev/uinput` is inaccessible there. The KDE fallback works because the
+  `RemoteDesktop` portal session it needs is the same *kind* of session the display
+  already uses; on GNOME the display doesn't go through a portal at all, so the
+  equivalent would be mutter's `org.gnome.Mutter.RemoteDesktop` tied to this
+  ScreenCast session via `CreateSession`'s `remote-desktop-session-id` property. That
+  is a real option and a separate piece of work.
+- **Scale.** Mutter picks the virtual monitor's scale itself (it has no physical size
+  to go on). `QUILL_GNOME_SCALE` sets `preferred-scale` for the case where it guesses
+  badly on a particular tablet; unset by default, so as not to override the user's own
+  display settings from a daemon.
+- **Does it extend or mirror?** The pre-existing KDE gripe (Milestone 13) about the
+  tablet coming up as a mirror rather than an extension. `is-platform: true` asks
+  mutter to treat this "transparently as if it was a real monitor", which may or may
+  not change the answer there. Unknown until someone runs it.
 
 ## 11. (Partially fixed) Reconnect robustness
 

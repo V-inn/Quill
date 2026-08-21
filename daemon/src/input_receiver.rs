@@ -343,7 +343,8 @@ impl Pointer {
     fn map(&mut self) -> Option<&PointerMap> {
         if !self.resolved {
             self.resolved = true;
-            self.map = crate::orientation::layout().map(|layout| {
+            let want = (self.tablet_w as u32, self.tablet_h as u32);
+            self.map = crate::orientation::layout(want).map(|layout| {
                 eprintln!(
                     "[input] pointer warp target: output {}x{} at ({}, {}) in a {}x{} desktop (logical)",
                     layout.output.w.round(),
@@ -357,8 +358,12 @@ impl Pointer {
             });
             if self.map.is_none() {
                 eprintln!(
-                    "[input] couldn't read the desktop layout from kscreen-doctor -- gestures and \
-                     long-press clicks will land wherever the pointer already is"
+                    "[input] couldn't read the desktop layout from {} -- gestures and \
+                     long-press clicks will land wherever the pointer already is",
+                    match crate::desktop::backend() {
+                        crate::desktop::Backend::Kde => "kscreen-doctor",
+                        crate::desktop::Backend::Gnome => "org.gnome.Mutter.DisplayConfig",
+                    }
                 );
             }
         }

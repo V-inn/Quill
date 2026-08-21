@@ -1,7 +1,10 @@
 mod aoa;
 mod clock_sync;
+mod desktop;
 mod ffi;
 mod gesture;
+mod gnome_display;
+mod gnome_screencast;
 mod h264_headers;
 mod input_receiver;
 mod orientation;
@@ -61,6 +64,11 @@ async fn main() {
         ),
     };
 
+    // Which compositor is running decides how the virtual display gets made
+    // and how its geometry is read back. Resolved before anything else looks
+    // at a display so the choice is logged once, at the top of the run.
+    let backend = desktop::backend();
+
     // Decided once, before any portal negotiation: uinput (real S Pen
     // pressure/tilt fidelity) needs a root-granted udev rule or ACL that
     // may simply not exist on this machine and never will (e.g. a school
@@ -69,6 +77,27 @@ async fn main() {
     // mutually-exclusive portal sessions, so this has to be decided before
     // either one starts, not worked around after the fact.
     let use_uinput = uinput_tablet::uinput_accessible();
+
+    // The GNOME path has no RemoteDesktop fallback yet. On KDE the fallback
+    // exists because the ScreenCast portal session it needs is the same kind
+    // of session the display already uses; on GNOME the display doesn't go
+    // through a portal at all (see gnome_screencast.rs), so wiring input
+    // through one is a separate piece of work, not a branch of this one.
+    // Failing here with the exact fix beats starting a session whose pen does
+    // nothing.
+    if backend == desktop::Backend::Gnome && !use_uinput {
+        eprintln!(
+            "[input] /dev/uinput is not accessible, and the GNOME path has no input fallback yet.\n\
+             \n\
+             This is the only step in the whole GNOME setup that needs root, and it is one-time:\n\
+             \n\
+             \x20   sudo cp packaging/70-quill-uinput.rules /etc/udev/rules.d/70-quill-uinput.rules\n\
+             \x20   sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=misc\n\
+             \n\
+             Then log out and back in (the rule grants access to whoever is logged in at the seat)."
+        );
+        std::process::exit(1);
+    }
 
     // Connects the transport and blocks for the tablet's capability
     // handshake *before* any portal call (Milestone 15): the virtual
@@ -120,37 +149,83 @@ async fn main() {
         .as_ref()
         .is_some_and(|(_, i)| i.config_flags & protocol::CONFIG_FLIP_180 != 0);
 
-    if let Some((_, info)) = &transport_setup {
-        orientation::ensure(info.width, info.height);
+
+    // The size everything downstream is built around: the encoder's surfaces,
+    // the format offered to PipeWire, and on GNOME the virtual monitor itself.
+    // With no client connected at all (capture-only diagnostic runs) there is
+    // no handshake to take it from, so a plain default stands in.
+    let capture_size = match &transport_setup {
+        Some((_, info)) => (info.width, info.height),
+        None => {
+            eprintln!("[capture] no client connected -- defaulting to 1920x1080");
+            (1920, 1080)
+        }
+    };
+
+    // No-op on GNOME (mutter's RecordVirtual creates the monitor at the size it
+    // is asked for); on KDE this is what (re)creates the krfb output.
+    if transport_setup.is_some() {
+        orientation::ensure(capture_size.0, capture_size.1);
     }
 
-    let (stream, fd) = if use_uinput {
-        eprintln!("Opening portal ScreenCast session -- pick the virtual monitor in the dialog...");
-        portal_capture::open_portal(cursor).await.expect("portal negotiation failed")
-    } else {
-        eprintln!(
-            "[input] /dev/uinput not accessible (no root-granted permission on this machine) \
-             -- falling back to portal RemoteDesktop input: position + click only, no S Pen \
-             pressure/tilt. Opening combined ScreenCast + RemoteDesktop portal session..."
-        );
-        let (stream, fd, remote_input) = remote_desktop_input::open_portal_with_input()
-            .await
-            .expect("portal negotiation failed");
-        // Hands off to the input thread, which has been blocked waiting for
-        // this since right after it read the capability handshake above.
-        let _ = remote_input_tx.send(remote_input);
-        (stream, fd)
+    let (node_id, fd) = match backend {
+        // Mutter creates the virtual monitor and publishes its PipeWire node in
+        // the same call, on the user's own PipeWire daemon -- no portal, no
+        // picker dialog, no restore token, and so no separate remote fd to
+        // connect through either.
+        desktop::Backend::Gnome => {
+            eprintln!(
+                "[gnome] asking mutter for a {}x{} virtual monitor...",
+                capture_size.0, capture_size.1
+            );
+            match gnome_screencast::start(capture_size.0, capture_size.1, cursor) {
+                Ok(node_id) => (node_id, None),
+                Err(e) => {
+                    eprintln!("[gnome] couldn't create the virtual monitor: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        desktop::Backend::Kde => {
+            let (stream, fd) = if use_uinput {
+                eprintln!("Opening portal ScreenCast session -- pick the virtual monitor in the dialog...");
+                portal_capture::open_portal(cursor).await.expect("portal negotiation failed")
+            } else {
+                eprintln!(
+                    "[input] /dev/uinput not accessible (no root-granted permission on this machine) \
+                     -- falling back to portal RemoteDesktop input: position + click only, no S Pen \
+                     pressure/tilt. Opening combined ScreenCast + RemoteDesktop portal session..."
+                );
+                let (stream, fd, remote_input) = remote_desktop_input::open_portal_with_input()
+                    .await
+                    .expect("portal negotiation failed");
+                // Hands off to the input thread, which has been blocked waiting
+                // for this since right after it read the capability handshake
+                // above.
+                let _ = remote_input_tx.send(remote_input);
+                (stream, fd)
+            };
+            let node_id = stream.pipe_wire_node_id();
+            eprintln!(
+                "[portal] got stream: node_id={node_id} size={:?} position={:?}",
+                stream.size(),
+                stream.position()
+            );
+            (node_id, Some(fd))
+        }
     };
-    let node_id = stream.pipe_wire_node_id();
-    eprintln!(
-        "[portal] got stream: node_id={node_id} size={:?} position={:?}",
-        stream.size(),
-        stream.position()
-    );
 
     let transport = transport_setup.map(|(writer, _)| writer);
-    let stats =
-        portal_capture::run_capture(node_id, fd, &out_path, transport, flip_180, cursor).expect("capture failed");
+    let stats = portal_capture::run_capture(
+        node_id,
+        fd,
+        &out_path,
+        transport,
+        flip_180,
+        cursor,
+        capture_size,
+    )
+    .expect("capture failed");
 
     if stats.frame_count == 0 {
         println!("No frames captured.");

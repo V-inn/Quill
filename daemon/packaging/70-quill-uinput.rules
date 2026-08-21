@@ -1,0 +1,44 @@
+# Gives the logged-in desktop user access to /dev/uinput, which is the only
+# thing in Quill that needs root -- and only once, to install this file.
+#
+# Everything else the daemon does runs as a plain user: the virtual display is
+# a screen-cast session (a portal call on KDE, a session-bus call to mutter on
+# GNOME), the tablet is reached over USB through libusb, and nothing writes
+# outside $HOME. Creating virtual input devices is the exception, because
+# /dev/uinput is root-owned by default and can synthesize input for the whole
+# session.
+#
+# `TAG+="uaccess"` is the mechanism the desktop already uses for exactly this
+# class of device (joysticks, webcams, smartcard readers): systemd-logind puts
+# an ACL on the node granting the user currently logged in at the seat, and
+# removes it when they log out. That is narrower than the usual advice of
+# `MODE="0660", GROUP="input"`, which would hand /dev/uinput to every member of
+# the input group permanently, logged in or not.
+#
+# `OPTIONS+="static_node=uinput"` applies the tag to the node udev creates at
+# boot, before anything has loaded the uinput module -- without it the rule
+# only takes effect once something else has already opened the device, which is
+# the chicken-and-egg this daemon would otherwise be stuck in.
+#
+# THE "70" IS LOAD-BEARING -- do not renumber this file upwards. udev runs rules
+# in lexical filename order, and setting `TAG+="uaccess"` does nothing by
+# itself: the tag is *consumed* by systemd's own
+# /usr/lib/udev/rules.d/73-seat-late.rules, whose only relevant line is
+#
+#     TAG=="uaccess", ENV{MAJOR}!="", RUN{builtin}+="uaccess"
+#
+# so a rule numbered above 73 sets the tag after the one thing that reads it has
+# already run, and the ACL is silently never applied. This file was briefly
+# numbered 99 and was inert for exactly that reason. 70 matches systemd's own
+# 70-uaccess.rules; every other uaccess-setting rule on a typical system sits in
+# the same range (51-android, 60-steam-input, ...).
+#
+# Install:
+#   sudo cp 70-quill-uinput.rules /etc/udev/rules.d/70-quill-uinput.rules
+#   sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=misc
+# then log out and back in, so logind applies the ACL to your session.
+#
+# Some systems already have an equivalent rule from another package (Steam
+# ships one, for instance) -- `getfacl /dev/uinput` showing your user means
+# there is nothing to install here.
+KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"
