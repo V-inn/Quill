@@ -15,10 +15,11 @@ use pipewire as pw;
 use pw::spa;
 use pw::{properties::properties, spa::pod::Pod};
 use std::cell::RefCell;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::os::fd::OwnedFd;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -266,15 +267,45 @@ impl CursorRendering {
 /// abruptly by design (six `std::process::exit` sites), and a truncated token
 /// reads back as a rejected one -- i.e. as a picker dialog for someone who
 /// isn't there.
+///
+/// The token is a secret, not just cached state: it is deliberately saved with
+/// `PersistMode::ExplicitlyRevoked` so the portal skips the picker dialog on
+/// every later run, which means anyone who can read this file can attempt to
+/// re-acquire full-screen capture with no consent prompt. So it is written
+/// 0600 inside a 0700 directory -- `fs::write` would have created it 0666 &
+/// ~umask, i.e. world-readable on a stock umask.
 fn save_restore_token(path: &std::path::Path, token: &str) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
+        // Unconditionally, not just on the create path: `create_dir_all` leaves
+        // an already-existing directory's mode alone, and this directory
+        // predates the tightening on every machine that has run an older build.
+        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
     }
     let tmp = path.with_extension("tmp");
-    if let Err(e) = std::fs::write(&tmp, token) {
+    // `mode()` only applies when the open actually creates the file, so a
+    // leftover tmp from a crashed run would otherwise be reused with whatever
+    // mode it already had. Remove first, then `create_new`, which fails closed
+    // (`O_EXCL`) rather than adopting a file someone else planted in between.
+    let _ = std::fs::remove_file(&tmp);
+    let mut file = match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("[portal] failed to save restore token: {e}");
+            return;
+        }
+    };
+    if let Err(e) = file.write_all(token.as_bytes()) {
         eprintln!("[portal] failed to save restore token: {e}");
+        let _ = std::fs::remove_file(&tmp);
         return;
     }
+    drop(file);
     if let Err(e) = std::fs::rename(&tmp, path) {
         eprintln!("[portal] failed to install restore token: {e}");
         let _ = std::fs::remove_file(&tmp);

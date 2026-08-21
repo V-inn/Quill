@@ -1,0 +1,36 @@
+# Grants the desktop user write access to /dev/uinput, which the daemon needs
+# to create the virtual tablet (see uinput_tablet.rs). Without it the daemon
+# falls back to the RemoteDesktop portal, which has no pressure or tilt axis at
+# all -- mouse-tier input, not a digitizer (see remote_desktop_input.rs).
+#
+# TAG+="uaccess" is the narrowest grant that does this job. systemd-logind
+# attaches an ACL for whichever user holds the *active* session on the seat and
+# removes it when that session stops being active. It gives nothing to an SSH
+# login (not a seat session), nothing to an inactive or logged-out local user,
+# and nothing to a system service.
+#
+# Worth contrasting with GROUP="input", the other common way to grant uinput:
+# on Debian that group owns every /dev/input/event* node at mode 0660, so it is
+# a *read* grant on every physical keyboard attached to the machine -- i.e. a
+# keylogger. This rule grants no read access to any real device.
+#
+# The number is load-bearing, not cosmetic. udev applies rules in lexical
+# filename order, and the uaccess tag is only ever acted on by
+# /usr/lib/udev/rules.d/73-seat-late.rules:
+#
+#     TAG=="uaccess", ENV{MAJOR}!="", RUN{builtin}+="uaccess"
+#
+# A rule numbered above 73 would set the tag after the only thing that reads it
+# has already run: the ACL would never be attached and the grant would silently
+# do nothing, with no error anywhere. That is why this is 60 and the launch
+# rule beside it is 99 -- they are ordered against different things. Every
+# uaccess-tagging rule on a stock system sits below 73 for the same reason
+# (systemd's own is 70-uaccess.rules; Steam's is 60-steam-input.rules).
+#
+# static_node=uinput applies the grant to the device node even before anything
+# has loaded the uinput module, which is what makes it work on a cold boot.
+#
+# This line is byte-for-byte what Steam ships as 60-steam-input.rules, so on
+# any machine with Steam installed the grant is already in effect and this rule
+# changes nothing.
+KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"

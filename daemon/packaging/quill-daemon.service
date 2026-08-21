@@ -10,3 +10,63 @@ Type=simple
 ExecStart=%h/.local/bin/quill-daemon %h/.local/share/quill/output.h264 aoa
 Restart=on-failure
 RestartSec=2
+
+# --- Sandboxing -------------------------------------------------------------
+# This is a `systemd --user` unit, so it never held privileges to drop. The
+# point of everything below is to shrink what a *compromised* daemon could
+# reach -- which is the question a security reviewer actually asks when this
+# project requests a udev rule for /dev/uinput.
+#
+# Each directive here was verified to leave the daemon working, not merely to
+# be accepted by systemd: under this exact set, the VAAPI encoder still
+# produced 150 frames at 2560x1600, /dev/uinput still opened, and libusb,
+# PipeWire and the session bus were all still reachable.
+
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+
+# PipeWire, D-Bus and udev over local sockets; loopback TCP only in the
+# adb-forward transport. Nothing else -- the AOA default needs no network at
+# all, and the daemon never listens on one.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_NETLINK
+
+# Read-only everywhere except the two directories the daemon actually writes:
+# the captured-video dump and the portal restore token.
+ProtectSystem=strict
+ReadWritePaths=%h/.local/share/quill %h/.config/quill
+
+ProtectProc=invisible
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+PrivateTmp=yes
+
+# 0600 on anything the daemon creates. The portal restore token sets its mode
+# explicitly (see `save_restore_token` in portal_capture.rs) rather than
+# relying on this, but this covers the video dump and anything added later by
+# someone not thinking about permissions.
+UMask=0077
+
+# Deliberately NOT set. Listed so the gaps read as decisions:
+#
+#   ProtectHome=            The daemon writes the capture dump and the portal
+#                           token under $HOME. ReadWritePaths above is the
+#                           narrower form of the same restriction.
+#
+#   PrivateDevices=         Would swap /dev for a minimal set containing
+#                           neither /dev/uinput nor the DRM render node --
+#                           i.e. it would disable both the tablet and the
+#                           hardware encoder.
+#
+#   CapabilityBoundingSet=  A user manager rejects it as privileged, and a
+#                           --user unit holds no capabilities to bound in the
+#                           first place.
