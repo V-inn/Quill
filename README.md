@@ -47,6 +47,66 @@ systems already have an equivalent rule from another package; `install.sh` check
 tells you if you don't need it. Nothing else in Quill runs as root, and it never asks
 for a password again.
 
+## Getting started
+
+Three steps: build the daemon on your computer, install the app on the tablet,
+plug them together.
+
+### 1. The daemon
+
+You need a GPU that can encode H.264 through VAAPI — the encoder is hardware-only.
+Check with `vainfo | grep -E 'VAProfileH264.*EncSlice'`; if that prints nothing,
+Quill will not run. Intel and AMD graphics generally work, NVIDIA does not.
+
+```sh
+# Debian / Ubuntu
+sudo apt install build-essential pkg-config curl clang libclang-dev \
+                 libva-dev libpipewire-0.3-dev libusb-1.0-0-dev
+
+# ...plus krfb on KDE, for the virtual monitor. GNOME needs nothing extra.
+sudo apt install krfb
+
+# Rust, if you don't have it
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+```sh
+git clone https://github.com/V-inn/Quill.git
+cd Quill/daemon
+cargo build --release
+./packaging/install.sh
+```
+
+`install.sh` prints two `sudo` lines to run — one udev rule that lets Quill create
+the virtual pen (this is the only step that needs root, and only once), and one
+that starts the daemon when you plug the tablet in. **Log out and back in
+afterwards**, so the pen permission applies to your session.
+
+Full detail, every option, and a troubleshooting table:
+[`daemon/README.md`](./daemon/README.md).
+
+### 2. The tablet
+
+```sh
+cd Quill/android-client
+echo "sdk.dir=$HOME/Android/Sdk" > local.properties
+./gradlew assembleDebug
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+```
+
+More in [`android-client/README.md`](./android-client/README.md).
+
+### 3. Plug it in
+
+Connect the cable and unlock the tablet — Android will not hand the connection to
+an app while the screen is locked. The app opens on its own.
+
+On KDE, the first run shows your desktop's screen-picker dialog once: choose
+`Virtual-QuillDisplay`. The answer is remembered, so it never asks again. On GNOME
+there is no dialog.
+
+Then drag a window onto the tablet.
+
 ## Features
 
 - Extended display over USB, connecting directly to the tablet (no `adb` relay
@@ -85,7 +145,7 @@ open.
 - `assets/` — GIFs used in this README.
 - `daemon/` — the Linux-side program (written in Rust) that talks to the tablet:
   captures the screen, sends video to it, and turns pen input back into something
-  Linux understands.
+  Linux understands. [Build and run instructions](./daemon/README.md).
 - `android-client/` — the app that runs on the tablet: displays the video feed and
   reports pen/touch input back to the daemon.
 - `experiments/` — throwaway spikes used to validate ideas before they become real

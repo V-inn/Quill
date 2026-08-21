@@ -2729,3 +2729,58 @@ turned on for portrait sessions. Landscape is unaffected.
 Verified with a synthetic client sending `config_flags = 4`: a touch at
 (1000, 700) arrived at the uinput layer as (1560, 900) -- reflected against the
 2560x1600 panel, exactly as the old portrait path did.
+
+## 25. Install instructions, and the kernel module nobody needed
+
+The repo had no install instructions at all. The root README said what Quill is
+and what it needs; `daemon/README.md` was one line ("Work begins in Milestone 2").
+The only build command written down anywhere was the Android one. The path from
+"found this on GitHub" to "it works" existed solely in the author's head.
+
+Writing that path down turned up something worse than a documentation gap.
+
+### A fresh clone did not build
+
+`build.rs` still emitted `cargo:rustc-link-lib=evdi` and `wrapper.h` still
+included `<evdi_lib.h>`, left over from Milestone 2's evdi-to-portal pivot.
+`evdi_capture.rs` had stopped being a module in `main.rs` at that point, and
+nothing outside that orphaned file referenced a single evdi symbol -- but bindgen
+still needed the header and the linker still wanted the library.
+
+So building Quill required `libevdi-dev` **and the evdi DKMS kernel module** --
+the exact thing Milestone 2 abandoned for freezing this machine under both
+Wayland and X11. The honest first line of the install guide would have read
+"install a kernel module we dropped for hanging your desktop."
+
+It went unnoticed for the obvious reason: this development machine still has
+`evdi-dkms`, `libevdi-dev` and `libevdi1` installed from that experiment. Nobody
+had ever built Quill anywhere else.
+
+Removed: the link directive, the three `evdi_.*` bindgen allowlists, the header
+include, and `evdi_capture.rs` itself. `ldd target/release/quill-daemon` no
+longer mentions evdi and the 33 tests still pass.
+
+### The dependency list was verified, not guessed
+
+A list of build dependencies written from memory on the machine that already has
+all of them is worth nothing. This one was derived from `wrapper.h` and the crate
+set, then **built from a clean `debian:13` container installing only the packages
+the guide names** -- which is also what proved the evdi removal, since the
+container has no evdi anything.
+
+First attempt filled the container's disk: `cp -r /src/daemon /tmp/daemon` drags
+in the multi-gigabyte `target/` directory. Copy the sources only.
+
+### What the guide says
+
+`daemon/README.md` is now the real thing: hardware and compositor requirements,
+the `vainfo` check for VAAPI H.264 encode support (hardware-only, no software
+fallback -- worth stating before someone builds the whole thing to find out),
+per-distro dependency lines, build, `install.sh`, what each of the two udev rules
+is for, first-run behaviour on KDE versus GNOME, every `QUILL_*` environment
+variable, and a troubleshooting table keyed on the daemon's own log tags.
+
+The root README gained a short three-step Getting started that hands off to it.
+
+Two things the guide deliberately does not do: promise Quill works outside
+KDE/GNOME, or imply the GNOME path has been tested. It has not.
