@@ -9,6 +9,9 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.graphics.toArgb
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import com.quill.client.ui.QuillTokens
 import com.quill.client.ui.SettingsScreen
 import com.quill.client.ui.SettingsScreenState
@@ -42,6 +45,7 @@ class SettingsActivity : ComponentActivity() {
         // is black -- which would flash before the first Compose frame paints
         // over it in graphite.
         window.setBackgroundDrawable(ColorDrawable(QuillTokens.Slate.toArgb()))
+        hideSystemBars()
 
         val settings = Settings(this)
 
@@ -87,5 +91,27 @@ class SettingsActivity : ComponentActivity() {
                 )
             )
         }
+    }
+
+    /** Same edge-to-edge immersive treatment `MainActivity` uses.
+     *
+     * Without it this screen came up with Samsung's status bar and navigation
+     * dock over it -- jarring next to a main activity that has no system chrome
+     * at all, and the nav bar sat on top of the action row. `SettingsScreen`
+     * still pads for the bars, so a transient reveal never covers anything. */
+    private fun hideSystemBars() {
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        val controller = WindowInsetsControllerCompat(window, window.decorView)
+        controller.hide(WindowInsetsCompat.Type.systemBars())
+        controller.systemBarsBehavior =
+            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+    }
+
+    /** The bars Android brings back on an edge swipe don't hide again on their
+     * own once the transient reveal times out -- re-assert on focus regain, the
+     * standard sticky-immersive pattern (and what `MainActivity` does). */
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) hideSystemBars()
     }
 }
