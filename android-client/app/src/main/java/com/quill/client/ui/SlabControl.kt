@@ -49,18 +49,24 @@ import kotlinx.coroutines.launch
  * This replaces a switch labelled "Rotate the image 180°", which could only ever
  * describe the result in a caption. Here you turn the picture and look at it.
  *
- * **What rotates is the picture and the handle, not the body.** An earlier
- * version turned the chassis instead and left the picture upright, explaining
- * itself in terms of which end the USB cable enters. The cable framing confused
- * more than it helped; rotating the contents is both what people expect and the
- * thing actually being configured.
+ * **The whole slab turns -- body, screen and handle as one object.** An earlier
+ * version explained itself in terms of which end the USB cable enters and turned
+ * only the chassis, holding the picture upright against it. The cable framing
+ * confused more than it helped. A later one turned only the picture inside a
+ * body that stayed put, which was accurate but read as a texture sliding around
+ * behind a window rather than a device being turned over.
  *
- * The copper nub on the edge is the handle: grab it and swing it round. It
- * travels with the picture, so it doubles as the mark that says which way up
- * the display currently is -- without it, a rectangle at 0 and at 180 degrees
- * look identical and the control would appear to do nothing. It is deliberately
- * unlabelled. It marks an edge and gives you something to take hold of, and
- * needs no more explanation than that.
+ * The copper nub on the edge is the handle: grab it and swing it round. It is
+ * part of the body, so it also marks which way up the display currently is --
+ * without it, a rectangle at 0 and at 180 degrees look identical and the control
+ * would appear to do nothing. It is deliberately unlabelled: it marks an edge
+ * and gives you something to take hold of, and needs no more explanation.
+ *
+ * Because the whole thing turns, it needs room to turn *in*. The slab is laid
+ * out in a square and drawn small enough that its diagonal fits, so it sweeps
+ * through every angle without being clipped. Sizing it to the panel's aspect
+ * instead would have sliced its corners off every time it passed through the
+ * quarter turn, which is exactly the part of the movement worth watching.
  *
  * **What the picture shows is the result, not the present.** The captured frame
  * is whatever is on the panel right now, already rotated if the *running*
@@ -139,7 +145,8 @@ fun SlabControl(
         Box(
             Modifier
                 .fillMaxWidth()
-                .aspectRatio(panelAspect.coerceIn(0.4f, 2.5f))
+                // Square, so the slab has room to sweep -- see the note above.
+                .aspectRatio(1f)
                 // Tap is the primary interaction and the only one TalkBack can
                 // drive: a rotational drag is not operable without sight.
                 .pointerInput(sessionFlip180) {
@@ -180,7 +187,7 @@ fun SlabControl(
                         if (flip180) "Rotated 180 degrees" else "Not rotated"
                 },
         ) {
-            Canvas(Modifier.fillMaxSize()) { drawSlab(image, angle.value) }
+            Canvas(Modifier.fillMaxSize()) { drawSlab(image, angle.value, panelAspect) }
         }
 
         Readout(flip180 = flip180, sessionLive = sessionLive, hasPicture = image != null, staged = staged)
@@ -196,32 +203,52 @@ private fun isFlippedAt(angleDegrees: Float, sessionFlip180: Boolean): Boolean {
     return if (halfTurned) !sessionFlip180 else sessionFlip180
 }
 
-private fun DrawScope.drawSlab(image: ImageBitmap?, angleDegrees: Float) {
-    val chassisCorner = 14.dp.toPx()
-    val bezel = size.minDimension * 0.055f
+private fun DrawScope.drawSlab(image: ImageBitmap?, angleDegrees: Float, panelAspect: Float) {
+    val aspect = panelAspect.coerceIn(0.4f, 2.5f)
     val centre = Offset(size.width / 2f, size.height / 2f)
-    val screen = Rect(bezel, bezel, size.width - bezel, size.height - bezel)
 
-    // Chassis. Raised, so the screen cut into it reads as a recess.
-    drawRoundRect(
-        color = QuillTokens.Raise,
-        size = size,
-        cornerRadius = CornerRadius(chassisCorner),
-    )
-    drawRoundRect(
-        color = QuillTokens.Copper.copy(alpha = 0.3f),
-        size = size,
-        cornerRadius = CornerRadius(chassisCorner),
-        style = Stroke(width = 1.dp.toPx()),
+    // Largest slab whose *diagonal* fits the square, so no angle clips.
+    val fit = size.minDimension / kotlin.math.sqrt(1f + 1f / (aspect * aspect))
+    val slabWidth = fit
+    val slabHeight = fit / aspect
+    val body = Rect(
+        centre.x - slabWidth / 2f,
+        centre.y - slabHeight / 2f,
+        centre.x + slabWidth / 2f,
+        centre.y + slabHeight / 2f,
     )
 
-    // The screen: darker than everything around it, because it is a window
-    // rather than a panel sitting on top of one.
-    drawRect(color = QuillTokens.Recess, topLeft = screen.topLeft, size = screen.size)
+    val chassisCorner = 14.dp.toPx()
+    val bezel = kotlin.math.min(slabWidth, slabHeight) * 0.055f
+    val screen = Rect(
+        body.left + bezel,
+        body.top + bezel,
+        body.right - bezel,
+        body.bottom - bezel,
+    )
 
-    if (image != null) {
-        clipRect(screen.left, screen.top, screen.right, screen.bottom) {
-            rotate(degrees = angleDegrees, pivot = centre) {
+    // One object: body, screen, picture and handle all turn together.
+    rotate(degrees = angleDegrees, pivot = centre) {
+        drawRoundRect(
+            color = QuillTokens.Raise,
+            topLeft = body.topLeft,
+            size = body.size,
+            cornerRadius = CornerRadius(chassisCorner),
+        )
+        drawRoundRect(
+            color = QuillTokens.Copper.copy(alpha = 0.3f),
+            topLeft = body.topLeft,
+            size = body.size,
+            cornerRadius = CornerRadius(chassisCorner),
+            style = Stroke(width = 1.dp.toPx()),
+        )
+
+        // The screen: darker than everything around it, because it is a window
+        // rather than a panel sitting on top of one.
+        drawRect(color = QuillTokens.Recess, topLeft = screen.topLeft, size = screen.size)
+
+        if (image != null) {
+            clipRect(screen.left, screen.top, screen.right, screen.bottom) {
                 drawImage(
                     image = image,
                     srcOffset = IntOffset.Zero,
@@ -231,17 +258,13 @@ private fun DrawScope.drawSlab(image: ImageBitmap?, angleDegrees: Float) {
                 )
             }
         }
-    }
 
-    // The handle. Outside the clip so it rides the bezel rather than being cut
-    // off by the screen, and rotated with the picture so it is always on the
-    // edge that is currently the bottom of the display.
-    rotate(degrees = angleDegrees, pivot = centre) {
-        val handleWidth = size.minDimension * 0.11f
+        // The handle, on what is currently the bottom edge of the body.
+        val handleWidth = kotlin.math.min(slabWidth, slabHeight) * 0.11f
         val handleHeight = 7.dp.toPx()
         drawRoundRect(
             color = QuillTokens.Copper,
-            topLeft = Offset(centre.x - handleWidth / 2f, size.height - handleHeight / 2f),
+            topLeft = Offset(centre.x - handleWidth / 2f, body.bottom - handleHeight / 2f),
             size = Size(handleWidth, handleHeight * 2f),
             cornerRadius = CornerRadius(handleHeight),
         )
