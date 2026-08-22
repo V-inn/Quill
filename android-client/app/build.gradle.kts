@@ -3,6 +3,22 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+// Release signing, read from ~/.gradle/gradle.properties rather than from
+// anything in this repository. The keystore is a long-lived secret: losing it
+// means never shipping an update that upgrades in place under the same
+// identity, and committing it would be worse.
+//
+// All four deliberately fall back to null. A machine without them still builds
+// a release -- unsigned, and named so -- instead of failing, which keeps the
+// project buildable by anyone who clones it.
+val quillKeystoreFile = providers.gradleProperty("quillKeystoreFile").orNull
+val quillKeystorePassword = providers.gradleProperty("quillKeystorePassword").orNull
+val quillKeyAlias = providers.gradleProperty("quillKeyAlias").orNull
+val quillKeyPassword = providers.gradleProperty("quillKeyPassword").orNull
+val canSignRelease = listOf(
+    quillKeystoreFile, quillKeystorePassword, quillKeyAlias, quillKeyPassword,
+).all { it != null } && file(quillKeystoreFile!!).exists()
+
 android {
     namespace = "com.quill.client"
     compileSdk = 34
@@ -15,8 +31,22 @@ android {
         versionName = "0.1"
     }
 
+    signingConfigs {
+        if (canSignRelease) {
+            create("release") {
+                storeFile = file(quillKeystoreFile!!)
+                storePassword = quillKeystorePassword
+                keyAlias = quillKeyAlias
+                keyPassword = quillKeyPassword
+            }
+        }
+    }
+
     buildTypes {
         release {
+            // Null when the key isn't configured; the build then produces
+            // app-release-unsigned.apk, which is the honest outcome.
+            signingConfig = signingConfigs.findByName("release")
             // Compose ships its own R8 rules, so nothing has to be authored
             // here -- but it has to actually run, or the Compose runtime is
             // carried whole. Turned on with this change, which is also the
