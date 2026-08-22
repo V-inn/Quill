@@ -106,6 +106,20 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     @Volatile
     private var requestedMonitorHeight = 0
 
+    /** The live connection's input stream, and the surface size that was true
+     * when its handshake went out. Together they let [surfaceChanged] notice
+     * that the geometry the daemon is producing for no longer matches the
+     * surface it is being drawn into, and force a renegotiation.
+     *
+     * Both are null/zero whenever no handshake is in force, which is what makes
+     * [surfaceChanged] a no-op during startup and teardown. */
+    @Volatile
+    private var activeInput: BufferedAccessoryInput? = null
+    @Volatile
+    private var connectedSurfaceW = 0
+    @Volatile
+    private var connectedSurfaceH = 0
+
     // Milestone 8: set from the launching intent (or a later
     // USB_ACCESSORY_ATTACHED broadcast) when the daemon has switched the
     // tablet into AOA accessory mode -- see daemon/src/aoa.rs. Null means
@@ -433,7 +447,56 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         }.also { it.start() }
     }
 
-    override fun surfaceChanged(holder: SurfaceHolder, format: Int, w: Int, h: Int) {}
+    /**
+     * Renegotiates the stream when the surface changes shape under it.
+     *
+     * This was an empty method for as long as the activity could rely on the
+     * orientation lock it sets in [onCreate] holding for the whole session
+     * (Milestone 15). Android 16 ends that: for apps targeting API 36, a
+     * display whose smallest width is at least 600dp ignores
+     * screenOrientation, resizability and setRequestedOrientation entirely,
+     * and this tablet is sw753dp. Measured, not assumed -- with targetSdk 36
+     * the activity launched locked to portrait and then followed the display
+     * into landscape anyway. The documented opt-out property does not work
+     * here; see the manifest.
+     *
+     * Without this, nothing crashed, which is the problem. `configChanges`
+     * keeps the activity from being recreated, so the decode loop simply kept
+     * feeding frames of the old shape into a surface of the new one: a
+     * wrong-shaped picture, and every touch mapped through that surface
+     * landing somewhere it was not aimed.
+     *
+     * The renegotiation is a reconnect, deliberately, rather than a new
+     * mid-stream protocol message. A reconnect already re-runs [sendHandshake]
+     * with fresh geometry, already re-sizes the daemon's virtual monitor and
+     * encoder, and is the same thing the settings screen does when it says a
+     * change takes effect the next time the tablet connects. Closing the input
+     * is also exactly how the watchdog forces a reconnect, so this reuses a
+     * path that is already exercised rather than adding a second one.
+     */
+    override fun surfaceChanged(holder: SurfaceHolder, format: Int, w: Int, h: Int) {
+        val input = activeInput ?: return
+        // Startup: the first surfaceChanged arrives before any handshake.
+        if (connectedSurfaceW == 0 || connectedSurfaceH == 0) return
+        if (w == connectedSurfaceW && h == connectedSurfaceH) return
+
+        // Cleared before closing, not after: a rotation delivers several
+        // surfaceChanged callbacks, and without this each one would close a
+        // stream and cost another reconnect.
+        connectedSurfaceW = 0
+        connectedSurfaceH = 0
+        activeInput = null
+
+        Log.i(tag, "surface resized to ${w}x$h, reconnecting to renegotiate geometry")
+        showStatus("Screen rotated -- reconnecting...")
+        try {
+            input.close()
+        } catch (e: Exception) {
+            // The decode loop is already on its way down if this throws; the
+            // retry loop in surfaceCreated reconnects either way.
+            Log.w(tag, "closing input to renegotiate failed", e)
+        }
+    }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
         running = false
@@ -1208,6 +1271,15 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             run {
                 output = out
                 sendHandshake(out)
+                // Remember what the surface looked like at the moment the
+                // daemon was told the geometry. surfaceChanged compares against
+                // this, not against the display, because the surface is what
+                // the decoded frames are actually drawn into.
+                activeInput = input
+                holder.surfaceFrame.let {
+                    connectedSurfaceW = it.width()
+                    connectedSurfaceH = it.height()
+                }
                 val clockOffsetMs = readClockOffset(input)
                 val (width, height) = readVideoFormat(input)
                 runOnUiThread { cursorOverlay.setVideoSize(width, height) }
@@ -1484,6 +1556,12 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         } catch (e: Exception) {
             Log.e(tag, "decode loop error", e)
         } finally {
+            // Before anything else: with no handshake in force there is nothing
+            // for surfaceChanged to renegotiate, and leaving these set would
+            // have it close an input stream belonging to the *next* connection.
+            activeInput = null
+            connectedSurfaceW = 0
+            connectedSurfaceH = 0
             cursorOverlay.clear()
             watchdogRunning.set(false)
             watchdogThread.interrupt()
