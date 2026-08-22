@@ -3,6 +3,14 @@
 //! they don't already match -- chosen once by the Android app at connect
 //! time (see MainActivity.kt), not live-switchable mid-session.
 //!
+//! Everything below the two dispatchers at the top of this file is KDE-only:
+//! `krfb-virtualmonitor` and `kscreen-doctor` are both parts of Plasma and
+//! neither exists on GNOME. The GNOME equivalents live in
+//! `gnome_screencast.rs` (which has no `ensure` step at all -- there, asking
+//! to capture a virtual monitor is what creates it) and `gnome_display.rs`.
+//! The two shared geometry types, `Rect` and `DesktopLayout`, are defined here
+//! and used by both backends.
+//!
 //! First attempt (Milestone 15) tried a plain `kscreen-doctor` rotation of
 //! an *already-created* landscape output instead of recreating it. Live-
 //! tested and found broken two different ways at once: the captured video
@@ -37,6 +45,36 @@ const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
 fn virtual_output_name() -> String {
     format!("Virtual-{OUTPUT_NAME}")
+}
+
+/// Makes sure a virtual output of exactly `width x height` exists, whichever
+/// compositor is running.
+///
+/// On GNOME this is a no-op by construction: mutter creates the monitor as
+/// part of the `RecordVirtual` call that captures it (see
+/// `gnome_screencast::start`), at the size that same call asks for, so there
+/// is nothing to reconcile beforehand and nothing left over afterwards.
+pub fn ensure(width: u32, height: u32) {
+    match crate::desktop::backend() {
+        crate::desktop::Backend::Kde => kde_ensure(width, height),
+        crate::desktop::Backend::Gnome => {}
+    }
+}
+
+/// The virtual output's rectangle plus the bounding box of every enabled
+/// output, both logical. `None` if the output isn't there or the layout can't
+/// be read -- the caller then does without pointer warping rather than
+/// guessing at a layout.
+///
+/// `want`: the size the virtual output was created at. KDE identifies the
+/// output by the name it was created with and ignores this; GNOME has no such
+/// name to match on and uses it to tell our virtual monitor apart from any
+/// other app's (see `gnome_display::layout`).
+pub fn layout(want: (u32, u32)) -> Option<DesktopLayout> {
+    match crate::desktop::backend() {
+        crate::desktop::Backend::Kde => kde_layout(),
+        crate::desktop::Backend::Gnome => crate::gnome_display::layout(want),
+    }
 }
 
 /// The named output's current (width, height) per `kscreen-doctor -j`, or
@@ -107,11 +145,9 @@ fn logical_rect(output: &Value) -> Option<Rect> {
     })
 }
 
-/// The virtual output's rectangle plus the bounding box of every enabled
-/// output, both logical. `None` if the output isn't there or kscreen-doctor
-/// can't be read -- the caller then does without pointer warping rather than
-/// guessing at a layout.
-pub fn layout() -> Option<DesktopLayout> {
+/// `layout()` for KDE: `kscreen-doctor -j`, matching the output by the
+/// `--name` `krfb-virtualmonitor` was started with.
+fn kde_layout() -> Option<DesktopLayout> {
     let out = Command::new("kscreen-doctor").arg("-j").output().ok()?;
     if !out.status.success() {
         return None;
@@ -192,7 +228,7 @@ fn poll_until(timeout: Duration, mut check: impl FnMut() -> bool) -> bool {
 ///
 /// `width`/`height`: the handshake's values, already bounds-checked by the
 /// caller (see `input_receiver.rs`) -- this function trusts them.
-pub fn ensure(width: u32, height: u32) {
+fn kde_ensure(width: u32, height: u32) {
     let name = virtual_output_name();
 
     if current_size(&name) == Some((width, height)) {

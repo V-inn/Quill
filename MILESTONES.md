@@ -1201,7 +1201,7 @@ Pinch-to-zoom, two-finger scroll, and similar — deferred from the Milestone 6b
 click/drag follow-up (see there for why: needs a real multitouch device model, not a
 small extension of the current single-pointer protocol).
 
-## 10. (Not started) GNOME support
+## 10. (Implemented, not yet live-tested) GNOME support
 
 Requested by the user after Milestone 8's no-sudo input fallback (`remote_desktop_input.rs`,
 see the follow-up work under Milestone 8 above) landed. Two genuinely separate problems,
@@ -1219,14 +1219,124 @@ not one:
   "Allow RemoteDesktop requests if they come from a non-sandboxed app", not yet in our
   installed version. GNOME's backend is a different codebase, unlikely to share this
   exact bug, but unconfirmed -- needs live testing on an actual GNOME machine.
-- **Display (the real blocker, not yet solved):** `krfb-virtualmonitor`, which creates
-  the virtual monitor in the first place, is KDE-only (part of `krfb`). GNOME/mutter has
-  no equivalent simple tool -- this is the same gap already flagged in Milestone 1's
-  evdi-to-portal pivot ("KWin has a native, compositor-level virtual-output mechanism...
-  no stable cross-desktop equivalent exists"). Making the *display* side work on GNOME
-  needs its own research pass (does mutter expose any virtual-output mechanism at all,
-  stable or not; would a different approach be needed entirely) before any code gets
-  written -- not started.
+- **Display (was the real blocker):** `krfb-virtualmonitor`, which creates the virtual
+  monitor in the first place, is KDE-only (part of `krfb`). GNOME/mutter has no
+  equivalent simple *tool* -- this is the same gap flagged in Milestone 1's
+  evdi-to-portal pivot ("KWin has a native, compositor-level virtual-output
+  mechanism... no stable cross-desktop equivalent exists").
+
+**The research pass that section asked for found the answer: mutter has one, and it is
+a better fit than KDE's.** `org.gnome.Mutter.ScreenCast.Session.RecordVirtual` --
+mutter's own private-but-stable-in-practice D-Bus interface, the one
+gnome-remote-desktop drives -- creates a virtual monitor *and* returns the PipeWire
+node carrying its pixels, in a single session. The KDE-only thing was the assumption
+that creating the output and capturing it are separate steps.
+
+### What this bought, beyond "GNOME now works"
+
+The GNOME path is structurally simpler than the KDE one at three points that have each
+cost this project a milestone:
+
+1. **No picker dialog, so no restore token.** The whole
+   `restore_token` / `PersistMode::ExplicitlyRevoked` apparatus in `portal_capture.rs`
+   (plus `single_instance.rs`'s first bullet, plus the per-cursor-mode token files)
+   exists because the portal shows a screen-selection dialog and a udev-launched daemon
+   has nobody at the keyboard to dismiss it. None of that machinery is needed here.
+2. **No `orientation::ensure`.** No pkill, no poll-until-ready, no
+   tear-down-and-recreate on an aspect change: the monitor is created at the size
+   `RecordVirtual` is asked for, which is the handshake's size, and it goes away with
+   the process. Nothing is left behind for the next run.
+3. **Nothing needs root.** Mutter's only access check on these calls is that the caller
+   is the same D-Bus sender that created the session (`check_permission` in
+   `meta-screen-cast-session.c`) -- it is a plain session-bus call as the logged-in
+   user.
+
+### What was written
+
+| File | What it does |
+| --- | --- |
+| `desktop.rs` | `Backend::{Kde, Gnome}` detection (`QUILL_BACKEND` override, then `XDG_CURRENT_DESKTOP`, then a session-bus name probe for the udev-launch case where the unit inherits no session environment), plus the one helper for running a D-Bus call from a synchronous caller. |
+| `gnome_screencast.rs` | The `CreateSession` / `RecordVirtual` / `Start` / `PipeWireStreamAdded` sequence. Holds the session on a thread of its own with its own runtime -- mutter ties the session's life to the D-Bus sender, and `run_capture` stops driving the main runtime the moment it's called. |
+| `gnome_display.rs` | `kscreen-doctor -j`'s replacement: `org.gnome.Mutter.DisplayConfig.GetCurrentState`, decoded into the same `DesktopLayout` the pointer warping already consumes. |
+| `orientation.rs` | Now dispatches `ensure`/`layout` on the backend; everything below the dispatchers is unchanged KDE code. |
+| `portal_capture.rs` | `run_capture` takes `fd: Option<OwnedFd>` (mutter publishes on the user's own PipeWire daemon, so there is no portal remote to connect through) and a preferred size. |
+| `packaging/60-quill-uinput.rules` | The one privileged step, isolated: `TAG+="uaccess"` on `/dev/uinput`. |
+
+The `70` in that filename is not cosmetic. `TAG+="uaccess"` does nothing on its own --
+the tag is *consumed* by systemd's `/usr/lib/udev/rules.d/73-seat-late.rules`
+(`TAG=="uaccess", ENV{MAJOR}!="", RUN{builtin}+="uaccess"`), and udev runs rules in
+lexical filename order, so a rule numbered above 73 sets the tag after the only thing
+that reads it has already run. Written first as `99-quill-uinput.rules`, which would
+have been silently inert: no error, no ACL, just a daemon that still can't open
+`/dev/uinput`. Caught in review before it shipped. Every uaccess-setting rule on a
+typical system sits below 73 (`51-android`, `60-steam-input`, systemd's own
+`70-uaccess`).
+
+`99-quill-daemon.rules` is a different mechanism and 99 is correct there: it sets
+`TAG+="systemd"` + `ENV{SYSTEMD_USER_WANTS}`, which systemd-udevd reads after all rule
+processing ends rather than from another rule file.
+
+### Two details that took reading mutter's source, not its docs
+
+- **Who sizes the monitor.** Without the `modes` property, mutter has no monitor to
+  take a size from and lets the *PipeWire format negotiation* decide -- meaning
+  `build_format_pod`'s `VideoSize` range default, which was hardcoded at 1920x1080,
+  would have silently given a 2560x1600 tablet a 1920x1080 display. It now carries the
+  handshake's size. (`modes` pins it explicitly where mutter is new enough to know the
+  property; the negotiated default is the fallback, and both land on the same size.)
+- **Identifying our own output in the layout.** KDE echoes back the `--name` we passed
+  `krfb-virtualmonitor`. Mutter names virtual monitors itself; what it *does* set, in
+  `meta-stream-source-virtual.c`, is a fixed vendor/product pair ("MetaVendor" /
+  "Virtual remote monitor"). That pair is the handle, with the requested size as a
+  tie-break if another app also has a virtual monitor up.
+
+Also worth recording: `RecordVirtual` streams get **no** `Parameters` at all --
+`set_stream_parameters` in `meta-screen-cast-stream.c` has branches for monitor, area
+and window streams and none for virtual ones. The obvious shortcut of reading
+`position`/`size` off the stream object instead of going to `DisplayConfig` is not
+available, and it is set at session-init time anyway, before any negotiation.
+
+### Status: written, compiles, unit-tested, never run against mutter
+
+This machine is Plasma-only, so none of the D-Bus path above has touched a real GNOME
+session. What *is* verified here:
+
+- The full setup path runs end to end and fails where it should
+  (`QUILL_BACKEND=gnome` on this KDE box: thread, runtime, connection, proxy and error
+  propagation all execute, ending at `CreateSession failed:
+  org.freedesktop.DBus.Error.ServiceUnknown`).
+- The KDE path is unchanged and still takes the portal branch.
+- 11 new unit tests. The ones that matter most are in `gnome_screencast.rs`: mutter
+  reads every `RecordVirtual` property with a `g_variant_lookup` naming an exact type
+  string, and **a type mismatch is silently skipped, not reported** -- `cursor-mode`
+  sent as `i` instead of `u` would not fail the call, it would just leave the cursor
+  hidden with no explanation. Those tests assert the D-Bus signature of every property
+  (`u`, `b`, `aa{sv}`, `(uu)`, `d`) against the type strings in mutter's source.
+  `gnome_display.rs`'s tests cover the layout geometry: scale division, the quarter-turn
+  axis swap, negative desktop origins, and picking between two virtual monitors.
+
+`modes` is the one property mutter *validates* rather than ignores, so
+`record_virtual` retries without it on error rather than giving up -- deliberately
+defensive, because the first real GNOME run is going to be someone else's.
+
+### Left open
+
+- **Live test on a GNOME machine.** Nothing here substitutes for it.
+- **No input fallback on GNOME.** `main` exits with the udev-rule instructions if
+  `/dev/uinput` is inaccessible there. The KDE fallback works because the
+  `RemoteDesktop` portal session it needs is the same *kind* of session the display
+  already uses; on GNOME the display doesn't go through a portal at all, so the
+  equivalent would be mutter's `org.gnome.Mutter.RemoteDesktop` tied to this
+  ScreenCast session via `CreateSession`'s `remote-desktop-session-id` property. That
+  is a real option and a separate piece of work.
+- **Scale.** Mutter picks the virtual monitor's scale itself (it has no physical size
+  to go on). `QUILL_GNOME_SCALE` sets `preferred-scale` for the case where it guesses
+  badly on a particular tablet; unset by default, so as not to override the user's own
+  display settings from a daemon.
+- **Does it extend or mirror?** The pre-existing KDE gripe (Milestone 13) about the
+  tablet coming up as a mirror rather than an extension. `is-platform: true` asks
+  mutter to treat this "transparently as if it was a real monitor", which may or may
+  not change the answer there. Unknown until someone runs it.
 
 ## 11. (Partially fixed) Reconnect robustness
 
@@ -2619,3 +2729,243 @@ turned on for portrait sessions. Landscape is unaffected.
 Verified with a synthetic client sending `config_flags = 4`: a touch at
 (1000, 700) arrived at the uinput layer as (1560, 900) -- reflected against the
 2560x1600 panel, exactly as the old portrait path did.
+
+## 25. Install instructions, and the kernel module nobody needed
+
+The repo had no install instructions at all. The root README said what Quill is
+and what it needs; `daemon/README.md` was one line ("Work begins in Milestone 2").
+The only build command written down anywhere was the Android one. The path from
+"found this on GitHub" to "it works" existed solely in the author's head.
+
+Writing that path down turned up something worse than a documentation gap.
+
+### A fresh clone did not build
+
+`build.rs` still emitted `cargo:rustc-link-lib=evdi` and `wrapper.h` still
+included `<evdi_lib.h>`, left over from Milestone 2's evdi-to-portal pivot.
+`evdi_capture.rs` had stopped being a module in `main.rs` at that point, and
+nothing outside that orphaned file referenced a single evdi symbol -- but bindgen
+still needed the header and the linker still wanted the library.
+
+So building Quill required `libevdi-dev` **and the evdi DKMS kernel module** --
+the exact thing Milestone 2 abandoned for freezing this machine under both
+Wayland and X11. The honest first line of the install guide would have read
+"install a kernel module we dropped for hanging your desktop."
+
+It went unnoticed for the obvious reason: this development machine still has
+`evdi-dkms`, `libevdi-dev` and `libevdi1` installed from that experiment. Nobody
+had ever built Quill anywhere else.
+
+Removed: the link directive, the three `evdi_.*` bindgen allowlists, the header
+include, and `evdi_capture.rs` itself. `ldd target/release/quill-daemon` no
+longer mentions evdi and the 33 tests still pass.
+
+### The dependency list was verified, not guessed
+
+A list of build dependencies written from memory on the machine that already has
+all of them is worth nothing. This one was derived from `wrapper.h` and the crate
+set, then **built from clean `debian:13` and `fedora:latest` containers installing
+only the packages the guide names** -- which is also what proved the evdi removal,
+since neither container has evdi anything. Both built clean, in under a minute of
+compile time each.
+
+First attempt filled the container's disk: `cp -r /src/daemon /tmp/daemon` drags
+in the multi-gigabyte `target/` directory. Copy the sources only.
+
+### What the guide says
+
+`daemon/README.md` is now the real thing: hardware and compositor requirements,
+the `vainfo` check for VAAPI H.264 encode support (hardware-only, no software
+fallback -- worth stating before someone builds the whole thing to find out),
+per-distro dependency lines, build, `install.sh`, what each of the two udev rules
+is for, first-run behaviour on KDE versus GNOME, every `QUILL_*` environment
+variable, and a troubleshooting table keyed on the daemon's own log tags.
+
+The root README gained a short three-step Getting started that hands off to it.
+
+Two things the guide deliberately does not do: promise Quill works outside
+KDE/GNOME, or imply the GNOME path has been tested. It has not.
+
+## 26. The settings screen, rebuilt — and 90/270 rotation
+
+User asked for two things: a gear that could be moved out of the way, and a
+settings screen that did not look a decade old. Both turned into more than that.
+
+### What the old screen actually was
+
+`SettingsActivity` built its whole tree imperatively with `Color.BLACK`,
+`LTGRAY` and `DKGRAY`, deprecated framework `Switch` widgets carrying their own
+labels, a default platform `Button` reading "Done", and 2px `View` dividers.
+Surveying it turned up four defects nobody had reported:
+
+- `PAD = 48` was used as a **raw pixel count**, so every gap rendered at less
+  than half the size the number suggests.
+- The activity overrode the app theme with `Theme.Black`, which *has* a title
+  bar, while also carrying `android:label="Quill settings"` -- so that string
+  drew twice.
+- `Settings.showLatencyOverlay` was **write-only dead state**. The only code
+  that read it was the switch that set it. The control did nothing, and had done
+  nothing for four milestones.
+- `CursorOverlay`'s flip was seeded only in `MainActivity.onCreate`. Returning
+  from settings recreates the *surface*, not the activity, so a changed flip
+  reached the daemon in the next handshake but never reached the tablet-drawn
+  pointer.
+
+### The honest problem the redesign is built around
+
+Every setting the daemon acts on is deferred: it chooses its capture session
+before the first frame, so nothing can change mid-session. The old screen
+carried that as a grey paragraph at the top while its switches snapped on and
+implied otherwise.
+
+Sections are now grouped by *when a setting takes effect* rather than by topic.
+A control is marked staged when it differs from **what the running session is
+using** -- not from what is saved -- which needs a snapshot taken at handshake
+time (`SessionConfig`). One marker, one meaning, and it can only appear in a
+section where something is deferred. Both exits name what they do, because
+leaving destroys the video surface either way and there is no free exit to
+pretend otherwise about.
+
+Built in Compose on `foundation`, deliberately not `material3`: this design
+replaces every default it would have supplied, so ~1.4 MB of them would only
+have been fought at every control. Not a departure from the app's "everything in
+code, no layout resources" habit -- the strongest form of it.
+
+### The slab
+
+"Rotate the image 180°" was replaced with a picture of the tablet, drawn at the
+panel's true aspect, with the real desktop inside it captured on the way in via
+`PixelCopy`. Three iterations, each corrected by live use:
+
+1. Chassis turned, picture stayed upright, explained via which end the USB cable
+   enters. **The cable framing confused more than it helped.**
+2. Picture turned inside a fixed body. Accurate, but read as a texture sliding
+   behind a window rather than a device being turned over.
+3. The whole slab turns as one object. That needs room to turn *in* -- a 16:10
+   rectangle passing through the quarter turn is far taller than its own bounds
+   -- so it is laid out in a square and sized so its *diagonal* fits.
+
+Two snap bugs, both found by spinning it: the release target was a bare 0 or
+180, so a dial at 540 degrees unwound a full turn rather than settling where it
+already was modulo one; and `atan2` wraps at ±180, so a drag across that seam
+registered as a 360-degree jump.
+
+### 90 and 270 degree rotation
+
+At a quarter turn the client asks for a monitor whose dimensions are the
+panel's, **transposed** -- a 2560x1600 tablet drives a 1600x2560 desktop that
+the encoder then turns to fill the panel exactly.
+
+Checked before building anything on it that the driver would do it:
+`vaQueryVideoProcPipelineCaps` reports `rotation_flags=0xf` on Intel iHD. That
+probe is kept, because the alternative way to discover an unsupported rotation
+is a black screen.
+
+**The structural change is that the encoder's output dimensions stop matching
+its input for the first time.** Source and output geometry are now separate
+throughout. The first live run sheared the picture and drew it twice side by
+side, because four operations on the *captured* frame -- the DMA-BUF descriptor,
+the imported surface, the probe mapping, the shm upload -- were still using the
+output shape and reading every row at the wrong stride. A second bug sat behind
+it: the daemon announced the capture size to the client rather than the
+encoder's output, so the decoder would have been configured for the wrong
+shape.
+
+Amusingly, the old-daemon guard caught that second one itself: it saw a portrait
+stream come back for a portrait request and correctly concluded the rotation had
+not happened. Right verdict, wrong culprit.
+
+Rotation is two bits (`CONFIG_ROTATE_90` alongside `CONFIG_FLIP_180`), arranged
+so 0 and 180 stay bit-for-bit what they always were. `PROTOCOL_VERSION`
+deliberately did not move -- the length-prefixed handshake body exists so
+capabilities can be appended rather than versioned. The cost is one blind spot
+(an old daemon ignores the new bit) and the client closes it without a new
+field, by checking `MSG_VIDEO_FORMAT` against what it asked for.
+
+`xdpi`/`ydpi` are swapped along with the dimensions. They feed the daemon's
+virtual-touchpad millimetre thresholds (Milestone 9), so leaving them alone
+would silently miscalibrate every gesture while the picture looked perfect. The
+same trap caught the desktop-size work later.
+
+### The gear
+
+Reported as "blocks things and can't be moved". Testing found it was worse: at
+`TOP|END` with a 12dp inset its 48dp touch target sat almost exactly inside the
+region Android watches for the status-bar pull-down, so **tapping it opened the
+notification shade instead of settings**. The one control that exists so
+settings stay reachable while streaming was not reliably reachable.
+
+Now draggable, snapping to the nearest edge, position persisted as an edge plus
+a fraction along it rather than pixels. Idle it retracts to a thin pill hugging
+its edge -- the *view* never changes size, only the drawing, so the touch target
+stays a full 48dp however small the mark looks.
+
+Two insets, for two different reasons: sides keep 6dp backed by
+`setSystemGestureExclusionRects`, which claims the back gesture; top and bottom
+keep 24dp and nothing else, because **gesture exclusion does not apply to the
+immersive system-bar reveal** -- that is a system window above the app, so
+distance is the only lever.
+
+The swallow contract is preserved by construction (all three overrides still
+return `true` unconditionally). The one structural change is that the view now
+detects its own taps rather than delegating to `super.onTouchEvent`, which would
+fire a click at the end of any drag ending near where it began.
+
+A later papercut: touch slop is the right threshold to *start* following a
+finger but far too low to treat as intent to move, so a tap that wobbled past it
+re-snapped and saved a slightly different position. Observed drifting from 0.71
+to 0.27 of the way down an edge over one testing session. A drag now has to
+travel 24dp before it re-parks anything.
+
+### Settings added
+
+| Setting | Where it lives | Notes |
+|---|---|---|
+| Rotation (0/90/180/270) | session | the slab |
+| Desktop size (100/75/60%) | session | both axes take the same factor, which keeps the input mapping a single multiply -- even at a quarter turn, where monitor-is-transposed and monitor-is-scaled cancel out |
+| Picture quality | session | preset picks a *fraction* of the driver's quality range, not a fixed level: iHD reports 7, other drivers report something else, and a hardcoded number would mean opposite things |
+| Halve the frame rate | session | enforced by not encoding, not by negotiating a rate -- what arrives is driven by compositor damage, and a negotiated maximum is a hint |
+| Keep the screen awake | tablet | `FLAG_KEEP_SCREEN_ON`, no permission. Scoped to *rendering*, not to the activity being open, and deliberately not frame-driven: an idle desktop sends no frames, which is exactly the case it exists to survive |
+| S Pen side button | tablet | right / middle / eraser / nothing, carried per event so it needs no reconnect |
+| Latency overlay | tablet | the dead switch, made real |
+
+### The latency overlay tells you when not to believe it
+
+Wiring it up immediately produced a confident **"696 ms"** over a stream actually
+running at about 30. The clock-sync had calibrated against a queued reply --
+round-trip 1308ms instead of the usual 1. `MainActivity`'s own watchdog comment
+already records what that costs: *"every reported per-frame latency was off by
+~550ms for the rest of the session"*.
+
+A readout that prints a number this repo's own notes call wrong is worse than no
+readout. Past 100ms of round-trip it turns copper and appends the figure and
+"reading unreliable".
+
+It also must **not** swallow input -- the exact opposite of the contract two
+files away in `GearButton`, and copying that would have put a full-screen dead
+rectangle over the desktop. There is a comment saying so, because the failure
+would be invisible until someone tried to click something.
+
+### Verified on hardware
+
+All four rotations (desktop fills the panel, taskbar left at 90 and right at
+270, pointer within ~10px of the finger at both quarter turns). Desktop size at
+75% (1920x1200 monitor, alignment holds). Frame cap measured rather than assumed
+-- 30 frames per 1.03s capped against per 0.52s uncapped. Gear drag over the
+full width of the screen leaving the Linux desktop **byte-identical outside the
+gear's own rectangle**. Screen-awake as a `SCREEN_BRIGHT_WAKE_LOCK` attributed
+to the app, present after the first frame and absent before it.
+
+### Not verified, and needing a person
+
+- **The S Pen side button.** `adb` cannot synthesise `BUTTON_STYLUS_PRIMARY`, so
+  middle click and eraser have never actually been pressed. The bit decoding is
+  unit-tested and the virtual tablet advertises `KEY=1c03` -- `BTN_TOOL_PEN`,
+  `BTN_TOOL_RUBBER`, `BTN_TOUCH`, `BTN_STYLUS`, `BTN_STYLUS2` -- but that is
+  capability, not behaviour.
+- **Pen pressure and tilt at the quarter turns.** Touch is verified there and
+  the pen goes through the same mapping, but no real S Pen has been on it.
+- **The accessibility pass.** Focus rings and the reduced-motion gate are
+  written; neither has been exercised with a keyboard or with
+  `animator_duration_scale 0`.
+- **Anything GNOME.** Milestone 10's caveat still stands.

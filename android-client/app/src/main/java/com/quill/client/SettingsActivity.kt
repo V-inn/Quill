@@ -1,168 +1,179 @@
 package com.quill.client
 
-import android.app.Activity
-import android.graphics.Color
+import android.graphics.drawable.ColorDrawable
 import android.os.Bundle
-import android.view.Gravity
-import android.view.View
-import android.widget.Button
-import android.widget.LinearLayout
-import android.widget.ScrollView
-import android.widget.Switch
-import android.widget.TextView
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
+import androidx.activity.compose.setContent
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.graphics.toArgb
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
+import com.quill.client.ui.QuillTokens
+import com.quill.client.ui.SettingsScreen
+import com.quill.client.ui.SettingsScreenState
 
 /**
- * Settings, reachable by tapping the status overlay on the main screen (there
- * is no system chrome to hang a menu off -- the app runs edge-to-edge immersive
- * as a monitor replacement, so the video surface itself is the only affordance).
+ * Settings, reached from the gear while streaming, or from the status overlay
+ * before the first frame (the app runs edge-to-edge immersive as a monitor
+ * replacement, so the video surface itself is the only affordance).
  *
- * Built in code rather than XML to match the rest of this app, which has no
- * layout resources at all.
+ * Built in Compose. That is not a departure from this app's "everything in
+ * code, no layout resources" habit -- it is the strongest form of it. There is
+ * still no `res/layout`, and the only resource directory that exists is
+ * `res/font`, which holds the three faces this screen is set in.
+ *
+ * `material3` is deliberately absent: this design replaces every default it
+ * would have supplied, so it would only have been fought at every control. See
+ * `ui/Controls.kt` for the switch, press feedback and focus ring built in its
+ * place.
+ *
+ * **Leaving here reconnects, whatever you pressed.** Opening this activity
+ * destroys the video surface, so returning restarts the decode loop with a
+ * fresh handshake -- which is exactly what makes a changed setting take effect,
+ * since the daemon fixes its capture session before the first frame. The action
+ * bar says so rather than pretending otherwise.
  */
-class SettingsActivity : Activity() {
+class SettingsActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // The activity theme is Theme.Black.NoTitleBar, whose window background
+        // is black -- which would flash before the first Compose frame paints
+        // over it in graphite.
+        window.setBackgroundDrawable(ColorDrawable(QuillTokens.Slate.toArgb()))
+        hideSystemBars()
+
         val settings = Settings(this)
 
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.BLACK)
-            setPadding(PAD, PAD, PAD, PAD)
-        }
+        setContent {
+            // Session settings are *staged*: held here and written only on
+            // Apply. The old screen wrote every toggle through on the spot,
+            // which made any Apply button a lie -- backing out still left the
+            // change for the next reconnect to pick up.
+            //
+            // rememberSaveable so a rotation or a process death does not
+            // silently drop what you were half-way through choosing.
+            var clientSideCursor by rememberSaveable { mutableStateOf(settings.clientSideCursor) }
+            var ctrlScrollZoom by rememberSaveable { mutableStateOf(settings.ctrlScrollZoom) }
+            var rotationDegrees by rememberSaveable { mutableStateOf(settings.rotationDegrees) }
+            var workspaceScale by rememberSaveable { mutableStateOf(settings.workspaceScalePercent) }
+            var cap30Fps by rememberSaveable { mutableStateOf(settings.cap30Fps) }
+            var quality by rememberSaveable { mutableStateOf(settings.quality) }
 
-        root.addView(heading("Quill settings"))
-        root.addView(
-            note(
-                "Changes apply the next time the tablet connects. The daemon " +
-                    "decides which kind of capture session to open before the first " +
-                    "frame, so these cannot be switched mid-session."
-            )
-        )
+            // Tablet settings are not staged -- there is nothing to stage
+            // against, since they take effect the moment you leave. They keep
+            // writing through, and can never show a staged mark.
+            var keepScreenAwake by rememberSaveable { mutableStateOf(settings.keepScreenAwake) }
+            var showLatencyOverlay by rememberSaveable { mutableStateOf(settings.showLatencyOverlay) }
+            var sideButtonAction by rememberSaveable { mutableStateOf(settings.sideButtonAction) }
 
-        root.addView(divider())
-        root.addView(heading("Cursor"))
-        val cursorSwitch = switchRow(
-            "Draw the pointer on the tablet (experimental)",
-            settings.clientSideCursor
-        ) { settings.clientSideCursor = it }
-        root.addView(cursorSwitch)
-        root.addView(
-            note(
-                "KNOWN ISSUE on KDE/KWin virtual displays: you will see TWO pointers.\n\n" +
-                    "A normal monitor keeps the pointer on a separate hardware layer, so the " +
-                    "desktop can leave it out of the picture it sends. A virtual display has " +
-                    "no such layer, so the desktop paints the pointer into the picture and " +
-                    "cannot be asked not to. Turning this on adds a second, faster pointer " +
-                    "drawn by the tablet, leaving the desktop's own pointer trailing a frame " +
-                    "behind it.\n\n" +
-                    "Measured on this setup, the tablet-drawn pointer was only about 5-10ms " +
-                    "ahead of the video anyway, so there is little to gain. Left here because " +
-                    "other desktops may behave differently.\n\n" +
-                    "Pen ink is unaffected either way: it is drawn by the app on the desktop " +
-                    "and comes back with the video."
-            )
-        )
+            val draft = SettingsDraft(clientSideCursor, ctrlScrollZoom, rotationDegrees, workspaceScale, cap30Fps, quality)
+            val session = SessionConfig.applied
 
-        root.addView(divider())
-        root.addView(heading("Display"))
-        root.addView(
-            switchRow("Rotate the image 180°", settings.flip180) { settings.flip180 = it }
-        )
-        root.addView(
-            note(
-                "Turn this on if the desktop appears upside down -- which way up it " +
-                    "belongs depends on which end of the device the USB cable enters, and " +
-                    "only you can see that.\n\n" +
-                    "Touch and pen coordinates rotate with the image, so they keep lining " +
-                    "up either way."
-            )
-        )
-
-        root.addView(divider())
-        root.addView(heading("Touch gestures"))
-        root.addView(
-            note(
-                "Two-finger scroll, pinch, swipes and two-finger tap are recognized by " +
-                    "Linux itself, from a virtual touchpad the daemon creates. Configure " +
-                    "them in System Settings > Touchpad (or Mouse & Touchpad on GNOME) " +
-                    "like any real trackpad.\n\n" +
-                    "One finger still points where you touch, and holding one finger still " +
-                    "is a right click."
-            )
-        )
-        root.addView(
-            switchRow("Zoom with Ctrl+scroll instead of pinch", settings.ctrlScrollZoom) {
-                settings.ctrlScrollZoom = it
+            val apply = {
+                draft.commit(settings)
+                finish()
             }
-        )
-        root.addView(
-            note(
-                "OFF sends a real pinch gesture. Only applications that understand Wayland " +
-                    "gestures zoom from it -- Firefox and GTK apps do, anything running " +
-                    "through XWayland (Krita, older Qt apps) ignores it entirely.\n\n" +
-                    "ON has the daemon recognize the pinch itself and send Ctrl+scroll, which " +
-                    "almost every application honours, but zooms in fixed steps instead of " +
-                    "smoothly."
+            val discard = { finish() }
+
+            // The system back button means "leave", and leaving without
+            // applying is discarding -- so it does exactly what the Discard
+            // button does rather than some third thing.
+            BackHandler(onBack = discard)
+
+            SettingsScreen(
+                SettingsScreenState(
+                    clientSideCursor = clientSideCursor,
+                    ctrlScrollZoom = ctrlScrollZoom,
+                    rotationDegrees = rotationDegrees,
+                    workspaceScalePercent = workspaceScale,
+                    cap30Fps = cap30Fps,
+                    quality = quality,
+                    keepScreenAwake = keepScreenAwake,
+                    showLatencyOverlay = showLatencyOverlay,
+                    sideButtonAction = sideButtonAction,
+
+                    // "Differs from what is running", not "differs from what is
+                    // saved". With no session yet, nothing can be out of step
+                    // with one, so nothing is marked.
+                    clientSideCursorStaged = session != null && clientSideCursor != session.clientSideCursor,
+                    ctrlScrollZoomStaged = session != null && ctrlScrollZoom != session.ctrlScrollZoom,
+                    rotationStaged = session != null && rotationDegrees != session.rotationDegrees,
+                    workspaceStaged = session != null && workspaceScale != session.workspaceScalePercent,
+                    cap30FpsStaged = session != null && cap30Fps != session.cap30Fps,
+                    qualityStaged = session != null && quality != session.quality,
+
+                    sessionLive = session != null,
+                    previewFrame = FramePreview.peek(),
+                    panelAspect = FramePreview.panelAspect(),
+                    panelWidthPx = FramePreview.panelWidthPx,
+                    panelHeightPx = FramePreview.panelHeightPx,
+                    sessionRotationDegrees = session?.rotationDegrees ?: rotationDegrees,
+                    connectionLabel = session
+                        ?.let { "${it.widthPx} × ${it.heightPx}" }
+                        ?: "Not connected",
+
+                    onClientSideCursor = { clientSideCursor = it },
+                    onCtrlScrollZoom = { ctrlScrollZoom = it },
+                    onRotation = { rotationDegrees = it },
+                    onWorkspaceScale = { workspaceScale = it },
+                    onCap30Fps = { cap30Fps = it },
+                    onQuality = { quality = it },
+                    onKeepScreenAwake = {
+                        keepScreenAwake = it
+                        settings.keepScreenAwake = it
+                    },
+                    onShowLatencyOverlay = {
+                        showLatencyOverlay = it
+                        settings.showLatencyOverlay = it
+                    },
+                    onSideButtonAction = {
+                        sideButtonAction = it
+                        settings.sideButtonAction = it
+                    },
+                    onApply = apply,
+                    onDiscard = discard,
+                )
             )
-        )
-
-        root.addView(divider())
-        root.addView(heading("Diagnostics"))
-        root.addView(
-            switchRow("Show latency overlay", settings.showLatencyOverlay) {
-                settings.showLatencyOverlay = it
-            }
-        )
-        root.addView(note("Draws the running per-frame latency over the video."))
-
-        root.addView(divider())
-        root.addView(Button(this).apply {
-            text = "Done"
-            setOnClickListener { finish() }
-        })
-
-        setContentView(ScrollView(this).apply {
-            setBackgroundColor(Color.BLACK)
-            addView(root)
-        })
-    }
-
-    private fun heading(text: String) = TextView(this).apply {
-        this.text = text
-        setTextColor(Color.WHITE)
-        textSize = 22f
-        setPadding(0, PAD / 2, 0, PAD / 4)
-    }
-
-    private fun note(text: String) = TextView(this).apply {
-        this.text = text
-        setTextColor(Color.LTGRAY)
-        textSize = 14f
-        setPadding(0, 0, 0, PAD / 2)
-    }
-
-    private fun divider() = View(this).apply {
-        setBackgroundColor(Color.DKGRAY)
-        layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 2).apply {
-            topMargin = PAD / 2
-            bottomMargin = PAD / 2
         }
     }
 
-    @Suppress("DEPRECATION") // Switch is fine here; this app pulls in no Material dependency
-    private fun switchRow(label: String, initial: Boolean, onChange: (Boolean) -> Unit) =
-        Switch(this).apply {
-            text = label
-            textSize = 18f
-            setTextColor(Color.WHITE)
-            isChecked = initial
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, PAD / 4, 0, PAD / 4)
-            setOnCheckedChangeListener { _, checked -> onChange(checked) }
-        }
+    override fun onDestroy() {
+        super.onDestroy()
+        // The captured frame exists for this screen and nothing else -- but
+        // `onDestroy` also runs when this activity is merely being *recreated*,
+        // which is what a physical rotation does, since unlike MainActivity
+        // this one is free to turn. Recycling the bitmap there left the
+        // rebuilt screen with no picture until the next trip through the gear.
+        // `isFinishing` is exactly the distinction between going away and
+        // coming straight back.
+        if (isFinishing) FramePreview.clear()
+    }
 
-    companion object {
-        private const val PAD = 48
+    /** Same edge-to-edge immersive treatment `MainActivity` uses.
+     *
+     * Without it this screen came up with Samsung's status bar and navigation
+     * dock over it -- jarring next to a main activity that has no system chrome
+     * at all, and the nav bar sat on top of the action row. `SettingsScreen`
+     * still pads for the bars, so a transient reveal never covers anything. */
+    private fun hideSystemBars() {
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        val controller = WindowInsetsControllerCompat(window, window.decorView)
+        controller.hide(WindowInsetsCompat.Type.systemBars())
+        controller.systemBarsBehavior =
+            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+    }
+
+    /** The bars Android brings back on an edge swipe don't hide again on their
+     * own once the transient reveal times out -- re-assert on focus regain, the
+     * standard sticky-immersive pattern (and what `MainActivity` does). */
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) hideSystemBars()
     }
 }

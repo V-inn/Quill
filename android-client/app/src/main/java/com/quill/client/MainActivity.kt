@@ -15,6 +15,7 @@ import android.view.InputDevice
 import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
+import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.TextView
 import androidx.core.view.WindowCompat
@@ -77,7 +78,11 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private lateinit var statusText: TextView
 
     /** Only used in client-side cursor mode; otherwise stays empty and hidden. */
+    private lateinit var surfaceView: SurfaceView
+
     private lateinit var cursorOverlay: CursorOverlay
+
+    private lateinit var latencyOverlay: LatencyOverlay
 
     /** The one settings entry point that survives streaming -- see [GearButton]. */
     private lateinit var gearButton: GearButton
@@ -87,6 +92,19 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     @Volatile
     private var running = true
+
+    /** True between the first rendered frame and the next connection drop --
+     * i.e. exactly while a desktop is actually on the panel. Drives
+     * [setScreenAwake]; see [applyLocalSettings]. */
+    @Volatile
+    private var rendering = false
+
+    /** What the last handshake asked the daemon for, so [checkVideoFormat] can
+     * tell whether the daemon understood the rotation it was sent. */
+    @Volatile
+    private var requestedMonitorWidth = 0
+    @Volatile
+    private var requestedMonitorHeight = 0
 
     // Milestone 8: set from the launching intent (or a later
     // USB_ACCESSORY_ATTACHED broadcast) when the daemon has switched the
@@ -110,39 +128,46 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         }
         usbAccessory = accessoryFromIntent(intent) ?: alreadyAttachedAccessory()
         hideSystemBars()
-        val surfaceView = SurfaceView(this)
+        surfaceView = SurfaceView(this)
         statusText = TextView(this).apply {
             setTextColor(android.graphics.Color.WHITE)
             textSize = 20f
             gravity = android.view.Gravity.CENTER
             setPadding(48, 48, 48, 48)
         }
-        cursorOverlay = CursorOverlay(this).apply {
-            // Same flag the daemon gets in the handshake, so the tablet-drawn
-            // pointer and the rotated video agree about which way is up.
-            setFlip180(Settings(this@MainActivity).flip180)
-        }
+        // Its flip is seeded by `applyLocalSettings` below, not here: returning
+        // from settings recreates the *surface*, not this activity, so an
+        // onCreate-only read went stale the moment anyone changed the setting.
+        cursorOverlay = CursorOverlay(this)
+        latencyOverlay = LatencyOverlay(this)
         gearButton = GearButton(this)
         val gearSize = (GEAR_SIZE_DP * resources.displayMetrics.density).toInt()
-        val gearMargin = (GEAR_MARGIN_DP * resources.displayMetrics.density).toInt()
         val root = FrameLayout(this).apply {
             addView(surfaceView, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
             // Above the video, below the status text.
             addView(cursorOverlay, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+            // Above the pointer so it stays readable, below the status text so
+            // a "replug the cable" message is never hidden by a diagnostic, and
+            // below the gear so nothing can shadow its touch target. Unlike the
+            // gear it must not consume input -- see LatencyOverlay's class doc.
+            addView(latencyOverlay, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
             addView(
                 statusText,
                 FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, android.view.Gravity.CENTER)
             )
             // Topmost, so it gets first crack at touch/hover dispatch and can
             // consume its own taps before the SurfaceView's forwarder (which
-            // hit-tests nothing) turns them into desktop clicks. Inset from the
-            // very top edge so the immersive-mode swipe that brings the system
-            // bars back still has somewhere to start.
+            // hit-tests nothing) turns them into desktop clicks.
+            //
+            // Laid out at the origin with no margins on purpose: GearButton
+            // owns its own position now (it is draggable and remembers where it
+            // was parked), and drives it entirely through translation so a drag
+            // costs no layout pass over the live video surface. The insets it
+            // keeps from each edge live there too -- see its class doc for why
+            // the top and bottom ones are bigger.
             addView(
                 gearButton,
-                FrameLayout.LayoutParams(gearSize, gearSize, android.view.Gravity.TOP or android.view.Gravity.END).apply {
-                    setMargins(0, gearMargin, gearMargin, 0)
-                }
+                FrameLayout.LayoutParams(gearSize, gearSize, android.view.Gravity.TOP or android.view.Gravity.START)
             )
         }
         setContentView(root)
@@ -174,24 +199,96 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         // system one here: the video's own embedded cursor is the only one
         // that should be visible.
         surfaceView.pointerIcon = android.view.PointerIcon.getSystemIcon(this, android.view.PointerIcon.TYPE_NULL)
+        applyLocalSettings()
+    }
+
+    /** Re-reads the tablet-local settings every time this screen comes back.
+     *
+     * Opening settings destroys the *surface*, not this activity, so anything
+     * seeded once in [onCreate] kept its old value for the life of the process
+     * -- which is what made a changed 180-degree flip reach the daemon (it
+     * rides the next handshake) but not the tablet-drawn pointer. Reading here
+     * covers the settings round trip and an activity recreation alike, and
+     * needs no result plumbing: SharedPreferences is already the single source
+     * of truth for both sides. */
+    private fun applyLocalSettings() {
+        val settings = Settings(this)
+        cursorOverlay.setRotation(settings.rotationDegrees)
+        showLatency = settings.showLatencyOverlay
+        sideButtonAction = settings.sideButtonAction
+        latencyOverlay.visibility =
+            if (showLatency) android.view.View.VISIBLE else android.view.View.GONE
+        setScreenAwake(rendering)
+    }
+
+    /** Mirrors `Settings.showLatencyOverlay` so the render thread can skip the
+     * per-frame handoff with a single field read rather than touching
+     * SharedPreferences or the view. */
+    @Volatile
+    private var showLatency = false
+
+    override fun onResume() {
+        super.onResume()
+        applyLocalSettings()
+        // Belt and braces with SettingsActivity.onDestroy: whichever runs,
+        // the captured frame does not outlive the screen that displayed it.
+        FramePreview.clear()
+    }
+
+    /** Keeps the panel lit while, and only while, a desktop is on it.
+     *
+     * `FLAG_KEEP_SCREEN_ON` rather than a `PowerManager.WakeLock` because it
+     * needs no permission, and on the window rather than on the SurfaceView
+     * because that surface is destroyed and recreated on every trip through
+     * settings -- one lifecycle to reason about instead of two.
+     *
+     * Deliberately not driven by frame arrival. An idle desktop sends no
+     * frames at all (that is what MSG_HEARTBEAT exists for), and "you paused to
+     * think" is precisely the idle case this exists to survive. It is armed on
+     * the first rendered frame and disarmed when the connection drops, which is
+     * what [showStatus]/[hideStatus] already mean.
+     *
+     * The flag only acts while the window is visible and focused, so the
+     * settings round trip needs no handling of its own: backgrounding drops it,
+     * and coming back re-arms through [onResume] and the reconnect. */
+    private fun setScreenAwake(on: Boolean) {
+        if (on && Settings(this).keepScreenAwake) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
     }
 
     /** Settings apply at connect time, so leaving here and coming back is what
      * makes a changed toggle take effect -- the surface is destroyed and the
-     * decode loop reconnects on return. */
+     * decode loop reconnects on return.
+     *
+     * Which is also why the frame grab happens here rather than over there:
+     * by the time `SettingsActivity` is running, the surface it would read is
+     * already gone. `captureThen` runs the callback exactly once, on whichever
+     * of the copy or its timeout lands first, so a stalled readback costs the
+     * preview and never the tap. */
     private fun openSettings() {
-        startActivity(Intent(this, SettingsActivity::class.java))
+        FramePreview.captureThen(surfaceView, window.decorView.handler) {
+            startActivity(Intent(this, SettingsActivity::class.java))
+        }
     }
 
     private fun showStatus(message: String) {
         runOnUiThread {
             statusText.text = message
             statusText.visibility = android.view.View.VISIBLE
+            rendering = false
+            setScreenAwake(false)
         }
     }
 
     private fun hideStatus() {
-        runOnUiThread { statusText.visibility = android.view.View.GONE }
+        runOnUiThread {
+            statusText.visibility = android.view.View.GONE
+            rendering = true
+            setScreenAwake(true)
+        }
     }
 
     /** Edge-to-edge immersive: hides both the status bar and navigation bar,
@@ -356,6 +453,18 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     // synchronization needed.
     private var lastStylusButtonState = false
 
+    /** Mirrors `Settings.sideButtonAction`, so the pen path reads a field
+     * rather than SharedPreferences on every event. Refreshed by
+     * [applyLocalSettings]. */
+    @Volatile
+    private var sideButtonAction = Settings.SIDE_BUTTON_RIGHT
+
+    /** Panel pixels to monitor pixels. 1.0 unless the desktop is smaller than
+     * the panel; see [send]. Fixed for the life of a connection, since the
+     * monitor it refers to is created at connect time. */
+    @Volatile
+    private var workspaceScale = 1f
+
     // --- Multi-touch state (Milestone 9). UI thread only, like the field above.
 
     /** Android pointer id -> multitouch slot, stable for the life of a contact. */
@@ -373,10 +482,25 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private var longPressFired = false
     private var longPressAnchor = 0f to 0f
 
+    /**
+     * The single choke point every coordinate passes through, which is why the
+     * workspace scale is applied here rather than at each of the ten call
+     * sites.
+     *
+     * The daemon's axes are declared against the *monitor*, not the panel, so a
+     * desktop smaller than the panel needs the touch position brought into that
+     * space. Because the aspect never changes, both axes take the same factor
+     * -- including at a quarter turn, where the monitor is the panel
+     * transposed and scaled, and the two cancel out to the same single
+     * multiply.
+     */
     private fun send(type: Int, x: Int, y: Int, pressure: Int = 0, tiltX: Int = 0, tiltY: Int = 0, buttons: Int = 0) {
         // Cheap, non-blocking enqueue on the UI thread; the actual socket
         // write happens on inputWriterThread.
-        eventQueue.offer(PenEvent(type, x, y, pressure, tiltX, tiltY, buttons))
+        val scale = workspaceScale
+        val sx = if (scale == 1f) x else (x * scale).roundToInt()
+        val sy = if (scale == 1f) y else (y * scale).roundToInt()
+        eventQueue.offer(PenEvent(type, sx, sy, pressure, tiltX, tiltY, buttons))
     }
 
     private fun handleMotionEvent(event: MotionEvent, down: Boolean): Boolean {
@@ -385,10 +509,18 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         val stylusButtonNow = event.buttonState and MotionEvent.BUTTON_STYLUS_PRIMARY != 0
         if (stylusButtonNow != lastStylusButtonState) {
             lastStylusButtonState = stylusButtonNow
-            send(
-                if (stylusButtonNow) EV_BUTTON_DOWN else EV_BUTTON_UP,
-                event.x.roundToInt(), event.y.roundToInt(), buttons = 1
-            )
+            // The chosen action rides bits 2-3 of the event rather than the
+            // handshake, so changing the mapping takes effect on the next press
+            // instead of at the next connect. "None" has no wire value: the
+            // event is just not sent, which an older daemon also handles
+            // correctly by never hearing about it.
+            if (sideButtonAction != Settings.SIDE_BUTTON_NONE) {
+                send(
+                    if (stylusButtonNow) EV_BUTTON_DOWN else EV_BUTTON_UP,
+                    event.x.roundToInt(), event.y.roundToInt(),
+                    buttons = 1 or (sideButtonAction shl 2),
+                )
+            }
         }
 
         // `actionMasked`, not `action`: for the secondary-pointer actions the
@@ -620,6 +752,34 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         }
         val widthPx = bounds.width()
         val heightPx = bounds.height()
+        // The settings screen's preview needs the panel's real geometry for its
+        // aspect, and this is where it is already worked out correctly (see the
+        // note above on why displayMetrics is not used).
+        FramePreview.setPanelSize(widthPx, heightPx)
+
+        // At a quarter turn the daemon is asked for a monitor whose dimensions
+        // are the panel's, transposed: a landscape tablet drives a portrait
+        // desktop, which the encoder then turns so it fills the panel exactly.
+        // Asking for the panel's own shape instead would letterbox a rotated
+        // image into it and waste most of the screen.
+        val settings = Settings(this)
+        val swapAxes = settings.rotationSwapsAxes
+        // A desktop smaller than the panel: fewer pixels to lay out, encode and
+        // push over the cable, and everything on it is physically bigger. Both
+        // axes take the same factor, so the aspect is unchanged and nothing is
+        // ever letterboxed.
+        val scale = settings.workspaceScalePercent / 100f
+        workspaceScale = scale
+        val scaledWidth = (widthPx * scale).roundToInt()
+        val scaledHeight = (heightPx * scale).roundToInt()
+        val monitorWidthPx = if (swapAxes) scaledHeight else scaledWidth
+        val monitorHeightPx = if (swapAxes) scaledWidth else scaledHeight
+        requestedMonitorWidth = monitorWidthPx
+        requestedMonitorHeight = monitorHeightPx
+        // The moment these stop being preferences and become what the daemon is
+        // actually doing. The settings screen diffs against this to tell a
+        // staged change from a settled one.
+        SessionConfig.record(settings, widthPx, heightPx)
 
         val stylusDevice = InputDevice.getDeviceIds()
             .map { InputDevice.getDevice(it) }
@@ -635,7 +795,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
         Log.i(
             tag,
-            "handshake: ${widthPx}x${heightPx}px, " +
+            "handshake: asking for ${monitorWidthPx}x${monitorHeightPx}px " +
+                "(panel ${widthPx}x${heightPx}, rotation ${settings.rotationDegrees}deg), " +
                 "pressure $pMin..$pMax, tilt -$tMaxDeg..$tMaxDeg (stylus device: ${stylusDevice?.name})"
         )
 
@@ -645,8 +806,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         // what v1 did, repeatedly and expensively.
         val body = java.io.ByteArrayOutputStream()
         DataOutputStream(body).apply {
-            writeInt(widthPx)
-            writeInt(heightPx)
+            writeInt(monitorWidthPx)
+            writeInt(monitorHeightPx)
             writeInt(pMin)
             writeInt(pMax)
             writeInt(-tMaxDeg)
@@ -662,8 +823,20 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             // `densityDpi`, which is the rounded bucket Android uses for
             // layout scaling. Appending is safe by construction -- `body_len`
             // is what makes an older daemon skip what it doesn't know.
-            writeInt((resources.displayMetrics.xdpi * 1000).roundToInt())
-            writeInt((resources.displayMetrics.ydpi * 1000).roundToInt())
+            // Swapped along with the dimensions at a quarter turn. These feed
+            // the daemon's virtual-touchpad millimetre thresholds (Milestone
+            // 9), so leaving them alone here would silently miscalibrate every
+            // gesture on both axes -- an easy one to miss, because nothing
+            // about the picture would look wrong.
+            // Scaled with the workspace: these are dots per inch measured in
+            // *monitor* pixels, and a smaller desktop spreads fewer of them
+            // over the same glass. The daemon turns pixel deltas into
+            // millimetres with these for its touchpad thresholds (Milestone 9),
+            // so an unscaled value would misjudge every gesture.
+            val xdpi = (resources.displayMetrics.xdpi * scale * 1000).roundToInt()
+            val ydpi = (resources.displayMetrics.ydpi * scale * 1000).roundToInt()
+            writeInt(if (swapAxes) ydpi else xdpi)
+            writeInt(if (swapAxes) xdpi else ydpi)
         }
         val bodyBytes = body.toByteArray()
 
@@ -840,6 +1013,9 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         val offset = ((androidRecvMs - daemonSendMs) - (daemonRecvMs - androidSendEchoMs)) / 2
         val roundTripSum = (daemonRecvMs - androidSendEchoMs) + (androidRecvMs - daemonSendMs)
         Log.i(tag, "clock-sync: offset=${offset}ms (android-daemon), round-trip sum=${roundTripSum}ms")
+        // The overlay needs this to know whether to trust its own numbers; see
+        // LatencyOverlay.syncRoundTripMs.
+        if (::latencyOverlay.isInitialized) latencyOverlay.setClockSync(roundTripSum)
         return offset
     }
 
@@ -853,7 +1029,49 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         val videoWidth = b.readInt()
         val videoHeight = b.readInt()
         Log.i(tag, "video format: ${videoWidth}x${videoHeight}")
+        checkDaemonUnderstoodRotation(videoWidth, videoHeight)
         return videoWidth to videoHeight
+    }
+
+    /**
+     * Catches a daemon too old to know about the quarter turns.
+     *
+     * The rotation is carried as two bits so that 0 and 180 degrees stay
+     * bit-for-bit what they always were (see protocol.rs). The cost of that
+     * compatibility is one blind spot in the other direction: an old daemon
+     * ignores the new bit and honours only the flip, so a client asking for 270
+     * gets a bare 180 applied to dimensions that were already swapped for it --
+     * a picture that is both the wrong shape and the wrong way up, with nothing
+     * saying why.
+     *
+     * There is no capability field to consult, but there is a fact already on
+     * the wire: the encoded video's shape. At a quarter turn we asked for a
+     * portrait monitor and the encoder should hand back a landscape stream. If
+     * it comes back still portrait, the daemon did not turn anything, so it did
+     * not understand. Say so, in words, instead of showing the mess.
+     */
+    private fun checkDaemonUnderstoodRotation(videoWidth: Int, videoHeight: Int) {
+        val settings = Settings(this)
+        if (!settings.rotationSwapsAxes) return
+        if (requestedMonitorWidth == 0 || requestedMonitorHeight == 0) return
+        // We asked for `requested`; a daemon that understood returns its
+        // transpose. Anything else means the rotation was dropped.
+        val expectedW = requestedMonitorHeight
+        val expectedH = requestedMonitorWidth
+        if (videoWidth == expectedW && videoHeight == expectedH) return
+        Log.w(
+            tag,
+            "daemon returned ${videoWidth}x${videoHeight} for a " +
+                "${requestedMonitorWidth}x${requestedMonitorHeight} monitor at " +
+                "${settings.rotationDegrees}deg -- expected ${expectedW}x${expectedH}. " +
+                "Falling back to no rotation.",
+        )
+        settings.rotationDegrees = 0
+        showStatus(
+            "This computer's Quill daemon is too old for 90° rotation.\n" +
+                "Update it, or pick 0° or 180° in settings.\n" +
+                "Reconnecting without rotation...",
+        )
     }
 
     /** Original transport (Milestones 3-7): listens on a TCP port reached
@@ -1148,8 +1366,21 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                                 if (latencyMs > latencyMaxMs) latencyMaxMs = latencyMs
                                 latencySampleCount++
                             }
+                            if (showLatency) {
+                                val avg = if (latencySampleCount > 0) latencySumMs / latencySampleCount else 0
+                                latencyOverlay.submit(
+                                    latencyMs,
+                                    avg,
+                                    if (latencySampleCount > 0) latencyMinMs else 0,
+                                    if (latencySampleCount > 0) latencyMaxMs else 0,
+                                    pendingSentTimesMs.size,
+                                )
+                            }
                             if (renderedCount == 1L || renderedCount % 30 == 0L) {
                                 val avg = if (latencySampleCount > 0) latencySumMs / latencySampleCount else 0
+                                // The log stays: logcat is how every latency
+                                // question in MILESTONES was actually answered,
+                                // and the overlay is a readout, not a replacement.
                                 Log.i(
                                     tag,
                                     "queued=${queuedCount.get()} rendered=$renderedCount, " +
@@ -1286,6 +1517,5 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
         /** Touch target; the drawn gear is 60% of this (see [GearButton]). */
         private const val GEAR_SIZE_DP = 48f
-        private const val GEAR_MARGIN_DP = 12f
     }
 }

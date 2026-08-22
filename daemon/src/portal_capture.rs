@@ -4,9 +4,16 @@
 //! under both Wayland and X11 on this machine; this path never touches
 //! DRM/KMS at all).
 //!
-//! The virtual monitor itself is created separately (by `krfb-virtualmonitor`
-//! for now); this module just captures whatever monitor the user picks in
-//! the portal's screen-selection dialog.
+//! The virtual monitor itself is created separately (by `krfb-virtualmonitor`);
+//! this module just captures whatever monitor the user picks in the portal's
+//! screen-selection dialog.
+//!
+//! All of that is the *KDE* route. On GNOME the portal isn't involved at all --
+//! `gnome_screencast.rs` asks mutter for a virtual monitor directly and gets a
+//! PipeWire node id back, with no dialog and no restore token. Everything from
+//! `run_capture` down is shared between the two: it takes a node id either way,
+//! and the only difference is whether there is a portal-provided PipeWire
+//! remote to connect through (`fd`) or the user's own daemon (`None`).
 
 use crate::vaapi_encoder::VaapiEncoder;
 use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType, Stream as PortalStream};
@@ -89,12 +96,16 @@ fn decode_latency_barcode(bytes: &[u8], stride: usize) -> Option<u64> {
 const DRM_FORMAT_MOD_INVALID: i64 = 0x00ff_ffff_ffff_ffff;
 const DRM_FORMAT_MOD_LINEAR: i64 = 0;
 
+/// Slightly under 1/30s, so a source running at a steady 30 is not clipped to
+/// 15 by a frame arriving a hair early.
+const MIN_FRAME_INTERVAL_30FPS: Duration = Duration::from_micros(31_000);
+
 /// Serializes one `EnumFormat` pod. With `dmabuf`, it carries a
 /// `SPA_FORMAT_VIDEO_modifier` choice marked MANDATORY + DONT_FIXATE -- the
 /// standard two-step modifier negotiation (the producer picks one from our
 /// list and echoes it back in the fixated format), and the exact property
 /// KWin's screencast looks for before it will export GPU buffers at all.
-fn build_format_pod(dmabuf: bool) -> Vec<u8> {
+fn build_format_pod(dmabuf: bool, preferred: (u32, u32)) -> Vec<u8> {
     use pw::spa::pod::{ChoiceValue, Property, PropertyFlags, Value};
     use pw::spa::utils::{Choice, ChoiceEnum, ChoiceFlags};
 
@@ -122,12 +133,20 @@ fn build_format_pod(dmabuf: bool) -> Vec<u8> {
             pw::spa::param::video::VideoFormat::BGRx,
             pw::spa::param::video::VideoFormat::RGBx,
         ),
+        // The *default* of this range is not decoration: mutter's virtual
+        // stream has no monitor to take a size from, so unless `RecordVirtual`
+        // was given an explicit mode (see `gnome_screencast::record_virtual`)
+        // the compositor sizes the virtual monitor from whatever this
+        // negotiation settles on -- and a fixed 1920x1080 default here would
+        // have handed a 2560x1600 tablet a 1920x1080 monitor. KWin, which
+        // always has a real output behind the stream, fixates to that output's
+        // size and ignores the default either way.
         pw::spa::pod::property!(
             pw::spa::param::format::FormatProperties::VideoSize,
             Choice,
             Range,
             Rectangle,
-            pw::spa::utils::Rectangle { width: 1920, height: 1080 },
+            pw::spa::utils::Rectangle { width: preferred.0, height: preferred.1 },
             pw::spa::utils::Rectangle { width: 1, height: 1 },
             pw::spa::utils::Rectangle { width: 8192, height: 8192 }
         ),
@@ -382,7 +401,11 @@ pub async fn open_portal(cursor: CursorRendering) -> ashpd::Result<(PortalStream
 struct CaptureData {
     format: spa::param::video::VideoInfoRaw,
     encoder: Option<VaapiEncoder>,
-    flip_180: bool,
+    rotation: crate::protocol::Rotation,
+    quality: crate::protocol::Quality,
+    cap_fps_30: bool,
+    /// When the last frame was actually encoded, for the 30fps cap.
+    last_encoded_at: Option<Instant>,
     /// `QUILL_NO_ENCODE` -- see the early return in `process`.
     no_encode: bool,
     /// Whether the client draws the pointer itself. Only in `ClientSide` does
@@ -640,19 +663,33 @@ fn emit_frame(
 /// called by `main.rs` before the portal was ever opened (see that
 /// function's doc) -- `None` only for the capture-only diagnostic mode
 /// (`TransportConfig::None`).
+/// `fd`: the PipeWire remote the portal handed over, on the KDE path.
+/// `None` on GNOME -- mutter publishes the virtual monitor's node on the
+/// user's own PipeWire daemon and `RecordVirtual` returns only a node id, so
+/// there is no separate remote to connect through.
+///
+/// `preferred_size`: the tablet's `width x height`, offered as the default of
+/// the negotiated video size. See `build_format_pod` for why this matters on
+/// GNOME and is inert on KDE.
 pub fn run_capture(
     node_id: u32,
-    fd: OwnedFd,
+    fd: Option<OwnedFd>,
     out_path: &str,
     transport: Option<TransportWriter>,
-    flip_180: bool,
+    rotation: crate::protocol::Rotation,
+    quality: crate::protocol::Quality,
+    cap_fps_30: bool,
     cursor: CursorRendering,
+    preferred_size: (u32, u32),
 ) -> Result<CaptureStats, pw::Error> {
     pw::init();
 
     let mainloop = pw::main_loop::MainLoopRc::new(None)?;
     let context = pw::context::ContextRc::new(&mainloop, None)?;
-    let core = context.connect_fd_rc(fd, None)?;
+    let core = match fd {
+        Some(fd) => context.connect_fd_rc(fd, None)?,
+        None => context.connect_rc(None)?,
+    };
 
     // pipewire's own add_signal_local mechanism turned out unreliable here
     // (registered fine, callback never fired -- SIGINT killed the process
@@ -672,7 +709,10 @@ pub fn run_capture(
     let data = CaptureData {
         format: Default::default(),
         encoder: None,
-        flip_180,
+        rotation,
+        quality,
+        cap_fps_30,
+        last_encoded_at: None,
         no_encode: std::env::var("QUILL_NO_ENCODE").is_ok(),
         cursor,
         last_cursor_id: None,
@@ -735,7 +775,7 @@ pub fn run_capture(
             // same size as the first, and rebuilding on it threw away a working
             // encoder (and reset its GOP state) for nothing.
             if user_data.sent_format != Some((width, height)) {
-                let encoder = VaapiEncoder::new(width, height, user_data.flip_180)
+                let encoder = VaapiEncoder::new(width, height, user_data.rotation, user_data.quality)
                     .expect("VAAPI encoder init failed");
                 user_data.encoder = Some(encoder);
             }
@@ -777,10 +817,19 @@ pub fn run_capture(
                 );
             }
             user_data.sent_format = Some((width, height));
+            // What the *encoder* emits, which is the capture transposed at a
+            // quarter turn. Announcing the capture size instead would configure
+            // the client's decoder for a portrait stream that arrives
+            // landscape.
+            let (out_width, out_height) = if user_data.rotation.swaps_axes() {
+                (height, width)
+            } else {
+                (width, height)
+            };
             if let Some(sock) = user_data.transport.borrow_mut().as_mut() {
                 let mut payload = Vec::with_capacity(8);
-                payload.extend_from_slice(&width.to_be_bytes());
-                payload.extend_from_slice(&height.to_be_bytes());
+                payload.extend_from_slice(&out_width.to_be_bytes());
+                payload.extend_from_slice(&out_height.to_be_bytes());
                 let header = crate::protocol::encode_message(
                     crate::protocol::MSG_VIDEO_FORMAT,
                     crate::clock_sync::now_millis(),
@@ -804,6 +853,23 @@ pub fn run_capture(
             // just grows and we always end up encoding an old one. Drain to
             // the newest buffer available right now and let older ones drop
             // (auto-requeued to PipeWire via `Buffer`'s Drop impl) unprocessed.
+            // The 30fps cap, enforced by not encoding rather than by asking
+            // for a lower rate: what arrives is driven by how often the
+            // compositor damages the output, and a negotiated maximum is a
+            // hint the producer may ignore. The buffer is still dequeued and
+            // dropped, so PipeWire gets it back and the queue does not grow --
+            // see the staleness note below, which is the same reasoning.
+            if user_data.cap_fps_30 {
+                let now = Instant::now();
+                if let Some(last) = user_data.last_encoded_at {
+                    if now.duration_since(last) < MIN_FRAME_INTERVAL_30FPS {
+                        let _ = stream.dequeue_buffer();
+                        return;
+                    }
+                }
+                user_data.last_encoded_at = Some(now);
+            }
+
             let Some(mut buffer) = stream.dequeue_buffer() else {
                 return;
             };
@@ -1069,8 +1135,8 @@ pub fn run_capture(
     // sitting -- without it there's no way to re-measure the old behavior once
     // the new one works.
     let force_shm = std::env::var("QUILL_FORCE_SHM").is_ok();
-    let dmabuf_values = build_format_pod(true);
-    let shm_values = build_format_pod(false);
+    let dmabuf_values = build_format_pod(true, preferred_size);
+    let shm_values = build_format_pod(false, preferred_size);
     let mut dmabuf_first = vec![
         Pod::from_bytes(&dmabuf_values).unwrap(),
         Pod::from_bytes(&shm_values).unwrap(),

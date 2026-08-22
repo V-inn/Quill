@@ -158,17 +158,28 @@ pub struct VaapiEncoder {
     imported_surfaces: std::collections::HashMap<std::os::fd::RawFd, ffi::VASurfaceID>,
     vpp_config_id: ffi::VAConfigID,
     vpp_context_id: ffi::VAContextID,
+    /// Encoder *output* geometry -- what goes on the wire. At a quarter turn
+    /// this is the transpose of the capture, which is the one place rotation
+    /// stops being a filter and starts changing shape.
     width: u32,
     height: u32,
     aligned_width: u32,
     aligned_height: u32,
+    /// Capture geometry: the size of the frames arriving from PipeWire, and so
+    /// the size of the BGRX surface they are uploaded into. Equal to the output
+    /// geometry except at a quarter turn.
+    src_width: u32,
+    src_height: u32,
+    src_aligned_width: u32,
+    src_aligned_height: u32,
     // Milestone 16: KWin's rotation property has no effect on what a
     // krfb-virtualmonitor output's screencast producer actually exports --
     // confirmed live, toggling it (even via System Settings directly, not
     // just our own automation) changed kscreen-doctor's reported metadata
     // but never the captured pixels. VPP's own rotation_state is the
     // GPU-accelerated place that does work, applied here instead.
-    flip_180: bool,
+    rotation: crate::protocol::Rotation,
+    quality: crate::protocol::Quality,
     // GOP state: total frames encoded so far (drives the ping-pong slot and
     // the IDR/P decision), a counter distinguishing successive IDRs
     // (idr_pic_id must differ between them even though frame_num resets to
@@ -187,7 +198,20 @@ pub struct VaapiEncoder {
 }
 
 impl VaapiEncoder {
-    pub fn new(width: u32, height: u32, flip_180: bool) -> VaResult<Self> {
+    /// `src_width`/`src_height` are the captured frame's dimensions. The
+    /// encoder's own output is those dimensions transposed when `rotation` is a
+    /// quarter turn, and identical otherwise.
+    pub fn new(
+        src_width: u32,
+        src_height: u32,
+        rotation: crate::protocol::Rotation,
+        quality: crate::protocol::Quality,
+    ) -> VaResult<Self> {
+        let (width, height) = if rotation.swaps_axes() {
+            (src_height, src_width)
+        } else {
+            (src_width, src_height)
+        };
         let render_fd = unsafe {
             libc::open(
                 c"/dev/dri/renderD128".as_ptr(),
@@ -258,9 +282,19 @@ impl VaapiEncoder {
         let quality_level = if quality_attrib.value == 0 || quality_attrib.value == u32::MAX {
             0 // 0 means "driver default", i.e. don't send the buffer at all
         } else {
-            quality_attrib.value
+            // 1 is the driver's best, `value` its fastest. The preset picks a
+            // fraction along that range rather than a fixed number, since the
+            // range is driver-specific -- iHD reports something quite different
+            // from AMD, and a hardcoded level would mean opposite things.
+            let span = quality_attrib.value as f32;
+            (span * quality.speed_fraction()).round().clamp(1.0, span) as u32
         };
-        eprintln!("[vaapi] encoder quality range: {} (using level {quality_level})", quality_attrib.value);
+        eprintln!(
+            "[vaapi] encoder quality range: {} (using level {quality_level}, {:?} at {} Mbps)",
+            quality_attrib.value,
+            quality,
+            quality.bits_per_second() / 1_000_000,
+        );
 
         let mut attribs = [
             ffi::VAConfigAttrib {
@@ -293,6 +327,8 @@ impl VaapiEncoder {
 
         let aligned_width = align16(width);
         let aligned_height = align16(height);
+        let src_aligned_width = align16(src_width);
+        let src_aligned_height = align16(src_height);
 
         let mut pixel_format_attrib = ffi::VASurfaceAttrib {
             type_: ffi::VASurfaceAttribType_VASurfaceAttribPixelFormat,
@@ -355,8 +391,11 @@ impl VaapiEncoder {
                 ffi::vaCreateSurfaces(
                     dpy,
                     ffi::VA_RT_FORMAT_RGB32,
-                    aligned_width,
-                    aligned_height,
+                    // Capture-shaped, not output-shaped: this is what the
+                    // frames from PipeWire are uploaded into, and the VPP pass
+                    // is what turns them.
+                    src_aligned_width,
+                    src_aligned_height,
                     &mut src_surface,
                     1,
                     &mut bgrx_format_attrib,
@@ -399,8 +438,37 @@ impl VaapiEncoder {
             "vaCreateContext(VPP)",
         )?;
 
+        // Which rotations this driver's VPP will actually do. Queried rather
+        // than assumed: quarter turns are a separate capability from the
+        // 180-degree flip, and finding out at runtime beats finding out from a
+        // black screen.
+        let mut caps: ffi::VAProcPipelineCaps = unsafe { std::mem::zeroed() };
+        let caps_status = unsafe {
+            ffi::vaQueryVideoProcPipelineCaps(
+                dpy,
+                vpp_context_id,
+                std::ptr::null_mut(),
+                0,
+                &mut caps,
+            )
+        };
+        let rotation_flags = if caps_status == ffi::VA_STATUS_SUCCESS as i32 {
+            caps.rotation_flags
+        } else {
+            0
+        };
         eprintln!(
-            "[vaapi] encoder ready: {width}x{height} (aligned {aligned_width}x{aligned_height}), GPU color conversion via VPP, GOP {GOP_SIZE}"
+            "[vaapi] VPP rotation_flags=0x{rotation_flags:x} (none={} 90={} 180={} 270={})",
+            rotation_flags & (1 << ffi::VA_ROTATION_NONE) != 0,
+            rotation_flags & (1 << ffi::VA_ROTATION_90) != 0,
+            rotation_flags & (1 << ffi::VA_ROTATION_180) != 0,
+            rotation_flags & (1 << ffi::VA_ROTATION_270) != 0,
+        );
+
+        eprintln!(
+            "[vaapi] encoder ready: capture {src_width}x{src_height} -> output {width}x{height} \
+             (aligned {aligned_width}x{aligned_height}), rotation {}deg, GPU color conversion via VPP, GOP {GOP_SIZE}",
+            rotation.degrees()
         );
 
         Ok(Self {
@@ -417,7 +485,12 @@ impl VaapiEncoder {
             height,
             aligned_width,
             aligned_height,
-            flip_180,
+            src_width,
+            src_height,
+            src_aligned_width,
+            src_aligned_height,
+            rotation,
+            quality,
             quality_level,
             frame_count: 0,
             idr_count: 0,
@@ -463,8 +536,12 @@ impl VaapiEncoder {
 
         let mut desc: ffi::VADRMPRIMESurfaceDescriptor = unsafe { std::mem::zeroed() };
         desc.fourcc = ffi::VA_FOURCC_BGRX;
-        desc.width = self.width;
-        desc.height = self.height;
+        // Capture geometry, not output: this describes the buffer PipeWire
+        // handed us. At a quarter turn the two are transposed, and using the
+        // output shape here reads every row at the wrong stride -- which looks
+        // like the picture sheared and drawn twice side by side.
+        desc.width = self.src_width;
+        desc.height = self.src_height;
         desc.num_objects = 1;
         desc.objects[0].fd = plane.fd;
         desc.objects[0].size = plane.size;
@@ -505,8 +582,8 @@ impl VaapiEncoder {
                 ffi::vaCreateSurfaces(
                     self.dpy,
                     ffi::VA_RT_FORMAT_RGB32,
-                    self.width,
-                    self.height,
+                    self.src_width,
+                    self.src_height,
                     &mut surface,
                     1,
                     attribs.as_mut_ptr(),
@@ -554,7 +631,11 @@ impl VaapiEncoder {
         // image derives from a dmabuf whose stride/offset came from PipeWire's
         // buffer metadata, i.e. from the compositor, not from the VA driver
         // alone.
-        let extent = plane0_extent(&image, self.height, "vaDeriveImage(dmabuf probe)");
+        // Bounded against the *capture* height: this maps a frame that arrived
+        // from PipeWire, and at a quarter turn the encoder's own output is the
+        // transpose of it. Using the output height here would bound the check
+        // against the wrong number of rows.
+        let extent = plane0_extent(&image, self.src_height, "vaDeriveImage(dmabuf probe)");
         let (offset, len) = match extent {
             Ok(v) => v,
             Err(e) => {
@@ -624,7 +705,7 @@ impl VaapiEncoder {
         seq.intra_period = GOP_SIZE as u32;
         seq.intra_idr_period = GOP_SIZE as u32;
         seq.ip_period = 1; // no B-frames: every non-I frame is a P
-        seq.bits_per_second = 20_000_000;
+        seq.bits_per_second = self.quality.bits_per_second();
         seq.max_num_ref_frames = 1;
         seq.picture_width_in_mbs = mbs_w as u16;
         seq.picture_height_in_mbs = mbs_h as u16;
@@ -959,7 +1040,9 @@ impl VaapiEncoder {
         // Unmap and destroy before propagating: this is the one write into
         // driver-mapped memory in the whole encoder, so it gets checked, and a
         // rejected frame shouldn't also leak the mapping it declined to use.
-        let extent = plane0_extent(&image, self.aligned_height, "vaDeriveImage(src)");
+        // The BGRX surface is capture-shaped, so it is the source alignment that
+        // bounds it, not the encoder's output alignment.
+        let extent = plane0_extent(&image, self.src_aligned_height, "vaDeriveImage(src)");
         let (offset, len) = match extent {
             Ok(v) => v,
             Err(e) => {
@@ -972,8 +1055,8 @@ impl VaapiEncoder {
         unsafe {
             let base = buf_ptr as *mut u8;
             let dst = std::slice::from_raw_parts_mut(base.add(offset), len);
-            let row_bytes = self.width as usize * 4;
-            for row in 0..self.height as usize {
+            let row_bytes = self.src_width as usize * 4;
+            for row in 0..self.src_height as usize {
                 let src = &bgrx[row * src_stride..][..row_bytes];
                 let d = &mut dst[row * image.pitches[0] as usize..][..row_bytes];
                 d.copy_from_slice(src);
@@ -1003,7 +1086,12 @@ impl VaapiEncoder {
 
         let mut pipeline_param: ffi::VAProcPipelineParameterBuffer = Default::default();
         pipeline_param.surface = source;
-        pipeline_param.rotation_state = if self.flip_180 { ffi::VA_ROTATION_180 } else { ffi::VA_ROTATION_NONE };
+        pipeline_param.rotation_state = match self.rotation {
+            crate::protocol::Rotation::None => ffi::VA_ROTATION_NONE,
+            crate::protocol::Rotation::Quarter => ffi::VA_ROTATION_90,
+            crate::protocol::Rotation::Half => ffi::VA_ROTATION_180,
+            crate::protocol::Rotation::ThreeQuarters => ffi::VA_ROTATION_270,
+        };
 
         let mut pipeline_buf: ffi::VABufferID = 0;
         check(
