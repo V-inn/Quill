@@ -22,3 +22,12 @@ android-client/captures/
 
 # Local working note, not a public roadmap.
 PUBLISHING-TODO.md
+
+# Signing keys must never enter this repository. They live in the user's home
+# directory (see app/build.gradle.kts, which reads them from
+# ~/.gradle/gradle.properties). This is a guard against a stray copy, not the
+# mechanism -- losing the keystore means no future build can upgrade an
+# installed copy in place, and committing it would be worse.
+*.jks
+*.keystore
+*.p12
