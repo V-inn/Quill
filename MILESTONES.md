@@ -2785,3 +2785,187 @@ The root README gained a short three-step Getting started that hands off to it.
 
 Two things the guide deliberately does not do: promise Quill works outside
 KDE/GNOME, or imply the GNOME path has been tested. It has not.
+
+## 26. The settings screen, rebuilt — and 90/270 rotation
+
+User asked for two things: a gear that could be moved out of the way, and a
+settings screen that did not look a decade old. Both turned into more than that.
+
+### What the old screen actually was
+
+`SettingsActivity` built its whole tree imperatively with `Color.BLACK`,
+`LTGRAY` and `DKGRAY`, deprecated framework `Switch` widgets carrying their own
+labels, a default platform `Button` reading "Done", and 2px `View` dividers.
+Surveying it turned up four defects nobody had reported:
+
+- `PAD = 48` was used as a **raw pixel count**, so every gap rendered at less
+  than half the size the number suggests.
+- The activity overrode the app theme with `Theme.Black`, which *has* a title
+  bar, while also carrying `android:label="Quill settings"` -- so that string
+  drew twice.
+- `Settings.showLatencyOverlay` was **write-only dead state**. The only code
+  that read it was the switch that set it. The control did nothing, and had done
+  nothing for four milestones.
+- `CursorOverlay`'s flip was seeded only in `MainActivity.onCreate`. Returning
+  from settings recreates the *surface*, not the activity, so a changed flip
+  reached the daemon in the next handshake but never reached the tablet-drawn
+  pointer.
+
+### The honest problem the redesign is built around
+
+Every setting the daemon acts on is deferred: it chooses its capture session
+before the first frame, so nothing can change mid-session. The old screen
+carried that as a grey paragraph at the top while its switches snapped on and
+implied otherwise.
+
+Sections are now grouped by *when a setting takes effect* rather than by topic.
+A control is marked staged when it differs from **what the running session is
+using** -- not from what is saved -- which needs a snapshot taken at handshake
+time (`SessionConfig`). One marker, one meaning, and it can only appear in a
+section where something is deferred. Both exits name what they do, because
+leaving destroys the video surface either way and there is no free exit to
+pretend otherwise about.
+
+Built in Compose on `foundation`, deliberately not `material3`: this design
+replaces every default it would have supplied, so ~1.4 MB of them would only
+have been fought at every control. Not a departure from the app's "everything in
+code, no layout resources" habit -- the strongest form of it.
+
+### The slab
+
+"Rotate the image 180°" was replaced with a picture of the tablet, drawn at the
+panel's true aspect, with the real desktop inside it captured on the way in via
+`PixelCopy`. Three iterations, each corrected by live use:
+
+1. Chassis turned, picture stayed upright, explained via which end the USB cable
+   enters. **The cable framing confused more than it helped.**
+2. Picture turned inside a fixed body. Accurate, but read as a texture sliding
+   behind a window rather than a device being turned over.
+3. The whole slab turns as one object. That needs room to turn *in* -- a 16:10
+   rectangle passing through the quarter turn is far taller than its own bounds
+   -- so it is laid out in a square and sized so its *diagonal* fits.
+
+Two snap bugs, both found by spinning it: the release target was a bare 0 or
+180, so a dial at 540 degrees unwound a full turn rather than settling where it
+already was modulo one; and `atan2` wraps at ±180, so a drag across that seam
+registered as a 360-degree jump.
+
+### 90 and 270 degree rotation
+
+At a quarter turn the client asks for a monitor whose dimensions are the
+panel's, **transposed** -- a 2560x1600 tablet drives a 1600x2560 desktop that
+the encoder then turns to fill the panel exactly.
+
+Checked before building anything on it that the driver would do it:
+`vaQueryVideoProcPipelineCaps` reports `rotation_flags=0xf` on Intel iHD. That
+probe is kept, because the alternative way to discover an unsupported rotation
+is a black screen.
+
+**The structural change is that the encoder's output dimensions stop matching
+its input for the first time.** Source and output geometry are now separate
+throughout. The first live run sheared the picture and drew it twice side by
+side, because four operations on the *captured* frame -- the DMA-BUF descriptor,
+the imported surface, the probe mapping, the shm upload -- were still using the
+output shape and reading every row at the wrong stride. A second bug sat behind
+it: the daemon announced the capture size to the client rather than the
+encoder's output, so the decoder would have been configured for the wrong
+shape.
+
+Amusingly, the old-daemon guard caught that second one itself: it saw a portrait
+stream come back for a portrait request and correctly concluded the rotation had
+not happened. Right verdict, wrong culprit.
+
+Rotation is two bits (`CONFIG_ROTATE_90` alongside `CONFIG_FLIP_180`), arranged
+so 0 and 180 stay bit-for-bit what they always were. `PROTOCOL_VERSION`
+deliberately did not move -- the length-prefixed handshake body exists so
+capabilities can be appended rather than versioned. The cost is one blind spot
+(an old daemon ignores the new bit) and the client closes it without a new
+field, by checking `MSG_VIDEO_FORMAT` against what it asked for.
+
+`xdpi`/`ydpi` are swapped along with the dimensions. They feed the daemon's
+virtual-touchpad millimetre thresholds (Milestone 9), so leaving them alone
+would silently miscalibrate every gesture while the picture looked perfect. The
+same trap caught the desktop-size work later.
+
+### The gear
+
+Reported as "blocks things and can't be moved". Testing found it was worse: at
+`TOP|END` with a 12dp inset its 48dp touch target sat almost exactly inside the
+region Android watches for the status-bar pull-down, so **tapping it opened the
+notification shade instead of settings**. The one control that exists so
+settings stay reachable while streaming was not reliably reachable.
+
+Now draggable, snapping to the nearest edge, position persisted as an edge plus
+a fraction along it rather than pixels. Idle it retracts to a thin pill hugging
+its edge -- the *view* never changes size, only the drawing, so the touch target
+stays a full 48dp however small the mark looks.
+
+Two insets, for two different reasons: sides keep 6dp backed by
+`setSystemGestureExclusionRects`, which claims the back gesture; top and bottom
+keep 24dp and nothing else, because **gesture exclusion does not apply to the
+immersive system-bar reveal** -- that is a system window above the app, so
+distance is the only lever.
+
+The swallow contract is preserved by construction (all three overrides still
+return `true` unconditionally). The one structural change is that the view now
+detects its own taps rather than delegating to `super.onTouchEvent`, which would
+fire a click at the end of any drag ending near where it began.
+
+A later papercut: touch slop is the right threshold to *start* following a
+finger but far too low to treat as intent to move, so a tap that wobbled past it
+re-snapped and saved a slightly different position. Observed drifting from 0.71
+to 0.27 of the way down an edge over one testing session. A drag now has to
+travel 24dp before it re-parks anything.
+
+### Settings added
+
+| Setting | Where it lives | Notes |
+|---|---|---|
+| Rotation (0/90/180/270) | session | the slab |
+| Desktop size (100/75/60%) | session | both axes take the same factor, which keeps the input mapping a single multiply -- even at a quarter turn, where monitor-is-transposed and monitor-is-scaled cancel out |
+| Picture quality | session | preset picks a *fraction* of the driver's quality range, not a fixed level: iHD reports 7, other drivers report something else, and a hardcoded number would mean opposite things |
+| Halve the frame rate | session | enforced by not encoding, not by negotiating a rate -- what arrives is driven by compositor damage, and a negotiated maximum is a hint |
+| Keep the screen awake | tablet | `FLAG_KEEP_SCREEN_ON`, no permission. Scoped to *rendering*, not to the activity being open, and deliberately not frame-driven: an idle desktop sends no frames, which is exactly the case it exists to survive |
+| S Pen side button | tablet | right / middle / eraser / nothing, carried per event so it needs no reconnect |
+| Latency overlay | tablet | the dead switch, made real |
+
+### The latency overlay tells you when not to believe it
+
+Wiring it up immediately produced a confident **"696 ms"** over a stream actually
+running at about 30. The clock-sync had calibrated against a queued reply --
+round-trip 1308ms instead of the usual 1. `MainActivity`'s own watchdog comment
+already records what that costs: *"every reported per-frame latency was off by
+~550ms for the rest of the session"*.
+
+A readout that prints a number this repo's own notes call wrong is worse than no
+readout. Past 100ms of round-trip it turns copper and appends the figure and
+"reading unreliable".
+
+It also must **not** swallow input -- the exact opposite of the contract two
+files away in `GearButton`, and copying that would have put a full-screen dead
+rectangle over the desktop. There is a comment saying so, because the failure
+would be invisible until someone tried to click something.
+
+### Verified on hardware
+
+All four rotations (desktop fills the panel, taskbar left at 90 and right at
+270, pointer within ~10px of the finger at both quarter turns). Desktop size at
+75% (1920x1200 monitor, alignment holds). Frame cap measured rather than assumed
+-- 30 frames per 1.03s capped against per 0.52s uncapped. Gear drag over the
+full width of the screen leaving the Linux desktop **byte-identical outside the
+gear's own rectangle**. Screen-awake as a `SCREEN_BRIGHT_WAKE_LOCK` attributed
+to the app, present after the first frame and absent before it.
+
+### Not verified, and needing a person
+
+- **The S Pen side button.** `adb` cannot synthesise `BUTTON_STYLUS_PRIMARY`, so
+  middle click and eraser have never actually been pressed. The bit decoding is
+  unit-tested and the virtual tablet advertises `KEY=1c03` -- `BTN_TOOL_PEN`,
+  `BTN_TOOL_RUBBER`, `BTN_TOUCH`, `BTN_STYLUS`, `BTN_STYLUS2` -- but that is
+  capability, not behaviour.
+- **Pen pressure and tilt at the quarter turns.** Touch is verified there and
+  the pen goes through the same mapping, but no real S Pen has been on it.
+- **The accessibility pass.** Focus rings and the reduced-motion gate are
+  written; neither has been exercised with a keyboard or with
+  `animator_duration_scale 0`.
+- **Anything GNOME.** Milestone 10's caveat still stands.

@@ -28,10 +28,23 @@ keep matching the identification strings `daemon/src/aoa.rs` sends).
 | File | What it does |
 |---|---|
 | `MainActivity.kt` | Transport, protocol, decode loop, S Pen capture |
-| `Settings.kt` | Persisted options, packed into the handshake's `config_flags` |
-| `SettingsActivity.kt` | The settings screen — reached from the gear, or the status overlay while disconnected |
+| `Settings.kt` | Persisted options; the session ones packed into the handshake's `config_flags` |
+| `SettingsActivity.kt` | Hosts the settings screen; owns the staged draft |
+| `SettingsDraft.kt` | What you are proposing, as against what is saved |
+| `SessionConfig.kt` | What the *running* session was started with, so the screen can mark a change as staged |
 | `CursorOverlay.kt` | Draws the desktop pointer, for client-side cursor mode |
-| `GearButton.kt` | Dimmed corner gear; the settings entry point that survives streaming |
+| `LatencyOverlay.kt` | Per-frame latency over the video. Must **not** swallow input — the opposite of `GearButton` |
+| `FramePreview.kt` | Grabs a still of the desktop on the way into settings, for the slab |
+| `GearButton.kt` | The draggable, edge-snapping settings entry point that survives streaming |
+| `GearEdge.kt` | Which edge it is parked against |
+| `ui/QuillTokens.kt` | Colours, spacing, shapes — in Kotlin, not `res/values` |
+| `ui/QuillType.kt` | The three faces, loaded from `res/font` |
+| `ui/QuillTheme.kt` | The little `material3` would have given us, including the reduced-motion scale |
+| `ui/Controls.kt` | Bespoke switch, segmented choice, buttons, focus ring |
+| `ui/SlabControl.kt` | The tablet drawn to scale, with the real desktop in it |
+| `ui/SettingsScreen.kt` | Two-pane layout and the sections |
+| `ui/SettingsScreenState.kt` | Everything the screen draws and can do, in one value |
+| `tools/build-fonts.sh` | Regenerates `res/font` from the upstream OFL sources |
 
 The wire protocol both sides speak is documented in one place,
 [`daemon/src/protocol.rs`](../daemon/src/protocol.rs). The constants at the

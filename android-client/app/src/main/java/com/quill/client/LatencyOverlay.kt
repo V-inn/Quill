@@ -70,7 +70,9 @@ class LatencyOverlay(context: Context) : View(context) {
         // lives in MainActivity's tree, which deliberately loads no Compose.
         color = Color.rgb(0xE8, 0xE6, 0xE1)
         typeface = ResourcesCompat.getFont(context, R.font.ibm_plex_mono_regular)
-        textSize = 13f * resources.displayMetrics.scaledDensity
+        textSize = android.util.TypedValue.applyDimension(
+            android.util.TypedValue.COMPLEX_UNIT_SP, 13f, resources.displayMetrics,
+        )
     }
     private val backdrop = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.argb(150, 0x2A, 0x2F, 0x35)

@@ -14,6 +14,7 @@ import android.view.View
 import android.view.ViewConfiguration
 import kotlin.math.abs
 import kotlin.math.cos
+import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sin
@@ -202,6 +203,28 @@ class GearButton(context: Context) : View(context) {
     }
 
     /**
+     * Decides what a finished drag meant.
+     *
+     * Touch slop is the right threshold for *starting* to follow the finger --
+     * anything larger feels sticky -- but it is far too low to treat as an
+     * intent to move: a tap that wobbles a few pixels past it would otherwise
+     * re-snap and save a slightly different position, and enough taps walk the
+     * gear along its edge. Observed doing exactly that over a testing session,
+     * drifting from 0.71 to 0.27 of the way down.
+     *
+     * So a drag that ends up near where it began puts the gear back where it
+     * was and saves nothing. Only a deliberate move re-parks it.
+     */
+    private fun settle(event: MotionEvent) {
+        val moved = hypot(event.rawX - downRawX, event.rawY - downRawY)
+        if (moved < dp(MIN_MOVE_DP)) {
+            moveTo(edge, fraction, animated = true)
+        } else {
+            snapToNearestEdge()
+        }
+    }
+
+    /**
      * Picks the edge whose distance from the view's centre is smallest, and
      * where along it the gear ended up, then parks there and remembers it.
      */
@@ -353,13 +376,13 @@ class GearButton(context: Context) : View(context) {
             }
 
             MotionEvent.ACTION_UP -> {
-                if (dragging) snapToNearestEdge() else performClick()
+                if (dragging) settle(event) else performClick()
                 dragging = false
                 fadeSoon()
             }
 
             MotionEvent.ACTION_CANCEL -> {
-                if (dragging) snapToNearestEdge()
+                if (dragging) settle(event)
                 dragging = false
                 fadeSoon()
             }
@@ -400,6 +423,10 @@ class GearButton(context: Context) : View(context) {
 
         /** Keeps the gear out of the corners, where gesture regions meet. */
         private const val CORNER_MARGIN_DP = 64f
+
+        /** How far a drag has to travel before it counts as meaning to move
+         * the gear rather than being a slightly shaky tap. */
+        private const val MIN_MOVE_DP = 24f
 
         private const val SLIVER_THICKNESS_DP = 5f
         private const val SLIVER_LENGTH_DP = 30f

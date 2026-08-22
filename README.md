@@ -111,11 +111,15 @@ Then drag a window onto the tablet.
 
 - Extended display over USB, connecting directly to the tablet (no `adb` relay
   involved) — plug the tablet in and it starts on its own, no manual steps
-- Full S Pen input: pressure, tilt, hover, and the side button
+- Full S Pen input: pressure, tilt, hover, and a remappable side button
 - Multi-touch gestures — two-finger scroll, pinch-to-zoom, tap-to-click — handled the
   same way a laptop touchpad's gestures are
-- Portrait and landscape, with a display-flip setting for cable orientation
-- A settings screen on the tablet (display orientation, cursor mode, gesture mode)
+- Rotate the desktop 0, 90, 180 or 270 degrees — a quarter turn asks for a
+  portrait desktop that then fills the landscape panel exactly
+- Run the desktop smaller than the panel, so everything on it is bigger
+- A settings screen on the tablet: rotation, desktop size, picture quality, frame
+  rate, pointer mode, gestures, S Pen side button, and a latency readout
+- Keeps the tablet awake while a desktop is on it, and lets it sleep when not
 - Recovers on its own from a dropped cable, an app restart, or a daemon restart
 - ~55ms glass-to-glass latency (camera-measured)
 
