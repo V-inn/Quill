@@ -1,0 +1,95 @@
+# Builds the daemon's Linux packages on a version tag and attaches them to the
+# GitHub release.
+#
+# What this workflow deliberately does NOT do: build the Android app. The
+# release signing key is not in CI and must not be -- losing it means never
+# again shipping an update that installs over an existing Quill, and a key that
+# lives in a secrets store is a key that can leak from one. The APK is built and
+# signed on the developer's machine and attached to the release by hand.
+#
+# Each job runs in the *same base image* packaging/build-packages.sh uses
+# locally, running the *same script*, so a CI package and a locally built one
+# come out identical. The image is not an arbitrary choice: cargo-deb resolves
+# `depends = "$auto"` against the machine it builds on, so building on anything
+# newer than the oldest supported release bakes in package names that release
+# has never heard of.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  # So the packaging can be exercised without cutting a release.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  packages:
+    name: ${{ matrix.format }} (${{ matrix.image }})
+    runs-on: ubuntu-latest
+    strategy:
+      # One broken format should not hide whether the other one built.
+      fail-fast: false
+      matrix:
+        include:
+          - format: deb
+            image: debian:12
+            artifacts: daemon/target/debian
+          - format: rpm
+            image: fedora:latest
+            artifacts: daemon/target/generate-rpm
+
+    container:
+      image: ${{ matrix.image }}
+
+    steps:
+      # actions/checkout shells out to git when it is present and falls back to
+      # a tarball download when it is not; installing it keeps the checkout a
+      # real repository, which `git describe` and friends need.
+      - name: Install git
+        run: |
+          if command -v apt-get >/dev/null; then
+            apt-get update -qq
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git ca-certificates
+          else
+            dnf install -y -q git
+          fi
+
+      - uses: actions/checkout@v4
+
+      - name: Build packages
+        env:
+          # The checkout is not at /src here, which is the only thing that
+          # differs from a local run.
+          QUILL_SRC: ${{ github.workspace }}
+        run: bash daemon/packaging/build-in-container.sh ${{ matrix.format }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quill-${{ matrix.format }}
+          path: ${{ matrix.artifacts }}/*.${{ matrix.format }}
+          if-no-files-found: error
+
+  release:
+    name: Attach to release
+    needs: packages
+    runs-on: ubuntu-latest
+    # workflow_dispatch runs have no tag to attach anything to; they exist to
+    # prove the packaging still builds.
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ls -l artifacts
+          gh release upload "${GITHUB_REF_NAME}" artifacts/* \
+            --repo "${GITHUB_REPOSITORY}" --clobber
