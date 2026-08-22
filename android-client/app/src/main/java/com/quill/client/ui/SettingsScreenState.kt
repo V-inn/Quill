@@ -18,6 +18,8 @@ data class SettingsScreenState(
     val ctrlScrollZoom: Boolean,
     val rotationDegrees: Int,
     val workspaceScalePercent: Int,
+    val cap30Fps: Boolean,
+    val quality: Int,
     val keepScreenAwake: Boolean,
     val showLatencyOverlay: Boolean,
     val sideButtonAction: Int,
@@ -26,6 +28,8 @@ data class SettingsScreenState(
     val ctrlScrollZoomStaged: Boolean = false,
     val rotationStaged: Boolean = false,
     val workspaceStaged: Boolean = false,
+    val cap30FpsStaged: Boolean = false,
+    val qualityStaged: Boolean = false,
 
     /** True once a desktop has actually rendered on this tablet. */
     val sessionLive: Boolean = false,
@@ -52,6 +56,8 @@ data class SettingsScreenState(
     val onCtrlScrollZoom: (Boolean) -> Unit,
     val onRotation: (Int) -> Unit,
     val onWorkspaceScale: (Int) -> Unit,
+    val onCap30Fps: (Boolean) -> Unit,
+    val onQuality: (Int) -> Unit,
     val onKeepScreenAwake: (Boolean) -> Unit,
     val onShowLatencyOverlay: (Boolean) -> Unit,
     val onSideButtonAction: (Int) -> Unit,
@@ -63,8 +69,10 @@ data class SettingsScreenState(
     val onDiscard: () -> Unit,
 ) {
     val stagedCount: Int
-        get() = listOf(clientSideCursorStaged, ctrlScrollZoomStaged, rotationStaged, workspaceStaged)
-            .count { it }
+        get() = listOf(
+            clientSideCursorStaged, ctrlScrollZoomStaged, rotationStaged,
+            workspaceStaged, cap30FpsStaged, qualityStaged,
+        ).count { it }
 
     val hasStagedChanges: Boolean get() = stagedCount > 0
 

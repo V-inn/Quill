@@ -95,6 +95,10 @@ fn decode_latency_barcode(bytes: &[u8], stride: usize) -> Option<u64> {
 const DRM_FORMAT_MOD_INVALID: i64 = 0x00ff_ffff_ffff_ffff;
 const DRM_FORMAT_MOD_LINEAR: i64 = 0;
 
+/// Slightly under 1/30s, so a source running at a steady 30 is not clipped to
+/// 15 by a frame arriving a hair early.
+const MIN_FRAME_INTERVAL_30FPS: Duration = Duration::from_micros(31_000);
+
 /// Serializes one `EnumFormat` pod. With `dmabuf`, it carries a
 /// `SPA_FORMAT_VIDEO_modifier` choice marked MANDATORY + DONT_FIXATE -- the
 /// standard two-step modifier negotiation (the producer picks one from our
@@ -367,6 +371,10 @@ struct CaptureData {
     format: spa::param::video::VideoInfoRaw,
     encoder: Option<VaapiEncoder>,
     rotation: crate::protocol::Rotation,
+    quality: crate::protocol::Quality,
+    cap_fps_30: bool,
+    /// When the last frame was actually encoded, for the 30fps cap.
+    last_encoded_at: Option<Instant>,
     /// `QUILL_NO_ENCODE` -- see the early return in `process`.
     no_encode: bool,
     /// Whether the client draws the pointer itself. Only in `ClientSide` does
@@ -638,6 +646,8 @@ pub fn run_capture(
     out_path: &str,
     transport: Option<TransportWriter>,
     rotation: crate::protocol::Rotation,
+    quality: crate::protocol::Quality,
+    cap_fps_30: bool,
     cursor: CursorRendering,
     preferred_size: (u32, u32),
 ) -> Result<CaptureStats, pw::Error> {
@@ -669,6 +679,9 @@ pub fn run_capture(
         format: Default::default(),
         encoder: None,
         rotation,
+        quality,
+        cap_fps_30,
+        last_encoded_at: None,
         no_encode: std::env::var("QUILL_NO_ENCODE").is_ok(),
         cursor,
         last_cursor_id: None,
@@ -731,7 +744,7 @@ pub fn run_capture(
             // same size as the first, and rebuilding on it threw away a working
             // encoder (and reset its GOP state) for nothing.
             if user_data.sent_format != Some((width, height)) {
-                let encoder = VaapiEncoder::new(width, height, user_data.rotation)
+                let encoder = VaapiEncoder::new(width, height, user_data.rotation, user_data.quality)
                     .expect("VAAPI encoder init failed");
                 user_data.encoder = Some(encoder);
             }
@@ -809,6 +822,23 @@ pub fn run_capture(
             // just grows and we always end up encoding an old one. Drain to
             // the newest buffer available right now and let older ones drop
             // (auto-requeued to PipeWire via `Buffer`'s Drop impl) unprocessed.
+            // The 30fps cap, enforced by not encoding rather than by asking
+            // for a lower rate: what arrives is driven by how often the
+            // compositor damages the output, and a negotiated maximum is a
+            // hint the producer may ignore. The buffer is still dequeued and
+            // dropped, so PipeWire gets it back and the queue does not grow --
+            // see the staleness note below, which is the same reasoning.
+            if user_data.cap_fps_30 {
+                let now = Instant::now();
+                if let Some(last) = user_data.last_encoded_at {
+                    if now.duration_since(last) < MIN_FRAME_INTERVAL_30FPS {
+                        let _ = stream.dequeue_buffer();
+                        return;
+                    }
+                }
+                user_data.last_encoded_at = Some(now);
+            }
+
             let Some(mut buffer) = stream.dequeue_buffer() else {
                 return;
             };

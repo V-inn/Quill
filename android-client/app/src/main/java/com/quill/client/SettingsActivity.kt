@@ -62,6 +62,8 @@ class SettingsActivity : ComponentActivity() {
             var ctrlScrollZoom by rememberSaveable { mutableStateOf(settings.ctrlScrollZoom) }
             var rotationDegrees by rememberSaveable { mutableStateOf(settings.rotationDegrees) }
             var workspaceScale by rememberSaveable { mutableStateOf(settings.workspaceScalePercent) }
+            var cap30Fps by rememberSaveable { mutableStateOf(settings.cap30Fps) }
+            var quality by rememberSaveable { mutableStateOf(settings.quality) }
 
             // Tablet settings are not staged -- there is nothing to stage
             // against, since they take effect the moment you leave. They keep
@@ -70,7 +72,7 @@ class SettingsActivity : ComponentActivity() {
             var showLatencyOverlay by rememberSaveable { mutableStateOf(settings.showLatencyOverlay) }
             var sideButtonAction by rememberSaveable { mutableStateOf(settings.sideButtonAction) }
 
-            val draft = SettingsDraft(clientSideCursor, ctrlScrollZoom, rotationDegrees, workspaceScale)
+            val draft = SettingsDraft(clientSideCursor, ctrlScrollZoom, rotationDegrees, workspaceScale, cap30Fps, quality)
             val session = SessionConfig.applied
 
             val apply = {
@@ -90,6 +92,8 @@ class SettingsActivity : ComponentActivity() {
                     ctrlScrollZoom = ctrlScrollZoom,
                     rotationDegrees = rotationDegrees,
                     workspaceScalePercent = workspaceScale,
+                    cap30Fps = cap30Fps,
+                    quality = quality,
                     keepScreenAwake = keepScreenAwake,
                     showLatencyOverlay = showLatencyOverlay,
                     sideButtonAction = sideButtonAction,
@@ -101,6 +105,8 @@ class SettingsActivity : ComponentActivity() {
                     ctrlScrollZoomStaged = session != null && ctrlScrollZoom != session.ctrlScrollZoom,
                     rotationStaged = session != null && rotationDegrees != session.rotationDegrees,
                     workspaceStaged = session != null && workspaceScale != session.workspaceScalePercent,
+                    cap30FpsStaged = session != null && cap30Fps != session.cap30Fps,
+                    qualityStaged = session != null && quality != session.quality,
 
                     sessionLive = session != null,
                     previewFrame = FramePreview.peek(),
@@ -116,6 +122,8 @@ class SettingsActivity : ComponentActivity() {
                     onCtrlScrollZoom = { ctrlScrollZoom = it },
                     onRotation = { rotationDegrees = it },
                     onWorkspaceScale = { workspaceScale = it },
+                    onCap30Fps = { cap30Fps = it },
+                    onQuality = { quality = it },
                     onKeepScreenAwake = {
                         keepScreenAwake = it
                         settings.keepScreenAwake = it

@@ -102,6 +102,7 @@ pub struct VaapiEncoder {
     // but never the captured pixels. VPP's own rotation_state is the
     // GPU-accelerated place that does work, applied here instead.
     rotation: crate::protocol::Rotation,
+    quality: crate::protocol::Quality,
     // GOP state: total frames encoded so far (drives the ping-pong slot and
     // the IDR/P decision), a counter distinguishing successive IDRs
     // (idr_pic_id must differ between them even though frame_num resets to
@@ -127,6 +128,7 @@ impl VaapiEncoder {
         src_width: u32,
         src_height: u32,
         rotation: crate::protocol::Rotation,
+        quality: crate::protocol::Quality,
     ) -> VaResult<Self> {
         let (width, height) = if rotation.swaps_axes() {
             (src_height, src_width)
@@ -203,9 +205,19 @@ impl VaapiEncoder {
         let quality_level = if quality_attrib.value == 0 || quality_attrib.value == u32::MAX {
             0 // 0 means "driver default", i.e. don't send the buffer at all
         } else {
-            quality_attrib.value
+            // 1 is the driver's best, `value` its fastest. The preset picks a
+            // fraction along that range rather than a fixed number, since the
+            // range is driver-specific -- iHD reports something quite different
+            // from AMD, and a hardcoded level would mean opposite things.
+            let span = quality_attrib.value as f32;
+            (span * quality.speed_fraction()).round().clamp(1.0, span) as u32
         };
-        eprintln!("[vaapi] encoder quality range: {} (using level {quality_level})", quality_attrib.value);
+        eprintln!(
+            "[vaapi] encoder quality range: {} (using level {quality_level}, {:?} at {} Mbps)",
+            quality_attrib.value,
+            quality,
+            quality.bits_per_second() / 1_000_000,
+        );
 
         let mut attribs = [
             ffi::VAConfigAttrib {
@@ -401,6 +413,7 @@ impl VaapiEncoder {
             src_aligned_width,
             src_aligned_height,
             rotation,
+            quality,
             quality_level,
             frame_count: 0,
             idr_count: 0,
@@ -601,7 +614,7 @@ impl VaapiEncoder {
         seq.intra_period = GOP_SIZE as u32;
         seq.intra_idr_period = GOP_SIZE as u32;
         seq.ip_period = 1; // no B-frames: every non-I frame is a P
-        seq.bits_per_second = 20_000_000;
+        seq.bits_per_second = self.quality.bits_per_second();
         seq.max_num_ref_frames = 1;
         seq.picture_width_in_mbs = mbs_w as u16;
         seq.picture_height_in_mbs = mbs_h as u16;

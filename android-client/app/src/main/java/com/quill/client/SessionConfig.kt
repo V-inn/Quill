@@ -33,6 +33,8 @@ object SessionConfig {
         val ctrlScrollZoom: Boolean,
         val rotationDegrees: Int,
         val workspaceScalePercent: Int,
+        val cap30Fps: Boolean,
+        val quality: Int,
         val widthPx: Int,
         val heightPx: Int,
     )
@@ -43,6 +45,8 @@ object SessionConfig {
             ctrlScrollZoom = settings.ctrlScrollZoom,
             rotationDegrees = settings.rotationDegrees,
             workspaceScalePercent = settings.workspaceScalePercent,
+            cap30Fps = settings.cap30Fps,
+            quality = settings.quality,
             widthPx = widthPx,
             heightPx = heightPx,
         )

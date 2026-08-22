@@ -174,6 +174,33 @@ class Settings(context: Context) {
             .putInt(KEY_WORKSPACE_SCALE, if (value in VALID_WORKSPACE_SCALES) value else 100)
             .apply()
 
+    /**
+     * Halve the stream to 30fps.
+     *
+     * Roughly halves what the daemon encodes and what crosses the cable. Fine
+     * for reading, not for drawing, which is why it is a choice rather than a
+     * default.
+     */
+    var cap30Fps: Boolean
+        get() = prefs.getBoolean(KEY_CAP_30_FPS, false)
+        set(value) = prefs.edit().putBoolean(KEY_CAP_30_FPS, value).apply()
+
+    /**
+     * How hard the daemon's encoder works: [QUALITY_BALANCED],
+     * [QUALITY_SHARPER] or [QUALITY_LIGHTER].
+     *
+     * Balanced is zero on the wire and is exactly what every version before
+     * this setting used, so an older daemon is unaffected by a newer client.
+     */
+    var quality: Int
+        get() {
+            val stored = prefs.getInt(KEY_QUALITY, QUALITY_BALANCED)
+            return if (stored in VALID_QUALITIES) stored else QUALITY_BALANCED
+        }
+        set(value) = prefs.edit()
+            .putInt(KEY_QUALITY, if (value in VALID_QUALITIES) value else QUALITY_BALANCED)
+            .apply()
+
     /** Packed into the handshake's `config_flags` byte. */
     fun configFlags(): Int {
         var flags = 0
@@ -187,6 +214,8 @@ class Settings(context: Context) {
             180 -> flags = flags or CONFIG_FLIP_180
             270 -> flags = flags or CONFIG_ROTATE_90 or CONFIG_FLIP_180
         }
+        if (cap30Fps) flags = flags or CONFIG_FPS_30
+        flags = flags or (quality shl CONFIG_QUALITY_SHIFT)
         return flags
     }
 
@@ -205,6 +234,8 @@ class Settings(context: Context) {
         private const val KEY_ROTATION_DEGREES = "rotation_deg"
         private const val KEY_SIDE_BUTTON = "side_button_action"
         private const val KEY_WORKSPACE_SCALE = "workspace_scale_percent"
+        private const val KEY_CAP_30_FPS = "cap_30_fps"
+        private const val KEY_QUALITY = "encoder_quality"
         private val VALID_ROTATIONS = setOf(0, 90, 180, 270)
 
         // Mirrors protocol.rs. Kept as plain constants in both languages rather
@@ -215,6 +246,14 @@ class Settings(context: Context) {
         const val CONFIG_CTRL_SCROLL_ZOOM = 1 shl 1
         const val CONFIG_FLIP_180 = 1 shl 2
         const val CONFIG_ROTATE_90 = 1 shl 3
+        const val CONFIG_FPS_30 = 1 shl 4
+        const val CONFIG_QUALITY_SHIFT = 5
+
+        // Mirrors protocol.rs's Quality. Balanced is zero, which is what every
+        // version before this setting sent.
+        const val QUALITY_BALANCED = 0
+        const val QUALITY_SHARPER = 1
+        const val QUALITY_LIGHTER = 2
 
         // Bits 2-3 of a button event's `buttons` byte, mirroring
         // uinput_tablet.rs's ButtonAction. Right click is zero, which is what
@@ -225,6 +264,9 @@ class Settings(context: Context) {
 
         /** Not a wire value: the event is simply not sent. */
         const val SIDE_BUTTON_NONE = 3
+
+        val QUALITIES = listOf(QUALITY_BALANCED, QUALITY_SHARPER, QUALITY_LIGHTER)
+        private val VALID_QUALITIES = QUALITIES.toSet()
 
         val WORKSPACE_SCALES = listOf(100, 75, 60)
         private val VALID_WORKSPACE_SCALES = WORKSPACE_SCALES.toSet()

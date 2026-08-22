@@ -241,6 +241,24 @@ private fun SessionSection(state: SettingsScreenState) {
                     "Krita and anything else on XWayland ignores it entirely."
             },
         )
+        ChoiceRow(
+            label = "Picture quality",
+            options = listOf("Balanced", "Sharper", "Lighter"),
+            selectedIndex = com.quill.client.Settings.QUALITIES.indexOf(state.quality).coerceAtLeast(0),
+            onSelect = { state.onQuality(com.quill.client.Settings.QUALITIES[it]) },
+            staged = state.qualityStaged,
+            note = "Sharper spends more bits and more encode time on every frame, " +
+                "so it costs a little latency. Lighter is for a tight cable or a " +
+                "tight power budget.",
+        )
+        SwitchRow(
+            label = "Halve the frame rate",
+            checked = state.cap30Fps,
+            onCheckedChange = state.onCap30Fps,
+            staged = state.cap30FpsStaged,
+            note = "30 instead of 60. Roughly halves what gets encoded and sent — " +
+                "comfortable for reading, not for drawing.",
+        )
         Note(
             "Two-finger scroll, swipes and two-finger tap are recognised by Linux " +
                 "itself, from a virtual touchpad the daemon creates. Configure them in " +

@@ -33,7 +33,7 @@ fn main() {
     let out_path = std::env::args().nth(1).unwrap_or_else(|| "/tmp/vui_test.h264".to_string());
     let mut out = std::fs::File::create(&out_path).expect("create output file");
 
-    let mut encoder = VaapiEncoder::new(WIDTH, HEIGHT, protocol::Rotation::None).expect("VAAPI encoder init failed");
+    let mut encoder = VaapiEncoder::new(WIDTH, HEIGHT, protocol::Rotation::None, protocol::Quality::Balanced).expect("VAAPI encoder init failed");
 
     let stride = WIDTH as usize * 4;
     let mut frame = vec![0u8; stride * HEIGHT as usize];

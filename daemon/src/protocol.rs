@@ -137,6 +137,63 @@ pub const CONFIG_FLIP_180: u8 = 1 << 2;
 /// so rather than showing a corrupted screen. See `MainActivity`.
 pub const CONFIG_ROTATE_90: u8 = 1 << 3;
 
+/// Bit 4: cap the stream at 30fps instead of 60.
+///
+/// Enforced by dropping frames in the capture loop rather than by asking
+/// PipeWire for a lower rate: what actually arrives is driven by how often the
+/// compositor damages the output, and a negotiated maximum is a hint the
+/// producer is free to ignore. Dropping is the version that certainly saves the
+/// encode and the USB traffic.
+pub const CONFIG_FPS_30: u8 = 1 << 4;
+
+/// Bits 5-6: how hard the encoder works. See [`Quality`].
+pub const CONFIG_QUALITY_MASK: u8 = 0b11 << 5;
+pub const CONFIG_QUALITY_SHIFT: u8 = 5;
+
+/// The trade between a sharper picture and a faster one.
+///
+/// Zero is [`Quality::Balanced`], which is exactly what every version before
+/// this setting existed used -- 20 Mbps at the driver's fastest preset -- so an
+/// older client keeps getting bit-for-bit what it always got.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Quality {
+    #[default]
+    Balanced,
+    /// More bits and a slower preset. Costs encode time on every frame.
+    Sharper,
+    /// Fewer bits, for a weak link or a tight power budget.
+    Lighter,
+}
+
+impl Quality {
+    pub fn from_config_flags(flags: u8) -> Self {
+        match (flags & CONFIG_QUALITY_MASK) >> CONFIG_QUALITY_SHIFT {
+            1 => Quality::Sharper,
+            2 => Quality::Lighter,
+            _ => Quality::Balanced,
+        }
+    }
+
+    pub fn bits_per_second(self) -> u32 {
+        match self {
+            Quality::Sharper => 40_000_000,
+            Quality::Balanced => 20_000_000,
+            Quality::Lighter => 8_000_000,
+        }
+    }
+
+    /// Where to sit in the driver's quality range, as a fraction from fastest
+    /// (1.0) to best (0.0). The range itself is queried at runtime, since it
+    /// differs per driver -- see `vaapi_encoder`.
+    pub fn speed_fraction(self) -> f32 {
+        match self {
+            Quality::Sharper => 0.4,
+            Quality::Balanced => 1.0,
+            Quality::Lighter => 1.0,
+        }
+    }
+}
+
 /// How far the captured image is turned before it is encoded, and how far
 /// touch and pen coordinates have to be turned back.
 ///
@@ -304,5 +361,32 @@ mod rotation_tests {
         assert!(Rotation::Quarter.swaps_axes());
         assert!(!Rotation::Half.swaps_axes());
         assert!(Rotation::ThreeQuarters.swaps_axes());
+    }
+}
+
+#[cfg(test)]
+mod quality_tests {
+    use super::*;
+
+    /// Zero must stay exactly what every client before this setting sent.
+    #[test]
+    fn zero_is_what_it_always_was() {
+        assert_eq!(Quality::from_config_flags(0), Quality::Balanced);
+        assert_eq!(Quality::Balanced.bits_per_second(), 20_000_000);
+    }
+
+    #[test]
+    fn the_presets_decode_from_bits_five_and_six() {
+        assert_eq!(Quality::from_config_flags(1 << 5), Quality::Sharper);
+        assert_eq!(Quality::from_config_flags(2 << 5), Quality::Lighter);
+    }
+
+    /// Rotation, cursor mode and the rest share this byte.
+    #[test]
+    fn the_other_config_bits_do_not_disturb_it() {
+        let noise = CONFIG_CLIENT_SIDE_CURSOR | CONFIG_ROTATE_90 | CONFIG_FLIP_180 | CONFIG_FPS_30;
+        assert_eq!(Quality::from_config_flags(noise), Quality::Balanced);
+        assert_eq!(Quality::from_config_flags(noise | (1 << 5)), Quality::Sharper);
+        assert_eq!(Rotation::from_config_flags(noise | (2 << 5)), Rotation::ThreeQuarters);
     }
 }

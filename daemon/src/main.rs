@@ -156,6 +156,13 @@ async fn main() {
         .map(|(_, i)| crate::protocol::Rotation::from_config_flags(i.config_flags))
         .unwrap_or(crate::protocol::Rotation::None);
 
+    // How hard the encoder works, and whether to halve the frame rate. Both
+    // ride the same config byte the rotation does; zero means what it always
+    // meant, so an older client is unaffected.
+    let config_flags = transport_setup.as_ref().map(|(_, i)| i.config_flags).unwrap_or(0);
+    let quality = crate::protocol::Quality::from_config_flags(config_flags);
+    let cap_fps_30 = config_flags & crate::protocol::CONFIG_FPS_30 != 0;
+
 
     // The size everything downstream is built around: the encoder's surfaces,
     // the format offered to PipeWire, and on GNOME the virtual monitor itself.
@@ -229,6 +236,8 @@ async fn main() {
         &out_path,
         transport,
         rotation,
+        quality,
+        cap_fps_30,
         cursor,
         capture_size,
     )
