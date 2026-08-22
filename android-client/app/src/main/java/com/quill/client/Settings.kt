@@ -114,7 +114,7 @@ class Settings(context: Context) {
 
     /** True at the quarter turns, where the monitor is the panel transposed. */
     val rotationSwapsAxes: Boolean
-        get() = rotationDegrees == 90 || rotationDegrees == 270
+        get() = PanelGeometry.swapsAxes(rotationDegrees)
 
     /**
      * Which screen edge the settings gear is parked against, as a
@@ -202,14 +202,22 @@ class Settings(context: Context) {
             .apply()
 
     /** Packed into the handshake's `config_flags` byte. */
-    fun configFlags(): Int {
+    /**
+     * [rotation] defaults to the saved setting, and is passed explicitly by the
+     * handshake when this session has had to stop asking for a quarter turn a
+     * daemon could not do. These bits and the monitor dimensions describe the
+     * same request, so they have to be derived from the same number -- telling
+     * the daemon to rotate while asking for an unrotated monitor would be a
+     * quiet way to produce a sideways desktop.
+     */
+    fun configFlags(rotation: Int = rotationDegrees): Int {
         var flags = 0
         if (clientSideCursor) flags = flags or CONFIG_CLIENT_SIDE_CURSOR
         if (ctrlScrollZoom) flags = flags or CONFIG_CTRL_SCROLL_ZOOM
         // Two bits, arranged so that bit 2 still means exactly 180 degrees and
         // the two orientations that predate the quarter turns are bit-for-bit
         // what they always were. See protocol.rs, which this mirrors.
-        when (rotationDegrees) {
+        when (rotation) {
             90 -> flags = flags or CONFIG_ROTATE_90
             180 -> flags = flags or CONFIG_FLIP_180
             270 -> flags = flags or CONFIG_ROTATE_90 or CONFIG_FLIP_180

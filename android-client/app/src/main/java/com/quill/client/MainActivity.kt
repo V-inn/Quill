@@ -130,6 +130,23 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
      * Milestone 15's orientation lock used to make before Android 16 took the
      * lock away.
      */
+    /**
+     * A quarter turn this daemon has already proved it cannot do, or null.
+     *
+     * Set when the video format comes back unrotated, and used to stop asking
+     * for that same rotation again on this connection. Deliberately *not*
+     * written to SharedPreferences: a stale daemon is transient, the user's
+     * setting is not, and silently rewriting a preference because one handshake
+     * disagreed is how a setting appears to undo itself.
+     */
+    @Volatile
+    private var rotationRejectedFor: Int? = null
+
+    /** The rotation the last handshake actually asked for, which is not the
+     * saved setting when [rotationRejectedFor] has suppressed it. */
+    @Volatile
+    private var sessionRotationDegrees = 0
+
     @Volatile
     private var panelWidthPx = 0
     @Volatile
@@ -515,12 +532,9 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         val input = activeInput ?: return
         if (panelWidthPx == 0 || panelHeightPx == 0) return
 
-        // Compared as an unordered pair: the same panel turned a quarter is the
-        // same two numbers the other way round, and that is precisely the case
-        // that must not renegotiate.
-        val sameArea = (w == panelWidthPx && h == panelHeightPx) ||
-            (w == panelHeightPx && h == panelWidthPx)
-        if (sameArea) return
+        // See PanelGeometry.isSamePanel: a quarter turn is the same two numbers
+        // reversed, and that case must not renegotiate.
+        if (PanelGeometry.isSamePanel(w, h, panelWidthPx, panelHeightPx)) return
 
         // A surface that is not the panel and not the panel turned means the
         // window no longer owns the whole display: split-screen or freeform.
@@ -921,23 +935,27 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         // Asking for the panel's own shape instead would letterbox a rotated
         // image into it and waste most of the screen.
         val settings = Settings(this)
-        val swapAxes = settings.rotationSwapsAxes
+        // Not necessarily what the user saved: a daemon that has already shown
+        // it cannot do this particular quarter turn gets asked for 0 instead,
+        // for as long as this session lasts. See [rotationRejectedFor].
+        val rotation = PanelGeometry.effectiveRotation(settings.rotationDegrees, rotationRejectedFor)
+        sessionRotationDegrees = rotation
         // A desktop smaller than the panel: fewer pixels to lay out, encode and
         // push over the cable, and everything on it is physically bigger. Both
         // axes take the same factor, so the aspect is unchanged and nothing is
         // ever letterboxed.
-        val scale = settings.workspaceScalePercent / 100f
-        workspaceScale = scale
-        val scaledWidth = (widthPx * scale).roundToInt()
-        val scaledHeight = (heightPx * scale).roundToInt()
-        val monitorWidthPx = if (swapAxes) scaledHeight else scaledWidth
-        val monitorHeightPx = if (swapAxes) scaledWidth else scaledHeight
+        workspaceScale = settings.workspaceScalePercent / 100f
+        val monitor = PanelGeometry.monitorSize(
+            widthPx, heightPx, rotation, settings.workspaceScalePercent,
+        )
+        val monitorWidthPx = monitor.widthPx
+        val monitorHeightPx = monitor.heightPx
         requestedMonitorWidth = monitorWidthPx
         requestedMonitorHeight = monitorHeightPx
         // The moment these stop being preferences and become what the daemon is
         // actually doing. The settings screen diffs against this to tell a
         // staged change from a settled one.
-        SessionConfig.record(settings, widthPx, heightPx)
+        SessionConfig.record(settings, widthPx, heightPx, rotation)
 
         val stylusDevice = InputDevice.getDeviceIds()
             .map { InputDevice.getDevice(it) }
@@ -954,7 +972,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         Log.i(
             tag,
             "handshake: asking for ${monitorWidthPx}x${monitorHeightPx}px " +
-                "(panel ${widthPx}x${heightPx}, rotation ${settings.rotationDegrees}deg), " +
+                "(panel ${widthPx}x${heightPx}, rotation ${rotation}deg" +
+                (if (rotation != settings.rotationDegrees) " [${settings.rotationDegrees} suppressed]" else "") + "), " +
                 "pressure $pMin..$pMax, tilt -$tMaxDeg..$tMaxDeg (stylus device: ${stylusDevice?.name})"
         )
 
@@ -973,7 +992,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             // Milestone 7 clock-sync ping -- see clock_sync.rs on the daemon
             // side for the two-message offset calibration this kicks off.
             writeLong(System.currentTimeMillis())
-            writeByte(Settings(this@MainActivity).configFlags())
+            writeByte(Settings(this@MainActivity).configFlags(rotation))
             // Appended in Milestone 9: the virtual touchpad's gesture
             // thresholds are all specified in millimetres, so the daemon needs
             // a real physical resolution or none of them mean anything.
@@ -991,8 +1010,9 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             // over the same glass. The daemon turns pixel deltas into
             // millimetres with these for its touchpad thresholds (Milestone 9),
             // so an unscaled value would misjudge every gesture.
-            val xdpi = (resources.displayMetrics.xdpi * scale * 1000).roundToInt()
-            val ydpi = (resources.displayMetrics.ydpi * scale * 1000).roundToInt()
+            val xdpi = (resources.displayMetrics.xdpi * workspaceScale * 1000).roundToInt()
+            val ydpi = (resources.displayMetrics.ydpi * workspaceScale * 1000).roundToInt()
+            val swapAxes = PanelGeometry.swapsAxes(rotation)
             writeInt(if (swapAxes) ydpi else xdpi)
             writeInt(if (swapAxes) xdpi else ydpi)
         }
@@ -1209,8 +1229,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
      * not understand. Say so, in words, instead of showing the mess.
      */
     private fun checkDaemonUnderstoodRotation(videoWidth: Int, videoHeight: Int) {
-        val settings = Settings(this)
-        if (!settings.rotationSwapsAxes) return
+        // The rotation this session asked for, not the saved setting: once
+        // suppressed below, the handshake stops requesting it and there is
+        // nothing left to check.
+        if (!PanelGeometry.swapsAxes(sessionRotationDegrees)) return
         if (requestedMonitorWidth == 0 || requestedMonitorHeight == 0) return
         // We asked for `requested`; a daemon that understood returns its
         // transpose. Anything else means the rotation was dropped.
@@ -1221,14 +1243,19 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             tag,
             "daemon returned ${videoWidth}x${videoHeight} for a " +
                 "${requestedMonitorWidth}x${requestedMonitorHeight} monitor at " +
-                "${settings.rotationDegrees}deg -- expected ${expectedW}x${expectedH}. " +
-                "Falling back to no rotation.",
+                "${sessionRotationDegrees}deg -- expected ${expectedW}x${expectedH}. " +
+                "Falling back to no rotation for this session.",
         )
-        settings.rotationDegrees = 0
+        // Session-scoped, not persisted. A daemon that is merely stale -- still
+        // serving the pipeline it built for the previous connection -- produces
+        // exactly this mismatch, and writing the preference to 0 there threw
+        // away a setting the user had deliberately chosen, with no way to tell
+        // it had happened.
+        rotationRejectedFor = sessionRotationDegrees
         showStatus(
-            "This computer's Quill daemon is too old for 90° rotation.\n" +
-                "Update it, or pick 0° or 180° in settings.\n" +
-                "Reconnecting without rotation...",
+            "This computer's Quill daemon did not rotate the desktop.\n" +
+                "It may be too old, or still busy with the last connection.\n" +
+                "Your setting is kept; reconnecting without rotation...",
         )
     }
 

@@ -39,11 +39,19 @@ object SessionConfig {
         val heightPx: Int,
     )
 
-    fun record(settings: Settings, widthPx: Int, heightPx: Int) {
+    /**
+     * [rotationDegrees] is what the handshake actually asked for, which is
+     * normally the saved setting but is 0 when this session has had to give up
+     * on a quarter turn the daemon could not do. This snapshot describes what
+     * is *running*, so it has to record the request, not the preference --
+     * otherwise the settings screen would show a rotation as settled while the
+     * desktop on the glass is not rotated at all.
+     */
+    fun record(settings: Settings, widthPx: Int, heightPx: Int, rotationDegrees: Int) {
         applied = Snapshot(
             clientSideCursor = settings.clientSideCursor,
             ctrlScrollZoom = settings.ctrlScrollZoom,
-            rotationDegrees = settings.rotationDegrees,
+            rotationDegrees = rotationDegrees,
             workspaceScalePercent = settings.workspaceScalePercent,
             cap30Fps = settings.cap30Fps,
             quality = settings.quality,
