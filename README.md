@@ -9,24 +9,13 @@ with a Wacom EMR S Pen.
 
 ## Demo
 
-<table>
-<tr>
-<td width="50%">
-
-![A window being dragged from the desktop onto the tablet, which acts as an extended display](./assets/extended-display.gif)
+https://github.com/user-attachments/assets/dc07d9b5-5367-40e1-9239-2fe61768e5d5
 
 Dragging a window from the desktop onto the tablet as an extended display.
 
-</td>
-<td width="50%">
-
-![Drawing in GIMP with the S Pen, with pressure and tilt working live on the tablet](./assets/s-pen-gimp.gif)
+https://github.com/user-attachments/assets/ce1dfe39-6e52-4cae-9dd6-d23542fc7191
 
 Drawing in GIMP with the S Pen — pressure and tilt working live.
-
-</td>
-</tr>
-</table>
 
 ## What it needs to work
 

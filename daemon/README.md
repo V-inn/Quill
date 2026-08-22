@@ -83,7 +83,7 @@ The two udev rules it names do different jobs:
 
 | Rule | Why |
 | --- | --- |
-| `70-quill-uinput.rules` | Lets your user open `/dev/uinput`, so the daemon can create the virtual pen, touchpad and pointer. **This is the only thing in Quill that needs root**, and only once. |
+| `60-quill-uinput.rules` | Lets your user open `/dev/uinput`, so the daemon can create the virtual pen, touchpad and pointer. **This is the only thing in Quill that needs root**, and only once. |
 | `99-quill-daemon.rules` | Starts the daemon automatically when the tablet is plugged in. Skip it if you would rather launch by hand. |
 
 `install.sh` checks whether `/dev/uinput` is already accessible and stays quiet

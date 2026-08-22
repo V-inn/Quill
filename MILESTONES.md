@@ -1260,7 +1260,7 @@ cost this project a milestone:
 | `gnome_display.rs` | `kscreen-doctor -j`'s replacement: `org.gnome.Mutter.DisplayConfig.GetCurrentState`, decoded into the same `DesktopLayout` the pointer warping already consumes. |
 | `orientation.rs` | Now dispatches `ensure`/`layout` on the backend; everything below the dispatchers is unchanged KDE code. |
 | `portal_capture.rs` | `run_capture` takes `fd: Option<OwnedFd>` (mutter publishes on the user's own PipeWire daemon, so there is no portal remote to connect through) and a preferred size. |
-| `packaging/70-quill-uinput.rules` | The one privileged step, isolated: `TAG+="uaccess"` on `/dev/uinput`. |
+| `packaging/60-quill-uinput.rules` | The one privileged step, isolated: `TAG+="uaccess"` on `/dev/uinput`. |
 
 The `70` in that filename is not cosmetic. `TAG+="uaccess"` does nothing on its own --
 the tag is *consumed* by systemd's `/usr/lib/udev/rules.d/73-seat-late.rules`

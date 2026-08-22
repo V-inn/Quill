@@ -49,6 +49,83 @@ fn align16(v: u32) -> u32 {
     (v + 15) & !15
 }
 
+/// Walks the driver's coded-buffer segment list into one contiguous buffer.
+///
+/// The list is written by the VA driver inside the buffer Quill allocated, and
+/// until this was bounded, nothing validated it on the way back out: `size` was
+/// used directly as a slice length and `next` was chased until it happened to
+/// be null. A driver reporting an inflated `size` would copy adjacent process
+/// memory into the frame that then goes to the phone; a cyclic `next` would
+/// loop until the allocator gave up. Both are now bounded against `cap` -- the
+/// size the allocation actually asked for -- and a segment budget.
+///
+/// # Safety
+/// `buf_ptr` must be the live mapping returned by `vaMapBuffer` for a coded
+/// buffer of at most `cap` bytes, valid for the duration of this call.
+unsafe fn collect_coded_segments(buf_ptr: *mut c_void, cap: usize) -> VaResult<Vec<u8>> {
+    // This encoder emits one segment per frame in practice. A list longer than
+    // this is malformed, not a bitstream.
+    const MAX_SEGMENTS: usize = 64;
+
+    let mut out: Vec<u8> = Vec::new();
+    let mut seg = buf_ptr as *const ffi::VACodedBufferSegment;
+    let mut count = 0usize;
+
+    while !seg.is_null() {
+        count += 1;
+        if count > MAX_SEGMENTS {
+            return Err(format!(
+                "coded buffer: segment list still going after {MAX_SEGMENTS} segments -- \
+                 refusing to follow it further"
+            ));
+        }
+        let s = &*seg;
+        if s.buf.is_null() {
+            return Err(format!("coded buffer: segment {count} has a null data pointer"));
+        }
+        let size = s.size as usize;
+        if size > cap || out.len() + size > cap {
+            return Err(format!(
+                "coded buffer: segment {count} reports {size} bytes, which with the {} already \
+                 read overruns the {cap}-byte buffer that was allocated",
+                out.len()
+            ));
+        }
+        out.extend_from_slice(std::slice::from_raw_parts(s.buf as *const u8, size));
+        seg = s.next as *const ffi::VACodedBufferSegment;
+    }
+    Ok(out)
+}
+
+/// Byte offset and length of plane 0, validated against the buffer the driver
+/// says it actually mapped.
+///
+/// A `VAImage` carries `data_size` -- the real size of the mapping -- right
+/// next to the `offsets`/`pitches` that describe where the plane sits inside
+/// it. Nothing in the API forces those three to agree, so a slice built from
+/// `offsets`/`pitches` alone is sound only for as long as the driver is
+/// well-behaved. `vaDeriveImage` is the trust boundary here: the values come
+/// back from the VA driver (iHD, in practice), not from anything Quill
+/// computed. Checking costs two comparisons per frame and turns a potential
+/// out-of-bounds read *or write* into a returned error.
+fn plane0_extent(image: &ffi::VAImage, rows: u32, what: &str) -> VaResult<(usize, usize)> {
+    let (offset, pitch) = (image.offsets[0], image.pitches[0]);
+    let len = pitch
+        .checked_mul(rows)
+        .ok_or_else(|| format!("{what}: pitch {pitch} x {rows} rows overflows u32"))?;
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| format!("{what}: offset {offset} + length {len} overflows u32"))?;
+    if end > image.data_size {
+        return Err(format!(
+            "{what}: plane 0 ends at byte {end} but the driver mapped only {} -- \
+             refusing to touch memory past the end of the buffer",
+            image.data_size
+        ));
+    }
+    Ok((offset as usize, len as usize))
+}
+
 /// Frames between IDRs (inclusive of the IDR itself). At the fixed 60fps
 /// hardware decode path (see MILESTONES.md), this is one IDR per second --
 /// tune down if the USB link needs faster recovery after a dropped frame,
@@ -550,12 +627,26 @@ impl VaapiEncoder {
             "vaMapBuffer(dmabuf probe)",
         )?;
         let stride = image.pitches[0] as usize;
+        // Same check as `upload_bgrx_surface`, and it matters more here: this
+        // image derives from a dmabuf whose stride/offset came from PipeWire's
+        // buffer metadata, i.e. from the compositor, not from the VA driver
+        // alone.
+        // Bounded against the *capture* height: this maps a frame that arrived
+        // from PipeWire, and at a quarter turn the encoder's own output is the
+        // transpose of it. Using the output height here would bound the check
+        // against the wrong number of rows.
+        let extent = plane0_extent(&image, self.src_height, "vaDeriveImage(dmabuf probe)");
+        let (offset, len) = match extent {
+            Ok(v) => v,
+            Err(e) => {
+                unsafe { ffi::vaUnmapBuffer(self.dpy, image.buf) };
+                unsafe { ffi::vaDestroyImage(self.dpy, image.image_id) };
+                return Err(e);
+            }
+        };
         let result = unsafe {
-            let base = (buf_ptr as *const u8).add(image.offsets[0] as usize);
-            f(
-                std::slice::from_raw_parts(base, stride * self.src_height as usize),
-                stride,
-            )
+            let base = (buf_ptr as *const u8).add(offset);
+            f(std::slice::from_raw_parts(base, len), stride)
         };
         check(unsafe { ffi::vaUnmapBuffer(self.dpy, image.buf) }, "vaUnmapBuffer(dmabuf probe)")?;
         check(
@@ -579,7 +670,7 @@ impl VaapiEncoder {
         let mbs_w = self.aligned_width / 16;
         let mbs_h = self.aligned_height / 16;
 
-        let coded_buf_size = (self.aligned_width * self.aligned_height * 3 / 2) + 0x10000;
+        let coded_buf_size = self.coded_buf_size();
         let mut coded_buf: ffi::VABufferID = 0;
         check(
             unsafe {
@@ -946,12 +1037,24 @@ impl VaapiEncoder {
             "vaMapBuffer(src)",
         )?;
 
+        // Unmap and destroy before propagating: this is the one write into
+        // driver-mapped memory in the whole encoder, so it gets checked, and a
+        // rejected frame shouldn't also leak the mapping it declined to use.
+        // The BGRX surface is capture-shaped, so it is the source alignment that
+        // bounds it, not the encoder's output alignment.
+        let extent = plane0_extent(&image, self.src_aligned_height, "vaDeriveImage(src)");
+        let (offset, len) = match extent {
+            Ok(v) => v,
+            Err(e) => {
+                unsafe { ffi::vaUnmapBuffer(self.dpy, image.buf) };
+                unsafe { ffi::vaDestroyImage(self.dpy, image.image_id) };
+                return Err(e);
+            }
+        };
+
         unsafe {
             let base = buf_ptr as *mut u8;
-            let dst = std::slice::from_raw_parts_mut(
-                base.add(image.offsets[0] as usize),
-                (image.pitches[0] as usize) * (self.src_aligned_height as usize),
-            );
+            let dst = std::slice::from_raw_parts_mut(base.add(offset), len);
             let row_bytes = self.src_width as usize * 4;
             for row in 0..self.src_height as usize {
                 let src = &bgrx[row * src_stride..][..row_bytes];
@@ -1027,6 +1130,13 @@ impl VaapiEncoder {
         Ok(())
     }
 
+    /// Size requested for the coded (bitstream output) buffer. A method rather
+    /// than a local so `read_coded_buffer` can bound what the driver reports
+    /// against the very number the allocation asked for.
+    fn coded_buf_size(&self) -> u32 {
+        (self.aligned_width * self.aligned_height * 3 / 2) + 0x10000
+    }
+
     fn read_coded_buffer(&self, coded_buf: ffi::VABufferID) -> VaResult<Vec<u8>> {
         let mut buf_ptr: *mut c_void = ptr::null_mut();
         check(
@@ -1034,19 +1144,11 @@ impl VaapiEncoder {
             "vaMapBuffer(coded)",
         )?;
 
-        let mut out = Vec::new();
-        unsafe {
-            let mut seg = buf_ptr as *const ffi::VACodedBufferSegment;
-            while !seg.is_null() {
-                let s = &*seg;
-                let bytes = std::slice::from_raw_parts(s.buf as *const u8, s.size as usize);
-                out.extend_from_slice(bytes);
-                seg = s.next as *const ffi::VACodedBufferSegment;
-            }
-        }
-
+        // Collect first, unmap unconditionally, then propagate -- a rejected
+        // frame must not leave the coded buffer mapped.
+        let collected = unsafe { collect_coded_segments(buf_ptr, self.coded_buf_size() as usize) };
         check(unsafe { ffi::vaUnmapBuffer(self.dpy, coded_buf) }, "vaUnmapBuffer(coded)")?;
-        Ok(out)
+        collected
     }
 }
 
@@ -1067,5 +1169,111 @@ impl Drop for VaapiEncoder {
             ffi::vaTerminate(self.dpy);
             libc::close(self.render_fd);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn image(offset: u32, pitch: u32, data_size: u32) -> ffi::VAImage {
+        let mut img: ffi::VAImage = unsafe { std::mem::zeroed() };
+        img.offsets[0] = offset;
+        img.pitches[0] = pitch;
+        img.data_size = data_size;
+        img
+    }
+
+    #[test]
+    fn plane_extent_accepts_a_buffer_that_actually_holds_the_plane() {
+        // 100 rows of 256 bytes starting at 0, in a buffer that says it has room.
+        let (offset, len) = plane0_extent(&image(0, 256, 25_600), 100, "t").unwrap();
+        assert_eq!((offset, len), (0, 25_600));
+    }
+
+    #[test]
+    fn plane_extent_rejects_a_plane_running_past_the_mapping() {
+        // One byte short: the old code would have built a slice over it anyway.
+        let err = plane0_extent(&image(0, 256, 25_599), 100, "t").unwrap_err();
+        assert!(err.contains("25600"), "{err}");
+        assert!(err.contains("25599"), "{err}");
+    }
+
+    #[test]
+    fn plane_extent_rejects_an_offset_that_pushes_the_plane_out_of_range() {
+        // Plane itself fits, but not where the driver says it starts.
+        assert!(plane0_extent(&image(1_024, 256, 25_600), 100, "t").is_err());
+    }
+
+    #[test]
+    fn plane_extent_rejects_arithmetic_overflow() {
+        assert!(plane0_extent(&image(0, u32::MAX, u32::MAX), 4, "t").is_err());
+        assert!(plane0_extent(&image(u32::MAX, 16, u32::MAX), 4, "t").is_err());
+    }
+
+    fn segment(data: &mut [u8], size: u32, next: *mut c_void) -> ffi::VACodedBufferSegment {
+        let mut s: ffi::VACodedBufferSegment = unsafe { std::mem::zeroed() };
+        s.size = size;
+        s.buf = data.as_mut_ptr() as *mut c_void;
+        s.next = next;
+        s
+    }
+
+    #[test]
+    fn collects_a_well_formed_segment_chain_in_order() {
+        let (mut a, mut b) = (vec![1u8; 3], vec![2u8; 2]);
+        let mut second = segment(&mut b, 2, ptr::null_mut());
+        let p2: *mut ffi::VACodedBufferSegment = &mut second;
+        let mut first = segment(&mut a, 3, p2 as *mut c_void);
+        let p1: *mut ffi::VACodedBufferSegment = &mut first;
+
+        let out = unsafe { collect_coded_segments(p1 as *mut c_void, 1024) }.unwrap();
+        assert_eq!(out, vec![1, 1, 1, 2, 2]);
+    }
+
+    #[test]
+    fn rejects_a_segment_claiming_more_bytes_than_were_allocated() {
+        // The disclosure case: an inflated `size` used to copy whatever followed
+        // the real buffer into the frame sent to the phone.
+        let mut data = vec![7u8; 8];
+        let mut s = segment(&mut data, 500_000, ptr::null_mut());
+        let p: *mut ffi::VACodedBufferSegment = &mut s;
+
+        let err = unsafe { collect_coded_segments(p as *mut c_void, 1024) }.unwrap_err();
+        assert!(err.contains("500000"), "{err}");
+    }
+
+    #[test]
+    fn rejects_a_cyclic_segment_list_instead_of_looping_forever() {
+        let mut data = vec![9u8; 4];
+        let mut s = segment(&mut data, 4, ptr::null_mut());
+        let p: *mut ffi::VACodedBufferSegment = &mut s;
+        unsafe { (*p).next = p as *mut c_void };
+
+        let err = unsafe { collect_coded_segments(p as *mut c_void, 1_048_576) }.unwrap_err();
+        assert!(err.contains("still going"), "{err}");
+    }
+
+    #[test]
+    fn rejects_a_segment_with_a_null_data_pointer() {
+        let mut s: ffi::VACodedBufferSegment = unsafe { std::mem::zeroed() };
+        s.size = 4;
+        let p: *mut ffi::VACodedBufferSegment = &mut s;
+
+        let err = unsafe { collect_coded_segments(p as *mut c_void, 1024) }.unwrap_err();
+        assert!(err.contains("null data pointer"), "{err}");
+    }
+
+    #[test]
+    fn accumulates_toward_the_cap_across_segments() {
+        // Each segment fits on its own; together they overrun. The old code had
+        // no notion of a running total at all.
+        let (mut a, mut b) = (vec![0u8; 600], vec![0u8; 600]);
+        let mut second = segment(&mut b, 600, ptr::null_mut());
+        let p2: *mut ffi::VACodedBufferSegment = &mut second;
+        let mut first = segment(&mut a, 600, p2 as *mut c_void);
+        let p1: *mut ffi::VACodedBufferSegment = &mut first;
+
+        assert!(unsafe { collect_coded_segments(p1 as *mut c_void, 1024) }.is_err());
     }
 }

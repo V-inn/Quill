@@ -25,7 +25,7 @@
 //!
 //! Consequence for the sudo story: nothing on this path needs root, ever. The
 //! one and only privileged step left on GNOME is granting access to
-//! `/dev/uinput` (see `packaging/70-quill-uinput.rules`), which is a single
+//! `/dev/uinput` (see `packaging/60-quill-uinput.rules`), which is a single
 //! one-time udev rule.
 //!
 //! **Not yet live-tested.** Written against mutter's published D-Bus interface

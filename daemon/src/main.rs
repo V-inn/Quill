@@ -91,7 +91,7 @@ async fn main() {
              \n\
              This is the only step in the whole GNOME setup that needs root, and it is one-time:\n\
              \n\
-             \x20   sudo cp packaging/70-quill-uinput.rules /etc/udev/rules.d/70-quill-uinput.rules\n\
+             \x20   sudo cp packaging/60-quill-uinput.rules /etc/udev/rules.d/60-quill-uinput.rules\n\
              \x20   sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=misc\n\
              \n\
              Then log out and back in (the rule grants access to whoever is logged in at the seat)."

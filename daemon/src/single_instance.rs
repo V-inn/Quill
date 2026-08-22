@@ -23,6 +23,7 @@
 
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 
@@ -42,14 +43,43 @@ fn lock_path() -> PathBuf {
 /// unit permanently `failed` and needing a manual `systemctl --user
 /// reset-failed`, which is how this daemon has bitten before (see `aoa.rs`'s
 /// device-scan retry).
+/// `O_NOFOLLOW` because of the `/tmp` fallback in `lock_path`: `/tmp` is
+/// world-writable, and its sticky bit only stops others *deleting* entries, not
+/// creating one at a path that doesn't exist yet. Without this, another local
+/// user could pre-place a symlink at `/tmp/quill-daemon-<uid>.lock` pointing at
+/// any file this uid can write, and `acquire_or_exit`'s `set_len(0)` would
+/// truncate the target. 0600 for the same reason -- nobody else needs to read a
+/// pid we only write for diagnostics.
+///
+/// Split out from `acquire_or_exit` (which takes a fixed path and exits the
+/// process) so the symlink refusal is actually testable -- see below.
+fn open_lock_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .custom_flags(libc::O_NOFOLLOW)
+        .mode(0o600)
+        .open(path)
+}
+
 pub fn acquire_or_exit() {
     let path = lock_path();
-    let mut file = match OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path) {
+    let mut file = match open_lock_file(&path) {
         Ok(f) => f,
         Err(e) => {
             // Not fatal: a daemon that can't create its lock file is still a
             // working daemon, just an unguarded one.
-            eprintln!("[lock] can't open {} ({e}) -- continuing without a single-instance guard", path.display());
+            if e.raw_os_error() == Some(libc::ELOOP) {
+                eprintln!(
+                    "[lock] {} is a symlink -- refusing to follow it (see the O_NOFOLLOW note above); \
+                     continuing without a single-instance guard",
+                    path.display()
+                );
+            } else {
+                eprintln!("[lock] can't open {} ({e}) -- continuing without a single-instance guard", path.display());
+            }
             return;
         }
     };
@@ -78,4 +108,46 @@ pub fn acquire_or_exit() {
     // places that skip `Drop` -- so hand the fd to the process rather than to a
     // value whose lifetime we would then have to thread through `main`.
     std::mem::forget(file);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// The `/tmp`-fallback attack, end to end: a symlink is planted at the lock
+    /// path pointing at a file this uid owns, and the open must refuse rather
+    /// than truncate what's on the other end.
+    #[test]
+    fn refuses_to_follow_a_symlink_and_leaves_the_target_intact() {
+        let dir = std::env::temp_dir().join(format!("quill-lock-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let victim = dir.join("victim");
+        std::fs::write(&victim, "precious").unwrap();
+        let lock = dir.join("quill-daemon.lock");
+        std::os::unix::fs::symlink(&victim, &lock).unwrap();
+
+        let err = open_lock_file(&lock).expect_err("must not follow the symlink");
+        assert_eq!(err.raw_os_error(), Some(libc::ELOOP));
+
+        let after = std::fs::read_to_string(&victim).unwrap();
+        assert_eq!(after, "precious", "target was modified through the symlink");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The ordinary path still works, and creates the file 0600.
+    #[test]
+    fn creates_a_private_lock_file_on_the_normal_path() {
+        let dir = std::env::temp_dir().join(format!("quill-lock-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let lock = dir.join("quill-daemon.lock");
+        let file = open_lock_file(&lock).expect("plain path must open");
+        let mode = file.metadata().unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "lock file should not be readable by others");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

@@ -12,7 +12,11 @@ if [ ! -f target/release/quill-daemon ]; then
     exit 1
 fi
 
-mkdir -p ~/.local/bin ~/.local/share/quill ~/.config/systemd/user
+# ~/.config/quill is created here rather than lazily by the daemon because the
+# unit's ProtectSystem=strict makes everything outside ReadWritePaths read-only
+# -- a missing directory there is a unit that refuses to start, not a directory
+# the daemon can still create for itself.
+mkdir -p ~/.local/bin ~/.local/share/quill ~/.config/quill ~/.config/systemd/user
 # Symlinked, not copied: a stable path for the unit file to reference no
 # matter where this repo is checked out, that stays current across rebuilds
 # without needing to reinstall.
@@ -26,24 +30,24 @@ cp packaging/quill-daemon.service ~/.config/systemd/user/quill-daemon.service
 systemctl --user daemon-reload
 
 echo "user unit installed. Now run (needs root):"
-echo
-echo "  # auto-launch when the tablet is plugged in"
-echo "  sudo cp $(pwd)/packaging/99-quill-daemon.rules /etc/udev/rules.d/99-quill-daemon.rules"
-echo
-
-# The pen, touch and pointer devices are all uinput devices, and /dev/uinput is
-# root-owned unless a rule says otherwise. Only mentioned when it's actually
-# needed: a machine that already has an equivalent rule from some other package
-# (Steam ships one) needs nothing here, and telling people to install a udev
-# rule they don't need is how a project earns a reputation for wanting root.
+# The 60- rule is only worth mentioning when it is actually needed: a machine
+# that already has an equivalent uaccess rule from some other package (Steam
+# ships one) needs nothing here, and telling people to install a udev rule they
+# do not need is how a project earns a reputation for wanting root.
 if [ -r /dev/uinput ] && [ -w /dev/uinput ]; then
     echo "  # (/dev/uinput is already accessible to you -- nothing to do for input)"
 else
-    echo "  # S Pen / touch input: grant this user access to /dev/uinput"
-    echo "  sudo cp $(pwd)/packaging/70-quill-uinput.rules /etc/udev/rules.d/70-quill-uinput.rules"
+    echo "  sudo cp $(pwd)/packaging/60-quill-uinput.rules /etc/udev/rules.d/60-quill-uinput.rules"
 fi
-echo
+echo "  sudo cp $(pwd)/packaging/99-quill-daemon.rules /etc/udev/rules.d/99-quill-daemon.rules"
 echo "  sudo udevadm control --reload"
 echo "  sudo udevadm trigger --subsystem-match=misc"
 echo
-echo "Then log out and back in, so logind applies the /dev/uinput ACL to your session."
+echo "The 60- rule grants /dev/uinput to the active-session user, which is what"
+echo "buys real pressure/tilt; without it the daemon still runs, on the portal"
+echo "fallback with no pressure or tilt. The 99- rule is only auto-launch."
+echo "Read both before running them -- see the comments in each file for what"
+echo "the grant does and does not cover."
+echo
+echo "Then log out and back in: the grant is an ACL logind attaches to the"
+echo "active seat session, so it does not apply to the one already running."
