@@ -7,6 +7,27 @@ StartLimitBurst=3
 
 [Service]
 Type=simple
+# `+`: run this one outside the sandbox below.
+#
+# A directory named in ReadWritePaths that does not exist is fatal, and the
+# failure names neither the directory nor the setting:
+#
+#   Failed at step NAMESPACE spawning /usr/bin/quill-daemon: No such file or
+#   directory
+#   Main process exited, code=exited, status=226/NAMESPACE
+#
+# ("No such file or directory" reads like a missing binary. It is not.)
+# Verified on systemd 257: the same unit starts with this line and fails
+# 226/NAMESPACE without it.
+#
+# So the directories have to exist before the namespace is built, which means
+# they cannot be created from inside it -- by then ProtectSystem=strict has
+# made the whole hierarchy read-only. `+` exempts this one command from that.
+#
+# install.sh creates the same two directories, which is why none of this was
+# needed while a hand install was the only kind there was. A package cannot: it
+# runs once, as root, and has no business walking every user's home directory.
+ExecStartPre=+/usr/bin/mkdir -p %h/.local/share/quill %h/.config/quill
 ExecStart=%h/.local/bin/quill-daemon %h/.local/share/quill/output.h264 aoa
 Restart=on-failure
 RestartSec=2
