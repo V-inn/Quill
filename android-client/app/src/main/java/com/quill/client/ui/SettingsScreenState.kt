@@ -16,13 +16,13 @@ package com.quill.client.ui
 data class SettingsScreenState(
     val clientSideCursor: Boolean,
     val ctrlScrollZoom: Boolean,
-    val flip180: Boolean,
+    val rotationDegrees: Int,
     val keepScreenAwake: Boolean,
     val showLatencyOverlay: Boolean,
 
     val clientSideCursorStaged: Boolean = false,
     val ctrlScrollZoomStaged: Boolean = false,
-    val flip180Staged: Boolean = false,
+    val rotationStaged: Boolean = false,
 
     /** True once a desktop has actually rendered on this tablet. */
     val sessionLive: Boolean = false,
@@ -37,13 +37,13 @@ data class SettingsScreenState(
     /** Panel width / height, for drawing the slab at the true shape. */
     val panelAspect: Float = 1.6f,
 
-    /** What the *running* session's flip is, which is what decides whether the
-     * captured pixels are already upside down. */
-    val sessionFlip180: Boolean = false,
+    /** How far the *running* session turns the picture, which is what decides
+     * how the captured pixels are already oriented. */
+    val sessionRotationDegrees: Int = 0,
 
     val onClientSideCursor: (Boolean) -> Unit,
     val onCtrlScrollZoom: (Boolean) -> Unit,
-    val onFlip180: (Boolean) -> Unit,
+    val onRotation: (Int) -> Unit,
     val onKeepScreenAwake: (Boolean) -> Unit,
     val onShowLatencyOverlay: (Boolean) -> Unit,
 
@@ -54,7 +54,7 @@ data class SettingsScreenState(
     val onDiscard: () -> Unit,
 ) {
     val stagedCount: Int
-        get() = listOf(clientSideCursorStaged, ctrlScrollZoomStaged, flip180Staged).count { it }
+        get() = listOf(clientSideCursorStaged, ctrlScrollZoomStaged, rotationStaged).count { it }
 
     val hasStagedChanges: Boolean get() = stagedCount > 0
 

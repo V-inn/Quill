@@ -31,7 +31,7 @@ object SessionConfig {
     data class Snapshot(
         val clientSideCursor: Boolean,
         val ctrlScrollZoom: Boolean,
-        val flip180: Boolean,
+        val rotationDegrees: Int,
         val widthPx: Int,
         val heightPx: Int,
     )
@@ -40,7 +40,7 @@ object SessionConfig {
         applied = Snapshot(
             clientSideCursor = settings.clientSideCursor,
             ctrlScrollZoom = settings.ctrlScrollZoom,
-            flip180 = settings.flip180,
+            rotationDegrees = settings.rotationDegrees,
             widthPx = widthPx,
             heightPx = heightPx,
         )

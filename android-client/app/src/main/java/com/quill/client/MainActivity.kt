@@ -94,6 +94,13 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     @Volatile
     private var rendering = false
 
+    /** What the last handshake asked the daemon for, so [checkVideoFormat] can
+     * tell whether the daemon understood the rotation it was sent. */
+    @Volatile
+    private var requestedMonitorWidth = 0
+    @Volatile
+    private var requestedMonitorHeight = 0
+
     // Milestone 8: set from the launching intent (or a later
     // USB_ACCESSORY_ATTACHED broadcast) when the daemon has switched the
     // tablet into AOA accessory mode -- see daemon/src/aoa.rs. Null means
@@ -201,7 +208,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
      * of truth for both sides. */
     private fun applyLocalSettings() {
         val settings = Settings(this)
-        cursorOverlay.setFlip180(settings.flip180)
+        cursorOverlay.setRotation(settings.rotationDegrees)
         showLatency = settings.showLatencyOverlay
         latencyOverlay.visibility =
             if (showLatency) android.view.View.VISIBLE else android.view.View.GONE
@@ -708,10 +715,22 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         // aspect, and this is where it is already worked out correctly (see the
         // note above on why displayMetrics is not used).
         FramePreview.setPanelSize(widthPx, heightPx)
+
+        // At a quarter turn the daemon is asked for a monitor whose dimensions
+        // are the panel's, transposed: a landscape tablet drives a portrait
+        // desktop, which the encoder then turns so it fills the panel exactly.
+        // Asking for the panel's own shape instead would letterbox a rotated
+        // image into it and waste most of the screen.
+        val settings = Settings(this)
+        val swapAxes = settings.rotationSwapsAxes
+        val monitorWidthPx = if (swapAxes) heightPx else widthPx
+        val monitorHeightPx = if (swapAxes) widthPx else heightPx
+        requestedMonitorWidth = monitorWidthPx
+        requestedMonitorHeight = monitorHeightPx
         // The moment these stop being preferences and become what the daemon is
         // actually doing. The settings screen diffs against this to tell a
         // staged change from a settled one.
-        SessionConfig.record(Settings(this), widthPx, heightPx)
+        SessionConfig.record(settings, widthPx, heightPx)
 
         val stylusDevice = InputDevice.getDeviceIds()
             .map { InputDevice.getDevice(it) }
@@ -727,7 +746,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
         Log.i(
             tag,
-            "handshake: ${widthPx}x${heightPx}px, " +
+            "handshake: asking for ${monitorWidthPx}x${monitorHeightPx}px " +
+                "(panel ${widthPx}x${heightPx}, rotation ${settings.rotationDegrees}deg), " +
                 "pressure $pMin..$pMax, tilt -$tMaxDeg..$tMaxDeg (stylus device: ${stylusDevice?.name})"
         )
 
@@ -737,8 +757,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         // what v1 did, repeatedly and expensively.
         val body = java.io.ByteArrayOutputStream()
         DataOutputStream(body).apply {
-            writeInt(widthPx)
-            writeInt(heightPx)
+            writeInt(monitorWidthPx)
+            writeInt(monitorHeightPx)
             writeInt(pMin)
             writeInt(pMax)
             writeInt(-tMaxDeg)
@@ -754,8 +774,15 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             // `densityDpi`, which is the rounded bucket Android uses for
             // layout scaling. Appending is safe by construction -- `body_len`
             // is what makes an older daemon skip what it doesn't know.
-            writeInt((resources.displayMetrics.xdpi * 1000).roundToInt())
-            writeInt((resources.displayMetrics.ydpi * 1000).roundToInt())
+            // Swapped along with the dimensions at a quarter turn. These feed
+            // the daemon's virtual-touchpad millimetre thresholds (Milestone
+            // 9), so leaving them alone here would silently miscalibrate every
+            // gesture on both axes -- an easy one to miss, because nothing
+            // about the picture would look wrong.
+            val xdpi = (resources.displayMetrics.xdpi * 1000).roundToInt()
+            val ydpi = (resources.displayMetrics.ydpi * 1000).roundToInt()
+            writeInt(if (swapAxes) ydpi else xdpi)
+            writeInt(if (swapAxes) xdpi else ydpi)
         }
         val bodyBytes = body.toByteArray()
 
@@ -948,7 +975,49 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         val videoWidth = b.readInt()
         val videoHeight = b.readInt()
         Log.i(tag, "video format: ${videoWidth}x${videoHeight}")
+        checkDaemonUnderstoodRotation(videoWidth, videoHeight)
         return videoWidth to videoHeight
+    }
+
+    /**
+     * Catches a daemon too old to know about the quarter turns.
+     *
+     * The rotation is carried as two bits so that 0 and 180 degrees stay
+     * bit-for-bit what they always were (see protocol.rs). The cost of that
+     * compatibility is one blind spot in the other direction: an old daemon
+     * ignores the new bit and honours only the flip, so a client asking for 270
+     * gets a bare 180 applied to dimensions that were already swapped for it --
+     * a picture that is both the wrong shape and the wrong way up, with nothing
+     * saying why.
+     *
+     * There is no capability field to consult, but there is a fact already on
+     * the wire: the encoded video's shape. At a quarter turn we asked for a
+     * portrait monitor and the encoder should hand back a landscape stream. If
+     * it comes back still portrait, the daemon did not turn anything, so it did
+     * not understand. Say so, in words, instead of showing the mess.
+     */
+    private fun checkDaemonUnderstoodRotation(videoWidth: Int, videoHeight: Int) {
+        val settings = Settings(this)
+        if (!settings.rotationSwapsAxes) return
+        if (requestedMonitorWidth == 0 || requestedMonitorHeight == 0) return
+        // We asked for `requested`; a daemon that understood returns its
+        // transpose. Anything else means the rotation was dropped.
+        val expectedW = requestedMonitorHeight
+        val expectedH = requestedMonitorWidth
+        if (videoWidth == expectedW && videoHeight == expectedH) return
+        Log.w(
+            tag,
+            "daemon returned ${videoWidth}x${videoHeight} for a " +
+                "${requestedMonitorWidth}x${requestedMonitorHeight} monitor at " +
+                "${settings.rotationDegrees}deg -- expected ${expectedW}x${expectedH}. " +
+                "Falling back to no rotation.",
+        )
+        settings.rotationDegrees = 0
+        showStatus(
+            "This computer's Quill daemon is too old for 90° rotation.\n" +
+                "Update it, or pick 0° or 180° in settings.\n" +
+                "Reconnecting without rotation...",
+        )
     }
 
     /** Original transport (Milestones 3-7): listens on a TCP port reached

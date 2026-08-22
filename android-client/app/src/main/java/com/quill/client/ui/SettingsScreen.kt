@@ -178,11 +178,11 @@ private fun DisplaySection(state: SettingsScreenState) {
         SlabControl(
             frame = state.previewFrame,
             panelAspect = state.panelAspect,
-            flip180 = state.flip180,
-            sessionFlip180 = state.sessionFlip180,
+            rotationDegrees = state.rotationDegrees,
+            sessionRotationDegrees = state.sessionRotationDegrees,
             sessionLive = state.sessionLive,
-            onFlip180 = state.onFlip180,
-            staged = state.flip180Staged,
+            onRotation = state.onRotation,
+            staged = state.rotationStaged,
         )
     }
 }

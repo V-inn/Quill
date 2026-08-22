@@ -85,10 +85,10 @@ import kotlinx.coroutines.launch
 fun SlabControl(
     frame: Bitmap?,
     panelAspect: Float,
-    flip180: Boolean,
-    sessionFlip180: Boolean,
+    rotationDegrees: Int,
+    sessionRotationDegrees: Int,
     sessionLive: Boolean,
-    onFlip180: (Boolean) -> Unit,
+    onRotation: (Int) -> Unit,
     staged: Boolean,
     modifier: Modifier = Modifier,
 ) {
@@ -96,13 +96,16 @@ fun SlabControl(
         frame?.takeIf { !it.isRecycled }?.asImageBitmap()
     }
 
-    // Rotation of the picture relative to the frame as captured.
-    fun restingAngle(flip: Boolean) = if (flip != sessionFlip180) 180f else 0f
+    // How far the slab sits from the frame as captured. The capture is already
+    // turned by whatever the running session is doing, so what the slab shows
+    // is the *difference*: at rest it is what you have, turned it is what you
+    // will get.
+    fun restingAngle(degrees: Int) = ((degrees - sessionRotationDegrees).toFloat())
 
-    val angle = remember { Animatable(restingAngle(flip180)) }
+    val angle = remember { Animatable(restingAngle(rotationDegrees)) }
     val scope = rememberCoroutineScope()
     val reduceMotion = LocalAnimationScale.current == 0f
-    val currentFlip by rememberUpdatedState(flip180)
+    val currentRotation by rememberUpdatedState(rotationDegrees)
 
     /**
      * Animates to whichever representation of [target] is nearest where the dial
@@ -129,13 +132,13 @@ fun SlabControl(
 
     // Follows the value when it changes from outside -- a Discard, or the draft
     // coming back after a process death.
-    LaunchedEffect(flip180, sessionFlip180) {
-        settleTo(restingAngle(flip180))
+    LaunchedEffect(rotationDegrees, sessionRotationDegrees) {
+        settleTo(restingAngle(rotationDegrees))
     }
 
-    fun choose(flip: Boolean) {
-        if (flip != currentFlip) onFlip180(flip)
-        scope.launch { settleTo(restingAngle(flip)) }
+    fun choose(degrees: Int) {
+        if (degrees != currentRotation) onRotation(degrees)
+        scope.launch { settleTo(restingAngle(degrees)) }
     }
 
     Column(
@@ -149,10 +152,13 @@ fun SlabControl(
                 .aspectRatio(1f)
                 // Tap is the primary interaction and the only one TalkBack can
                 // drive: a rotational drag is not operable without sight.
-                .pointerInput(sessionFlip180) {
-                    detectTapGestures { choose(!currentFlip) }
+                .pointerInput(sessionRotationDegrees) {
+                    // Each tap advances a quarter turn. This is not a fallback
+                    // for the drag: a rotational drag is not operable under
+                    // TalkBack, and tapping is what most people do anyway.
+                    detectTapGestures { choose((currentRotation + 90) % 360) }
                 }
-                .pointerInput(sessionFlip180) {
+                .pointerInput(sessionRotationDegrees) {
                     var previous = 0f
                     var accumulated = 0f
                     var base = 0f
@@ -163,8 +169,8 @@ fun SlabControl(
                             accumulated = 0f
                             base = angle.value
                         },
-                        onDragEnd = { choose(isFlippedAt(angle.value, sessionFlip180)) },
-                        onDragCancel = { choose(isFlippedAt(angle.value, sessionFlip180)) },
+                        onDragEnd = { choose(rotationAt(angle.value, sessionRotationDegrees)) },
+                        onDragCancel = { choose(rotationAt(angle.value, sessionRotationDegrees)) },
                     ) { change, _ ->
                         val c = Offset(size.width / 2f, size.height / 2f)
                         val now = angleOf(change.position - c)
@@ -184,23 +190,33 @@ fun SlabControl(
                     role = Role.Button
                     contentDescription = "Display rotation"
                     stateDescription =
-                        if (flip180) "Rotated 180 degrees" else "Not rotated"
+                        if (rotationDegrees == 0) "Not rotated"
+                        else "Rotated $rotationDegrees degrees"
                 },
         ) {
             Canvas(Modifier.fillMaxSize()) { drawSlab(image, angle.value, panelAspect) }
         }
 
-        Readout(flip180 = flip180, sessionLive = sessionLive, hasPicture = image != null, staged = staged)
+        Readout(
+            rotationDegrees = rotationDegrees,
+            sessionLive = sessionLive,
+            hasPicture = image != null,
+            staged = staged,
+        )
     }
 }
 
-/** Which stop a free-spun angle is closest to, as a flip180 value. */
-private fun isFlippedAt(angleDegrees: Float, sessionFlip180: Boolean): Boolean {
-    val normalised = ((angleDegrees % 360f) + 360f) % 360f
-    val halfTurned = normalised in 90f..270f
-    // The angle is relative to the captured frame, which is itself already
-    // rotated when the running session has the flip on.
-    return if (halfTurned) !sessionFlip180 else sessionFlip180
+/**
+ * Which stop a freely-spun angle is closest to, as an absolute rotation.
+ *
+ * The dial's angle is relative to the captured frame, which is itself already
+ * turned by whatever the running session is doing -- so the session's own
+ * rotation has to be added back to get an absolute answer.
+ */
+private fun rotationAt(angleDegrees: Float, sessionRotationDegrees: Int): Int {
+    val quarters = Math.round(angleDegrees / 90f)
+    val delta = ((quarters * 90) % 360 + 360) % 360
+    return (sessionRotationDegrees + delta) % 360
 }
 
 private fun DrawScope.drawSlab(image: ImageBitmap?, angleDegrees: Float, panelAspect: Float) {
@@ -273,7 +289,7 @@ private fun DrawScope.drawSlab(image: ImageBitmap?, angleDegrees: Float, panelAs
 
 @Composable
 private fun Readout(
-    flip180: Boolean,
+    rotationDegrees: Int,
     sessionLive: Boolean,
     hasPicture: Boolean,
     staged: Boolean,
@@ -284,7 +300,7 @@ private fun Readout(
         // arrangement; it only has to say that it is a proposal.
         BasicText(
             text = buildString {
-                append(if (flip180) "Rotated · 180°" else "Not rotated · 0°")
+                append(if (rotationDegrees == 0) "Not rotated · 0°" else "Rotated · $rotationDegrees°")
                 if (staged) append(" · staged")
             }.uppercase(),
             style = QuillType.eyebrow.copy(

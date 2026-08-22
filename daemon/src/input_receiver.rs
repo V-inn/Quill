@@ -619,16 +619,16 @@ pub fn run(
     // it to do this for us.
     let mut remote_prev_contact = false;
 
-    // Mirrors vaapi_encoder.rs's flip_180, which rotates the video GPU-side
+    // Mirrors vaapi_encoder.rs's rotation, which turns the video GPU-side
     // (KWin's own rotation property does nothing for this output type --
-    // Milestone 16). Reflecting touch/pen x,y here keeps input and image in
-    // sync; both sides read the same handshake flag, since this thread has the
+    // Milestone 16). Turning touch/pen x,y back here keeps input and image in
+    // sync; both sides read the same handshake flags, since this thread has the
     // handshake before main.rs does.
     //
     // Until Milestone 24 this was `height > width`, i.e. "portrait means
     // flipped" -- which was really a fact about where the USB cable enters this
     // one tablet held that way, and would flip every phone unconditionally.
-    let flip_180 = handshake.config_flags & crate::protocol::CONFIG_FLIP_180 != 0;
+    let rotation = crate::protocol::Rotation::from_config_flags(handshake.config_flags);
 
     let mut event_count = 0u64;
     let mut consecutive_bad = 0u32;
@@ -648,11 +648,7 @@ pub fn run(
             Ok(v) => v,
             Err(_) => break,
         };
-        let (x, y) = if flip_180 {
-            (ranges.width - x, ranges.height - y)
-        } else {
-            (x, y)
-        };
+        let (x, y) = rotate_into_monitor_space(x, y, rotation, ranges.width, ranges.height);
         let pressure = match read_i32(&mut stream) {
             Ok(v) => v,
             Err(_) => break,
@@ -1016,5 +1012,95 @@ mod tests {
     fn gives_up_on_a_stream_that_never_contains_a_handshake() {
         let bytes = vec![0x5Au8; 4096];
         assert!(read_handshake(&mut io::Cursor::new(bytes)).is_err());
+    }
+}
+
+/// Turns a touch or pen position from the tablet's own panel back into the
+/// virtual monitor's coordinate space.
+///
+/// The daemon rotates the image on its way *out* (`vaapi_encoder.rs`), so a
+/// finger landing at a given spot on the glass is pointing at a different spot
+/// on the monitor, and this undoes exactly that turn.
+///
+/// `mw`/`mh` are the *monitor's* dimensions, which is what the handshake
+/// carries and what the uinput device's axes are declared against. At a quarter
+/// turn the panel is the transpose of that, so the incoming `x` runs over `mh`
+/// and the incoming `y` over `mw` -- the reason the two are crossed over below,
+/// and the easiest thing here to get subtly wrong.
+///
+/// Rotations follow the encoder's `VA_ROTATION_*`, whose 90-degree case turns
+/// the image clockwise.
+fn rotate_into_monitor_space(
+    x: i32,
+    y: i32,
+    rotation: crate::protocol::Rotation,
+    mw: i32,
+    mh: i32,
+) -> (i32, i32) {
+    use crate::protocol::Rotation;
+    match rotation {
+        Rotation::None => (x, y),
+        Rotation::Half => (mw - x, mh - y),
+        Rotation::Quarter => (y, mh - x),
+        Rotation::ThreeQuarters => (mw - y, x),
+    }
+}
+
+#[cfg(test)]
+mod rotation_mapping_tests {
+    use super::rotate_into_monitor_space;
+    use crate::protocol::Rotation;
+
+    // A 1600x2560 portrait monitor shown on a 2560x1600 landscape panel: the
+    // quarter-turn case, and the only one where the two spaces differ in shape.
+    const MW: i32 = 1600;
+    const MH: i32 = 2560;
+
+    #[test]
+    fn no_rotation_passes_through() {
+        assert_eq!(rotate_into_monitor_space(100, 200, Rotation::None, MW, MH), (100, 200));
+    }
+
+    /// The case Milestone 24 verified on hardware: a touch at (1000, 700) on a
+    /// 2560x1600 panel arrives at (1560, 900).
+    #[test]
+    fn half_turn_reflects_both_axes() {
+        assert_eq!(
+            rotate_into_monitor_space(1000, 700, Rotation::Half, 2560, 1600),
+            (1560, 900),
+        );
+    }
+
+    /// Every corner of the panel has to land on a corner of the monitor, and on
+    /// the *right* one -- a sign error still maps corners to corners, which is
+    /// why the mapping is pinned per corner rather than by area.
+    #[test]
+    fn quarter_turn_maps_panel_corners_onto_monitor_corners() {
+        // Panel is MH wide by MW tall (the transpose of the monitor).
+        assert_eq!(rotate_into_monitor_space(0, 0, Rotation::Quarter, MW, MH), (0, MH));
+        assert_eq!(rotate_into_monitor_space(MH, 0, Rotation::Quarter, MW, MH), (0, 0));
+        assert_eq!(rotate_into_monitor_space(MH, MW, Rotation::Quarter, MW, MH), (MW, 0));
+        assert_eq!(rotate_into_monitor_space(0, MW, Rotation::Quarter, MW, MH), (MW, MH));
+    }
+
+    #[test]
+    fn three_quarter_turn_maps_the_other_way_round() {
+        assert_eq!(rotate_into_monitor_space(0, 0, Rotation::ThreeQuarters, MW, MH), (MW, 0));
+        assert_eq!(rotate_into_monitor_space(MH, 0, Rotation::ThreeQuarters, MW, MH), (MW, MH));
+        assert_eq!(rotate_into_monitor_space(MH, MW, Rotation::ThreeQuarters, MW, MH), (0, MH));
+        assert_eq!(rotate_into_monitor_space(0, MW, Rotation::ThreeQuarters, MW, MH), (0, 0));
+    }
+
+    /// Quarter and three-quarter turns must be inverses of one another, which
+    /// catches a sign flip that happens to keep corners on corners.
+    #[test]
+    fn the_two_quarter_turns_are_opposites() {
+        for (x, y) in [(0, 0), (137, 42), (MH, MW), (MH / 3, MW / 4)] {
+            let (mx, my) = rotate_into_monitor_space(x, y, Rotation::Quarter, MW, MH);
+            // Undoing it means turning the other way, with the axes swapped
+            // back: the monitor is MW x MH, so its transpose is the panel.
+            let back = rotate_into_monitor_space(mx, my, Rotation::ThreeQuarters, MH, MW);
+            assert_eq!(back, (x, y), "round trip failed for ({x}, {y})");
+        }
     }
 }

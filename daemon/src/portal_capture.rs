@@ -366,7 +366,7 @@ pub async fn open_portal(cursor: CursorRendering) -> ashpd::Result<(PortalStream
 struct CaptureData {
     format: spa::param::video::VideoInfoRaw,
     encoder: Option<VaapiEncoder>,
-    flip_180: bool,
+    rotation: crate::protocol::Rotation,
     /// `QUILL_NO_ENCODE` -- see the early return in `process`.
     no_encode: bool,
     /// Whether the client draws the pointer itself. Only in `ClientSide` does
@@ -637,7 +637,7 @@ pub fn run_capture(
     fd: Option<OwnedFd>,
     out_path: &str,
     transport: Option<TransportWriter>,
-    flip_180: bool,
+    rotation: crate::protocol::Rotation,
     cursor: CursorRendering,
     preferred_size: (u32, u32),
 ) -> Result<CaptureStats, pw::Error> {
@@ -668,7 +668,7 @@ pub fn run_capture(
     let data = CaptureData {
         format: Default::default(),
         encoder: None,
-        flip_180,
+        rotation,
         no_encode: std::env::var("QUILL_NO_ENCODE").is_ok(),
         cursor,
         last_cursor_id: None,
@@ -731,7 +731,7 @@ pub fn run_capture(
             // same size as the first, and rebuilding on it threw away a working
             // encoder (and reset its GOP state) for nothing.
             if user_data.sent_format != Some((width, height)) {
-                let encoder = VaapiEncoder::new(width, height, user_data.flip_180)
+                let encoder = VaapiEncoder::new(width, height, user_data.rotation)
                     .expect("VAAPI encoder init failed");
                 user_data.encoder = Some(encoder);
             }
@@ -773,10 +773,19 @@ pub fn run_capture(
                 );
             }
             user_data.sent_format = Some((width, height));
+            // What the *encoder* emits, which is the capture transposed at a
+            // quarter turn. Announcing the capture size instead would configure
+            // the client's decoder for a portrait stream that arrives
+            // landscape.
+            let (out_width, out_height) = if user_data.rotation.swaps_axes() {
+                (height, width)
+            } else {
+                (width, height)
+            };
             if let Some(sock) = user_data.transport.borrow_mut().as_mut() {
                 let mut payload = Vec::with_capacity(8);
-                payload.extend_from_slice(&width.to_be_bytes());
-                payload.extend_from_slice(&height.to_be_bytes());
+                payload.extend_from_slice(&out_width.to_be_bytes());
+                payload.extend_from_slice(&out_height.to_be_bytes());
                 let header = crate::protocol::encode_message(
                     crate::protocol::MSG_VIDEO_FORMAT,
                     crate::clock_sync::now_millis(),

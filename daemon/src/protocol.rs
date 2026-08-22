@@ -112,6 +112,72 @@ pub const CONFIG_CLIENT_SIDE_CURSOR: u8 = 1 << 0;
 /// flipped.
 pub const CONFIG_FLIP_180: u8 = 1 << 2;
 
+/// Bit 3, paired with [`CONFIG_FLIP_180`] to carry a quarter turn.
+///
+/// The two bits together encode all four rotations, arranged so that bit 2
+/// keeps meaning *exactly* 180 degrees and the two orientations that predate
+/// this are bit-for-bit what they always were:
+///
+/// | rotation | bit 3 | bit 2 |
+/// |----------|-------|-------|
+/// | 0        | 0     | 0     |
+/// | 90       | 1     | 0     |
+/// | 180      | 0     | 1     |
+/// | 270      | 1     | 1     |
+///
+/// That is why the protocol version did not move. A client that only knows
+/// about the flip sets bit 3 never, and an old daemon reading a new client at 0
+/// or 180 degrees behaves identically to before. The length-prefixed handshake
+/// body exists precisely so capabilities can be appended rather than versioned.
+///
+/// The hazard is the other direction: an old daemon ignores bit 3, so a client
+/// asking for 270 would get a bare 180 applied to swapped dimensions. The client
+/// detects that from `MSG_VIDEO_FORMAT` -- if it asked for a portrait monitor
+/// and the video comes back landscape, the daemon did not understand -- and says
+/// so rather than showing a corrupted screen. See `MainActivity`.
+pub const CONFIG_ROTATE_90: u8 = 1 << 3;
+
+/// How far the captured image is turned before it is encoded, and how far
+/// touch and pen coordinates have to be turned back.
+///
+/// Applied GPU-side in the encoder's VPP pass, never by the compositor:
+/// Milestone 16 established, live, that KWin's own rotation property has no
+/// effect on this output type at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rotation {
+    None,
+    Quarter,
+    Half,
+    ThreeQuarters,
+}
+
+impl Rotation {
+    pub fn from_config_flags(flags: u8) -> Self {
+        match (flags & CONFIG_ROTATE_90 != 0, flags & CONFIG_FLIP_180 != 0) {
+            (false, false) => Rotation::None,
+            (true, false) => Rotation::Quarter,
+            (false, true) => Rotation::Half,
+            (true, true) => Rotation::ThreeQuarters,
+        }
+    }
+
+    pub fn degrees(self) -> u32 {
+        match self {
+            Rotation::None => 0,
+            Rotation::Quarter => 90,
+            Rotation::Half => 180,
+            Rotation::ThreeQuarters => 270,
+        }
+    }
+
+    /// Whether the encoder's output is the transpose of its input. True for the
+    /// quarter turns, which is the one place this stops being a pure filter and
+    /// starts changing geometry.
+    pub fn swaps_axes(self) -> bool {
+        matches!(self, Rotation::Quarter | Rotation::ThreeQuarters)
+    }
+}
+
 /// Bit 1: send pinch as ctrl+wheel instead of letting it reach the virtual
 /// touchpad as a real gesture. libinput's pinch is delivered as a Wayland
 /// gesture, which only gesture-aware toolkits act on -- anything on XWayland
@@ -198,4 +264,45 @@ pub fn encode_cursor(update: &CursorUpdate) -> Vec<u8> {
         }
     }
     p
+}
+
+#[cfg(test)]
+mod rotation_tests {
+    use super::*;
+
+    /// The two orientations that predate the quarter turns must decode from
+    /// exactly the bits they always used, or every existing client breaks.
+    #[test]
+    fn the_old_two_orientations_keep_their_bits() {
+        assert_eq!(Rotation::from_config_flags(0), Rotation::None);
+        assert_eq!(Rotation::from_config_flags(CONFIG_FLIP_180), Rotation::Half);
+    }
+
+    #[test]
+    fn quarter_turns_use_the_new_bit() {
+        assert_eq!(Rotation::from_config_flags(CONFIG_ROTATE_90), Rotation::Quarter);
+        assert_eq!(
+            Rotation::from_config_flags(CONFIG_ROTATE_90 | CONFIG_FLIP_180),
+            Rotation::ThreeQuarters,
+        );
+    }
+
+    /// The other config bits share the byte and must not disturb the reading.
+    #[test]
+    fn other_config_bits_are_ignored() {
+        let noise = CONFIG_CLIENT_SIDE_CURSOR | CONFIG_CTRL_SCROLL_ZOOM;
+        assert_eq!(Rotation::from_config_flags(noise), Rotation::None);
+        assert_eq!(
+            Rotation::from_config_flags(noise | CONFIG_ROTATE_90 | CONFIG_FLIP_180),
+            Rotation::ThreeQuarters,
+        );
+    }
+
+    #[test]
+    fn only_quarter_turns_transpose() {
+        assert!(!Rotation::None.swaps_axes());
+        assert!(Rotation::Quarter.swaps_axes());
+        assert!(!Rotation::Half.swaps_axes());
+        assert!(Rotation::ThreeQuarters.swaps_axes());
+    }
 }

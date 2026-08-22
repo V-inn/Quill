@@ -14,25 +14,25 @@ package com.quill.client
 data class SettingsDraft(
     val clientSideCursor: Boolean,
     val ctrlScrollZoom: Boolean,
-    val flip180: Boolean,
+    val rotationDegrees: Int,
 ) {
     /** Whether this differs from what is on disk, i.e. is there anything to save. */
     fun isDirty(settings: Settings): Boolean =
         clientSideCursor != settings.clientSideCursor ||
             ctrlScrollZoom != settings.ctrlScrollZoom ||
-            flip180 != settings.flip180
+            rotationDegrees != settings.rotationDegrees
 
     fun commit(settings: Settings) {
         settings.clientSideCursor = clientSideCursor
         settings.ctrlScrollZoom = ctrlScrollZoom
-        settings.flip180 = flip180
+        settings.rotationDegrees = rotationDegrees
     }
 
     companion object {
         fun from(settings: Settings) = SettingsDraft(
             clientSideCursor = settings.clientSideCursor,
             ctrlScrollZoom = settings.ctrlScrollZoom,
-            flip180 = settings.flip180,
+            rotationDegrees = settings.rotationDegrees,
         )
     }
 }

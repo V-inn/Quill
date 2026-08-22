@@ -60,7 +60,7 @@ class SettingsActivity : ComponentActivity() {
             // silently drop what you were half-way through choosing.
             var clientSideCursor by rememberSaveable { mutableStateOf(settings.clientSideCursor) }
             var ctrlScrollZoom by rememberSaveable { mutableStateOf(settings.ctrlScrollZoom) }
-            var flip180 by rememberSaveable { mutableStateOf(settings.flip180) }
+            var rotationDegrees by rememberSaveable { mutableStateOf(settings.rotationDegrees) }
 
             // Tablet settings are not staged -- there is nothing to stage
             // against, since they take effect the moment you leave. They keep
@@ -68,7 +68,7 @@ class SettingsActivity : ComponentActivity() {
             var keepScreenAwake by rememberSaveable { mutableStateOf(settings.keepScreenAwake) }
             var showLatencyOverlay by rememberSaveable { mutableStateOf(settings.showLatencyOverlay) }
 
-            val draft = SettingsDraft(clientSideCursor, ctrlScrollZoom, flip180)
+            val draft = SettingsDraft(clientSideCursor, ctrlScrollZoom, rotationDegrees)
             val session = SessionConfig.applied
 
             val apply = {
@@ -86,7 +86,7 @@ class SettingsActivity : ComponentActivity() {
                 SettingsScreenState(
                     clientSideCursor = clientSideCursor,
                     ctrlScrollZoom = ctrlScrollZoom,
-                    flip180 = flip180,
+                    rotationDegrees = rotationDegrees,
                     keepScreenAwake = keepScreenAwake,
                     showLatencyOverlay = showLatencyOverlay,
 
@@ -95,19 +95,19 @@ class SettingsActivity : ComponentActivity() {
                     // with one, so nothing is marked.
                     clientSideCursorStaged = session != null && clientSideCursor != session.clientSideCursor,
                     ctrlScrollZoomStaged = session != null && ctrlScrollZoom != session.ctrlScrollZoom,
-                    flip180Staged = session != null && flip180 != session.flip180,
+                    rotationStaged = session != null && rotationDegrees != session.rotationDegrees,
 
                     sessionLive = session != null,
                     previewFrame = FramePreview.peek(),
                     panelAspect = FramePreview.panelAspect(),
-                    sessionFlip180 = session?.flip180 ?: flip180,
+                    sessionRotationDegrees = session?.rotationDegrees ?: rotationDegrees,
                     connectionLabel = session
                         ?.let { "${it.widthPx} × ${it.heightPx}" }
                         ?: "Not connected",
 
                     onClientSideCursor = { clientSideCursor = it },
                     onCtrlScrollZoom = { ctrlScrollZoom = it },
-                    onFlip180 = { flip180 = it },
+                    onRotation = { rotationDegrees = it },
                     onKeepScreenAwake = {
                         keepScreenAwake = it
                         settings.keepScreenAwake = it

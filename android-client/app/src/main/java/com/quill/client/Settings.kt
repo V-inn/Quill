@@ -78,18 +78,43 @@ class Settings(context: Context) {
         set(value) = prefs.edit().putBoolean(KEY_CTRL_SCROLL_ZOOM, value).apply()
 
     /**
-     * Rotates the streamed image 180 degrees, and the touch mapping with it.
+     * How far the streamed image is turned, in degrees: 0, 90, 180 or 270. The
+     * touch and pen mapping turns with it, so they keep lining up.
      *
-     * Which way up the picture belongs depends on which end of the device the
+     * Which way up the desktop belongs depends on which end of the device the
      * USB cable enters, and only the person holding it knows that. Until
      * Milestone 24 the daemon inferred it from the aspect ratio -- portrait
-     * meant flipped -- which was a fact about one tablet held one way, and
-     * would have flipped every phone unconditionally, since phones are portrait
-     * by default.
+     * meant flipped -- which was a fact about one tablet held one way, and would
+     * have flipped every phone unconditionally, since phones are portrait by
+     * default.
+     *
+     * The quarter turns arrived later and are the more interesting case: at 90
+     * or 270 the handshake asks for a monitor whose dimensions are *swapped*, so
+     * a landscape tablet drives a portrait desktop that then fills the panel
+     * exactly. See [rotationSwapsAxes] and `MainActivity.sendHandshake`.
      */
-    var flip180: Boolean
-        get() = prefs.getBoolean(KEY_FLIP_180, false)
-        set(value) = prefs.edit().putBoolean(KEY_FLIP_180, value).apply()
+    var rotationDegrees: Int
+        get() {
+            val stored = prefs.getInt(KEY_ROTATION_DEGREES, -1)
+            if (stored in VALID_ROTATIONS) return stored
+            // Migration: before the quarter turns there was only a boolean.
+            // Read it through once rather than writing, so an older build
+            // installed over this one still finds what it expects.
+            return if (prefs.getBoolean(KEY_FLIP_180, false)) 180 else 0
+        }
+        set(value) {
+            val normalised = if (value in VALID_ROTATIONS) value else 0
+            prefs.edit()
+                .putInt(KEY_ROTATION_DEGREES, normalised)
+                // Kept in step so a downgrade to a build that only knows the
+                // boolean still behaves sensibly at 0 and 180.
+                .putBoolean(KEY_FLIP_180, normalised == 180)
+                .apply()
+        }
+
+    /** True at the quarter turns, where the monitor is the panel transposed. */
+    val rotationSwapsAxes: Boolean
+        get() = rotationDegrees == 90 || rotationDegrees == 270
 
     /**
      * Which screen edge the settings gear is parked against, as a
@@ -114,7 +139,14 @@ class Settings(context: Context) {
         var flags = 0
         if (clientSideCursor) flags = flags or CONFIG_CLIENT_SIDE_CURSOR
         if (ctrlScrollZoom) flags = flags or CONFIG_CTRL_SCROLL_ZOOM
-        if (flip180) flags = flags or CONFIG_FLIP_180
+        // Two bits, arranged so that bit 2 still means exactly 180 degrees and
+        // the two orientations that predate the quarter turns are bit-for-bit
+        // what they always were. See protocol.rs, which this mirrors.
+        when (rotationDegrees) {
+            90 -> flags = flags or CONFIG_ROTATE_90
+            180 -> flags = flags or CONFIG_FLIP_180
+            270 -> flags = flags or CONFIG_ROTATE_90 or CONFIG_FLIP_180
+        }
         return flags
     }
 
@@ -130,6 +162,8 @@ class Settings(context: Context) {
         private const val DEFAULT_GEAR_FRACTION = 0.06f
         private const val KEY_CTRL_SCROLL_ZOOM = "ctrl_scroll_zoom"
         private const val KEY_FLIP_180 = "flip_180"
+        private const val KEY_ROTATION_DEGREES = "rotation_deg"
+        private val VALID_ROTATIONS = setOf(0, 90, 180, 270)
 
         // Mirrors protocol.rs. Kept as plain constants in both languages rather
         // than generated, since there are only a handful and a build-time
@@ -138,5 +172,6 @@ class Settings(context: Context) {
         const val CONFIG_CLIENT_SIDE_CURSOR = 1 shl 0
         const val CONFIG_CTRL_SCROLL_ZOOM = 1 shl 1
         const val CONFIG_FLIP_180 = 1 shl 2
+        const val CONFIG_ROTATE_90 = 1 shl 3
     }
 }

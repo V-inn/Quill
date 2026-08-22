@@ -137,17 +137,24 @@ async fn main() {
         }
     );
 
-    // A 180-degree flip, when the client asks for one -- applied GPU-side by
-    // the encoder and mirrored in the uinput touch mapping (see
-    // vaapi_encoder.rs / input_receiver.rs), not via KWin rotation, which
+    // Rotation, when the client asks for one -- applied GPU-side by the
+    // encoder and mirrored in the uinput coordinate mapping (see
+    // vaapi_encoder.rs / input_receiver.rs), never via KWin rotation, which
     // Milestone 16 found has no effect on this output type at all.
     //
-    // Milestone 24 moved this from `height > width` to the handshake flag: the
-    // flip exists because of which end the USB cable enters, which the person
-    // holding the device knows and the aspect ratio does not.
-    let flip_180 = transport_setup
+    // Milestone 24 moved the 180-degree case from `height > width` to a
+    // handshake flag: the flip exists because of which end the USB cable
+    // enters, which the person holding the device knows and the aspect ratio
+    // does not. The quarter turns joined it later, as a second bit; see
+    // `protocol::Rotation`.
+    //
+    // At a quarter turn the client asks for a monitor whose dimensions are
+    // already swapped, so nothing here has to transpose anything -- the shape
+    // arrives correct and only the encoder's own output differs from its input.
+    let rotation = transport_setup
         .as_ref()
-        .is_some_and(|(_, i)| i.config_flags & protocol::CONFIG_FLIP_180 != 0);
+        .map(|(_, i)| crate::protocol::Rotation::from_config_flags(i.config_flags))
+        .unwrap_or(crate::protocol::Rotation::None);
 
 
     // The size everything downstream is built around: the encoder's surfaces,
@@ -221,7 +228,7 @@ async fn main() {
         fd,
         &out_path,
         transport,
-        flip_180,
+        rotation,
         cursor,
         capture_size,
     )
