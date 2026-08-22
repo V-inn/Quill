@@ -67,6 +67,7 @@ class SettingsActivity : ComponentActivity() {
             // writing through, and can never show a staged mark.
             var keepScreenAwake by rememberSaveable { mutableStateOf(settings.keepScreenAwake) }
             var showLatencyOverlay by rememberSaveable { mutableStateOf(settings.showLatencyOverlay) }
+            var sideButtonAction by rememberSaveable { mutableStateOf(settings.sideButtonAction) }
 
             val draft = SettingsDraft(clientSideCursor, ctrlScrollZoom, rotationDegrees)
             val session = SessionConfig.applied
@@ -89,6 +90,7 @@ class SettingsActivity : ComponentActivity() {
                     rotationDegrees = rotationDegrees,
                     keepScreenAwake = keepScreenAwake,
                     showLatencyOverlay = showLatencyOverlay,
+                    sideButtonAction = sideButtonAction,
 
                     // "Differs from what is running", not "differs from what is
                     // saved". With no session yet, nothing can be out of step
@@ -115,6 +117,10 @@ class SettingsActivity : ComponentActivity() {
                     onShowLatencyOverlay = {
                         showLatencyOverlay = it
                         settings.showLatencyOverlay = it
+                    },
+                    onSideButtonAction = {
+                        sideButtonAction = it
+                        settings.sideButtonAction = it
                     },
                     onApply = apply,
                     onDiscard = discard,

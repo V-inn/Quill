@@ -210,6 +210,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         val settings = Settings(this)
         cursorOverlay.setRotation(settings.rotationDegrees)
         showLatency = settings.showLatencyOverlay
+        sideButtonAction = settings.sideButtonAction
         latencyOverlay.visibility =
             if (showLatency) android.view.View.VISIBLE else android.view.View.GONE
         setScreenAwake(rendering)
@@ -447,6 +448,12 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     // synchronization needed.
     private var lastStylusButtonState = false
 
+    /** Mirrors `Settings.sideButtonAction`, so the pen path reads a field
+     * rather than SharedPreferences on every event. Refreshed by
+     * [applyLocalSettings]. */
+    @Volatile
+    private var sideButtonAction = Settings.SIDE_BUTTON_RIGHT
+
     // --- Multi-touch state (Milestone 9). UI thread only, like the field above.
 
     /** Android pointer id -> multitouch slot, stable for the life of a contact. */
@@ -476,10 +483,18 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         val stylusButtonNow = event.buttonState and MotionEvent.BUTTON_STYLUS_PRIMARY != 0
         if (stylusButtonNow != lastStylusButtonState) {
             lastStylusButtonState = stylusButtonNow
-            send(
-                if (stylusButtonNow) EV_BUTTON_DOWN else EV_BUTTON_UP,
-                event.x.roundToInt(), event.y.roundToInt(), buttons = 1
-            )
+            // The chosen action rides bits 2-3 of the event rather than the
+            // handshake, so changing the mapping takes effect on the next press
+            // instead of at the next connect. "None" has no wire value: the
+            // event is just not sent, which an older daemon also handles
+            // correctly by never hearing about it.
+            if (sideButtonAction != Settings.SIDE_BUTTON_NONE) {
+                send(
+                    if (stylusButtonNow) EV_BUTTON_DOWN else EV_BUTTON_UP,
+                    event.x.roundToInt(), event.y.roundToInt(),
+                    buttons = 1 or (sideButtonAction shl 2),
+                )
+            }
         }
 
         // `actionMasked`, not `action`: for the secondary-pointer actions the

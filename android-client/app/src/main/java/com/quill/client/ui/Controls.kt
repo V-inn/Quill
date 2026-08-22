@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -311,6 +312,111 @@ fun SecondaryButton(
         contentAlignment = Alignment.Center,
     ) {
         BasicText(text = text, style = QuillType.button.copy(color = QuillTokens.Chalk))
+    }
+}
+
+/**
+ * A row whose control is a choice between a handful of options rather than on
+ * or off.
+ *
+ * Laid out as a segmented bar under the label instead of beside it: on a pane
+ * this wide, four options crammed against the right edge would be a much
+ * smaller target than the switch they sit alongside, and would read as a
+ * different kind of thing than it is.
+ */
+@Composable
+fun ChoiceRow(
+    label: String,
+    options: List<String>,
+    selectedIndex: Int,
+    onSelect: (Int) -> Unit,
+    modifier: Modifier = Modifier,
+    note: String? = null,
+    staged: Boolean = false,
+) {
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .clip(QuillTokens.RowShape)
+            .background(QuillTokens.Raise)
+            .padding(QuillTokens.SpaceMd),
+        verticalArrangement = Arrangement.spacedBy(QuillTokens.SpaceSm),
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(QuillTokens.SpaceSm),
+        ) {
+            if (staged) StagedDot()
+            BasicText(
+                text = label,
+                style = QuillType.label.copy(
+                    color = if (staged) QuillTokens.CopperLit else QuillTokens.Chalk,
+                ),
+            )
+        }
+        if (note != null) Note(note)
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(QuillTokens.SpaceXs),
+        ) {
+            options.forEachIndexed { index, option ->
+                Segment(
+                    text = option,
+                    selected = index == selectedIndex,
+                    onClick = { onSelect(index) },
+                    modifier = Modifier.weight(1f),
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun Segment(
+    text: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val interaction = remember { MutableInteractionSource() }
+    val pressed by interaction.collectIsPressedAsState()
+    val focused by interaction.collectIsFocusedAsState()
+
+    val background by animateColorAsState(
+        targetValue = when {
+            selected -> QuillTokens.Copper
+            pressed -> QuillTokens.RaisePressed
+            else -> QuillTokens.Slate
+        },
+        animationSpec = quillTween(),
+        label = "segmentBackground",
+    )
+
+    Box(
+        modifier = modifier
+            .clip(QuillTokens.ChipShape)
+            .background(background)
+            .then(
+                if (focused) Modifier.border(2.dp, QuillTokens.Chalk, QuillTokens.ChipShape) else Modifier
+            )
+            .selectable(
+                selected = selected,
+                interactionSource = interaction,
+                indication = null,
+                role = Role.RadioButton,
+                onClick = onClick,
+            )
+            .focusable(interactionSource = interaction)
+            .defaultMinSize(minHeight = QuillTokens.TouchTarget)
+            .padding(horizontal = QuillTokens.SpaceSm, vertical = QuillTokens.SpaceSm),
+        contentAlignment = Alignment.Center,
+    ) {
+        BasicText(
+            text = text,
+            style = QuillType.button.copy(
+                color = if (selected) Color(0xFF241A0E) else QuillTokens.Graphite,
+            ),
+        )
     }
 }
 

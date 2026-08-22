@@ -28,9 +28,13 @@
 //!   i32 tilt_x_deg
 //!   i32 tilt_y_deg
 //!   u8  buttons      (bit0 = stylus primary button state, informational --
-//!                     the actual BTN_STYLUS toggle is driven by the
-//!                     explicit button_down/button_up event types, not this
-//!                     bit; bit1 = tool is a finger, not the S Pen.
+//!                     the actual button toggle is driven by the explicit
+//!                     button_down/button_up event types, not this bit;
+//!                     bit1 = tool is a finger, not the S Pen.
+//!                     button_* types: bits 2-3 additionally carry what the
+//!                     side button should do -- 0 right click, 1 middle
+//!                     click, 2 eraser. Zero is what every client before the
+//!                     mapping sent, and still means right click.
 //!                     touch_* types: the live contact count instead)
 //!
 //! # Multi-touch (Milestone 9)
@@ -713,8 +717,13 @@ pub fn run(
             }
         } else if matches!(event_type, EV_BUTTON_DOWN | EV_BUTTON_UP) {
             let pressed = event_type == EV_BUTTON_DOWN;
+            // Bits 2-3 carry what the button should do. Sent per event rather
+            // than in the handshake so the tablet can change the mapping
+            // without a reconnect; an older client leaves them zero and gets
+            // the right click it always got.
+            let action = crate::uinput_tablet::ButtonAction::from_event_buttons(buttons);
             if let Some(tablet) = &tablet {
-                if let Err(e) = tablet.set_button(pressed) {
+                if let Err(e) = tablet.set_button(pressed, action) {
                     eprintln!("[input] set_button failed: {e}");
                 }
             } else if let Some(ri) = &remote_input {

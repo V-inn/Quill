@@ -245,6 +245,14 @@ private fun TabletSection(state: SettingsScreenState) {
             note = "While a desktop is showing. The tablet still sleeps when nothing " +
                 "is connected.",
         )
+        ChoiceRow(
+            label = "S Pen side button",
+            options = listOf("Right click", "Middle click", "Eraser", "Nothing"),
+            selectedIndex = state.sideButtonAction,
+            onSelect = state.onSideButtonAction,
+            note = "Eraser is a different tool rather than a button, so apps that " +
+                "know about pen erasers switch to erasing while you hold it.",
+        )
         SwitchRow(
             label = "Show latency overlay",
             checked = state.showLatencyOverlay,

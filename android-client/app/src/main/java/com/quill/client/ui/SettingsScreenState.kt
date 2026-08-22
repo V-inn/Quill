@@ -19,6 +19,7 @@ data class SettingsScreenState(
     val rotationDegrees: Int,
     val keepScreenAwake: Boolean,
     val showLatencyOverlay: Boolean,
+    val sideButtonAction: Int,
 
     val clientSideCursorStaged: Boolean = false,
     val ctrlScrollZoomStaged: Boolean = false,
@@ -46,6 +47,7 @@ data class SettingsScreenState(
     val onRotation: (Int) -> Unit,
     val onKeepScreenAwake: (Boolean) -> Unit,
     val onShowLatencyOverlay: (Boolean) -> Unit,
+    val onSideButtonAction: (Int) -> Unit,
 
     /** Saves the staged settings, then leaves -- which is what applies them. */
     val onApply: () -> Unit,

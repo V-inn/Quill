@@ -134,6 +134,23 @@ class Settings(context: Context) {
         get() = prefs.getFloat(KEY_GEAR_FRACTION, DEFAULT_GEAR_FRACTION)
         set(value) = prefs.edit().putFloat(KEY_GEAR_FRACTION, value.coerceIn(0f, 1f)).apply()
 
+    /**
+     * What the S Pen's side button does while held.
+     *
+     * One of [SIDE_BUTTON_RIGHT], [SIDE_BUTTON_MIDDLE], [SIDE_BUTTON_ERASER] or
+     * [SIDE_BUTTON_NONE].
+     *
+     * Tablet-local, and deliberately *not* in [configFlags]: it rides each
+     * button event instead, so changing it takes effect on the next press
+     * rather than at the next connect. "None" needs no representation on the
+     * wire at all -- the event simply is not sent.
+     */
+    var sideButtonAction: Int
+        get() = prefs.getInt(KEY_SIDE_BUTTON, SIDE_BUTTON_RIGHT)
+        set(value) = prefs.edit()
+            .putInt(KEY_SIDE_BUTTON, if (value in VALID_SIDE_BUTTONS) value else SIDE_BUTTON_RIGHT)
+            .apply()
+
     /** Packed into the handshake's `config_flags` byte. */
     fun configFlags(): Int {
         var flags = 0
@@ -163,6 +180,7 @@ class Settings(context: Context) {
         private const val KEY_CTRL_SCROLL_ZOOM = "ctrl_scroll_zoom"
         private const val KEY_FLIP_180 = "flip_180"
         private const val KEY_ROTATION_DEGREES = "rotation_deg"
+        private const val KEY_SIDE_BUTTON = "side_button_action"
         private val VALID_ROTATIONS = setOf(0, 90, 180, 270)
 
         // Mirrors protocol.rs. Kept as plain constants in both languages rather
@@ -173,5 +191,18 @@ class Settings(context: Context) {
         const val CONFIG_CTRL_SCROLL_ZOOM = 1 shl 1
         const val CONFIG_FLIP_180 = 1 shl 2
         const val CONFIG_ROTATE_90 = 1 shl 3
+
+        // Bits 2-3 of a button event's `buttons` byte, mirroring
+        // uinput_tablet.rs's ButtonAction. Right click is zero, which is what
+        // every version before this mapping existed sent.
+        const val SIDE_BUTTON_RIGHT = 0
+        const val SIDE_BUTTON_MIDDLE = 1
+        const val SIDE_BUTTON_ERASER = 2
+
+        /** Not a wire value: the event is simply not sent. */
+        const val SIDE_BUTTON_NONE = 3
+
+        private val VALID_SIDE_BUTTONS =
+            setOf(SIDE_BUTTON_RIGHT, SIDE_BUTTON_MIDDLE, SIDE_BUTTON_ERASER, SIDE_BUTTON_NONE)
     }
 }

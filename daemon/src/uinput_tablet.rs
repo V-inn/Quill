@@ -41,6 +41,10 @@ pub struct UinputTablet {
     // Android reports it via its own ACTION_BUTTON_PRESS/RELEASE stream,
     // independent of whether the pen is currently hovering or in contact.
     button_pressed: Cell<bool>,
+    /// Whether the side button is currently being held as an eraser.
+    eraser_active: Cell<bool>,
+    /// Which tool the device last declared in proximity.
+    tool_is_rubber: Cell<bool>,
 }
 
 /// Axis ranges as reported by the capability handshake (Android's
@@ -88,6 +92,11 @@ impl UinputTablet {
         handle.set_keybit(Key::ButtonToolPen)?;
         handle.set_keybit(Key::ButtonTouch)?;
         handle.set_keybit(Key::ButtonStylus)?;
+        // Declared whatever the side button is currently mapped to: keybits are
+        // fixed when the device is created, but the mapping is a live setting,
+        // so the device has to be able to speak all of them from the start.
+        handle.set_keybit(Key::ButtonStylus2)?;
+        handle.set_keybit(Key::ButtonToolRubber)?;
 
         handle.set_evbit(EventKind::Absolute)?;
         handle.set_absbit(AbsoluteAxis::X)?;
@@ -174,6 +183,8 @@ impl UinputTablet {
             tool_in_proximity: Cell::new(false),
             in_contact: Cell::new(false),
             button_pressed: Cell::new(false),
+            eraser_active: Cell::new(false),
+            tool_is_rubber: Cell::new(false),
         })
     }
 
@@ -199,8 +210,18 @@ impl UinputTablet {
         let t = EventTime::new(0, 0); // kernel fills in the real timestamp
         let mut events = Vec::with_capacity(8);
 
+        // Which tool is in proximity. The eraser is not a button in evdev's
+        // model -- it is a *different tool*, so holding the side button in
+        // eraser mode swaps BTN_TOOL_PEN for BTN_TOOL_RUBBER rather than
+        // reporting a press.
+        let want_rubber = self.eraser_active.get();
         if !self.tool_in_proximity.replace(true) {
-            events.push(InputEvent { time: t, kind: EventKind::Key, code: Key::ButtonToolPen as u16, value: 1 });
+            events.push(InputEvent { time: t, kind: EventKind::Key, code: tool_key(want_rubber), value: 1 });
+            self.tool_is_rubber.set(want_rubber);
+        } else if self.tool_is_rubber.get() != want_rubber {
+            events.push(InputEvent { time: t, kind: EventKind::Key, code: tool_key(self.tool_is_rubber.get()), value: 0 });
+            events.push(InputEvent { time: t, kind: EventKind::Key, code: tool_key(want_rubber), value: 1 });
+            self.tool_is_rubber.set(want_rubber);
         }
         if self.in_contact.replace(in_contact) != in_contact {
             events.push(InputEvent { time: t, kind: EventKind::Key, code: Key::ButtonTouch as u16, value: in_contact as i32 });
@@ -227,17 +248,46 @@ impl UinputTablet {
         Ok(())
     }
 
-    /// Toggles the S Pen side button (`BTN_STYLUS`), independent of any
-    /// position update -- edge-triggered like everything else here.
-    pub fn set_button(&self, pressed: bool) -> io::Result<()> {
+    /// Acts on the S Pen side button, independent of any position update --
+    /// edge-triggered like everything else here.
+    ///
+    /// `action` is chosen on the tablet and carried per event, so changing the
+    /// mapping takes effect on the next press with no reconnect. See
+    /// `input_receiver`'s protocol note.
+    pub fn set_button(&self, pressed: bool, action: ButtonAction) -> io::Result<()> {
         if self.button_pressed.replace(pressed) == pressed {
             return Ok(());
         }
         let t = EventTime::new(0, 0);
-        let events = [
-            InputEvent { time: t, kind: EventKind::Key, code: Key::ButtonStylus as u16, value: pressed as i32 },
-            InputEvent { time: t, kind: EventKind::Synchronize, code: SynchronizeKind::Report as u16, value: 0 },
-        ];
+        let mut events = Vec::with_capacity(4);
+        match action {
+            ButtonAction::RightClick => events.push(InputEvent {
+                time: t, kind: EventKind::Key, code: Key::ButtonStylus as u16, value: pressed as i32,
+            }),
+            ButtonAction::MiddleClick => events.push(InputEvent {
+                time: t, kind: EventKind::Key, code: Key::ButtonStylus2 as u16, value: pressed as i32,
+            }),
+            ButtonAction::Eraser => {
+                self.eraser_active.set(pressed);
+                // Swap the tool now rather than waiting for the next position
+                // update: the pen is often held still while the button is
+                // pressed, and a tool that changes only once you move would
+                // feel broken.
+                if self.tool_in_proximity.get() && self.tool_is_rubber.get() != pressed {
+                    events.push(InputEvent {
+                        time: t, kind: EventKind::Key, code: tool_key(self.tool_is_rubber.get()), value: 0,
+                    });
+                    events.push(InputEvent {
+                        time: t, kind: EventKind::Key, code: tool_key(pressed), value: 1,
+                    });
+                    self.tool_is_rubber.set(pressed);
+                }
+            }
+        }
+        if events.is_empty() {
+            return Ok(());
+        }
+        events.push(InputEvent { time: t, kind: EventKind::Synchronize, code: SynchronizeKind::Report as u16, value: 0 });
         let raw: Vec<input_linux::sys::input_event> = events.into_iter().map(Into::into).collect();
         self.handle.write(&raw)?;
         Ok(())
@@ -247,5 +297,70 @@ impl UinputTablet {
 impl Drop for UinputTablet {
     fn drop(&mut self) {
         let _ = self.handle.dev_destroy();
+    }
+}
+
+/// What the S Pen's side button does while held.
+///
+/// Chosen on the tablet and sent with each button event rather than negotiated
+/// at connect time, so changing it takes effect on the next press. The device
+/// declares the key bits for all of these when it is created, because keybits
+/// are fixed at creation and the mapping is not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ButtonAction {
+    /// `BTN_STYLUS` -- what a stylus's first side button conventionally is,
+    /// and what every version before the mapping existed always sent.
+    #[default]
+    RightClick,
+    /// `BTN_STYLUS2`, the second side button.
+    MiddleClick,
+    /// Not a button at all in evdev's model: swaps `BTN_TOOL_PEN` for
+    /// `BTN_TOOL_RUBBER` while held, which is how a real tablet reports the
+    /// other end of the pen.
+    Eraser,
+}
+
+impl ButtonAction {
+    /// Decodes bits 2-3 of a button event's `buttons` byte. Anything
+    /// unrecognised falls back to the historical behaviour rather than doing
+    /// nothing, so a newer client talking to this daemon degrades to a right
+    /// click instead of a dead button.
+    pub fn from_event_buttons(buttons: u8) -> Self {
+        match (buttons >> 2) & 0b11 {
+            1 => ButtonAction::MiddleClick,
+            2 => ButtonAction::Eraser,
+            _ => ButtonAction::RightClick,
+        }
+    }
+}
+
+fn tool_key(rubber: bool) -> u16 {
+    if rubber { Key::ButtonToolRubber as u16 } else { Key::ButtonToolPen as u16 }
+}
+
+#[cfg(test)]
+mod button_action_tests {
+    use super::ButtonAction;
+
+    /// Bits 0 and 1 of this byte mean other things (stylus state, finger tool),
+    /// so the mapping has to ignore them.
+    #[test]
+    fn the_other_bits_are_ignored() {
+        assert_eq!(ButtonAction::from_event_buttons(0b0000_0011), ButtonAction::RightClick);
+        assert_eq!(ButtonAction::from_event_buttons(0b0000_0111), ButtonAction::MiddleClick);
+        assert_eq!(ButtonAction::from_event_buttons(0b0000_1011), ButtonAction::Eraser);
+    }
+
+    /// A client that predates the mapping sends zero there, and must keep
+    /// getting exactly what it always got.
+    #[test]
+    fn an_older_client_still_right_clicks() {
+        assert_eq!(ButtonAction::from_event_buttons(0b0000_0001), ButtonAction::RightClick);
+        assert_eq!(ButtonAction::from_event_buttons(0), ButtonAction::RightClick);
+    }
+
+    #[test]
+    fn an_unknown_action_degrades_rather_than_dying() {
+        assert_eq!(ButtonAction::from_event_buttons(0b0000_1100), ButtonAction::RightClick);
     }
 }
