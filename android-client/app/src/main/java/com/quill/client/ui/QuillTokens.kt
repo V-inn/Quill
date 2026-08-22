@@ -20,7 +20,7 @@ import androidx.compose.ui.unit.dp
  * moment they go back to work.
  *
  * The single accent is a muted copper, and it only ever appears as a mark --
- * a hairline, a small dot, a focus ring, the cable stub on the slab. Never as a
+ * a hairline, a small dot, a focus ring, the slab's outline. Never as a
  * large fill. The brightest thing on this screen is meant to be the captured
  * frame of the user's own desktop, not a piece of UI.
  */
@@ -48,7 +48,7 @@ object QuillTokens {
     val Graphite = Color(0xFFAEB6BF)
 
     /**
-     * Marks only -- rules, dots, the focus ring, the cable stub. 3.5:1 on
+     * Marks only -- rules, dots, the focus ring, the slab's outline. 3.5:1 on
      * [Slate], which clears the 3:1 that non-text UI needs but **not** the
      * 4.5:1 that small text does. Use [CopperLit] for anything with letters in
      * it.
