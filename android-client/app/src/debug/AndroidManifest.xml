@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Debug-only additions.
+
+    The adb-forward transport (`quill 7777`, Milestones 3-7) listens on a TCP
+    socket, so it needs INTERNET. It is a development path: the shipped
+    transport is AOA over raw USB, which needs no permission at all, so the
+    permission is declared here rather than in the main manifest and never
+    reaches a release build.
+
+    Keeping it out of release is not cosmetic: a network permission on an app
+    that collects nothing is a Data Safety question to answer and a thing
+    reviewers look at twice.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET" />
+</manifest>
