@@ -13,8 +13,13 @@ import com.quill.client.R
  *
  * The files in `res/font/` are instanced and subset from the upstream OFL
  * releases -- see `tools/build-fonts.sh` for the command that produces them and
- * why (1,196 KB upstream, 115 KB as shipped). Licences are in `app/licenses/`
- * and have to stay with them.
+ * why (1,196 KB upstream, 115 KB as shipped).
+ *
+ * All three are under the SIL Open Font License 1.1, which requires the licence
+ * to be distributed *with* the fonts. So the text lives in
+ * `assets/licenses/`, which is packaged into the APK -- it used to sit in a
+ * source-only directory that never reached a shipped build, which met the
+ * letter of nothing. `Licenses.kt` renders the attribution on screen.
  *
  * **Eyebrow** carries the personality and is rationed to two places: section
  * labels and the slab's readout. A display face used anywhere else stops being
