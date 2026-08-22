@@ -144,6 +144,7 @@ private fun TwoPane(state: SettingsScreenState) {
         ) {
             SessionSection(state)
             TabletSection(state)
+            TypefaceCredits()
             Box(Modifier.height(QuillTokens.SpaceLg))
         }
     }
@@ -161,6 +162,7 @@ private fun SinglePane(state: SettingsScreenState) {
         DisplaySection(state)
         SessionSection(state)
         TabletSection(state)
+        TypefaceCredits()
         Box(Modifier.height(QuillTokens.SpaceLg))
     }
 }

@@ -19,3 +19,6 @@ android-client/local.properties
 android-client/.idea/
 android-client/.cxx/
 android-client/captures/
+
+# Local working note, not a public roadmap.
+PUBLISHING-TODO.md

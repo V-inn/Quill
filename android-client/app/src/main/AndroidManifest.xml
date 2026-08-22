@@ -1,8 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <uses-permission android:name="android.permission.INTERNET" />
-    <uses-feature android:name="android.hardware.usb.accessory" android:required="false" />
+    <!-- INTERNET is deliberately absent here. The shipped transport is AOA over
+         USB, which needs no permission; the only networked path is the
+         adb-forward one used during development, and its permission lives in
+         the debug manifest so release builds ask for nothing.
+
+         required="true": without a USB accessory host this app cannot do
+         anything at all, so a store listing should be filtered to devices that
+         can actually run it rather than offering it to everyone. -->
+    <uses-feature android:name="android.hardware.usb.accessory" android:required="true" />
 
     <application
         android:allowBackup="false"

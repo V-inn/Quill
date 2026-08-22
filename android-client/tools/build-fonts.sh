@@ -61,4 +61,6 @@ done
 echo
 ls -l "$OUT" | awk '{s+=$5; if ($9) printf "%8d  %s\n", $5, $9} END {printf "%8d  TOTAL\n", s}'
 echo
-echo "Licences live in app/licenses/ and must stay with these files (OFL 1.1)."
+echo "Licences live in app/src/main/assets/licenses/ and are packaged into the"
+echo "APK: OFL 1.1 requires the text to travel with the fonts. Do not move them"
+echo "somewhere that is not packaged."
