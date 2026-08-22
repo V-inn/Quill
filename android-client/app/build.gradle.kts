@@ -112,6 +112,13 @@ dependencies {
     implementation("androidx.activity:activity-compose:1.10.1")
     debugImplementation("androidx.compose.ui:ui-tooling")
 
+    // The first tests this project has had on the Android side. Plain JUnit on
+    // the JVM, deliberately: everything covered is pure arithmetic over Ints and
+    // data classes, so it needs no device, no emulator and no Robolectric. The
+    // logic worth testing was made reachable without Android precisely so this
+    // stayed true -- see PanelGeometry.
+    testImplementation("junit:junit:4.13.2")
+
     // androidx.appcompat was declared but never imported -- the only androidx
     // imports in the app are WindowCompat/WindowInsets* from core-ktx. Dropped
     // with this change, which claws back part of what Compose adds.

@@ -37,6 +37,48 @@ data class SettingsDraft(
         settings.quality = quality
     }
 
+    /**
+     * Which controls differ from the session that is actually running.
+     *
+     * "Differs from what is running", not "differs from what is saved" -- the
+     * two are different facts and only the first one is worth a mark on screen.
+     * With no session yet ([session] null) nothing can be out of step with one,
+     * so nothing is marked: that is a real state, not a missing one.
+     *
+     * Lives here rather than inline in the settings screen so it can be tested.
+     * It is the arithmetic behind every staged mark and the "N changes staged"
+     * line, and it was previously only ever checked by a person reading a
+     * screenshot of a footer.
+     */
+    fun stagedAgainst(session: SessionConfig.Snapshot?): Staged {
+        if (session == null) return Staged()
+        return Staged(
+            clientSideCursor = clientSideCursor != session.clientSideCursor,
+            ctrlScrollZoom = ctrlScrollZoom != session.ctrlScrollZoom,
+            rotation = rotationDegrees != session.rotationDegrees,
+            workspace = workspaceScalePercent != session.workspaceScalePercent,
+            cap30Fps = cap30Fps != session.cap30Fps,
+            quality = quality != session.quality,
+        )
+    }
+
+    /** One flag per stageable control; all false when nothing is running. */
+    data class Staged(
+        val clientSideCursor: Boolean = false,
+        val ctrlScrollZoom: Boolean = false,
+        val rotation: Boolean = false,
+        val workspace: Boolean = false,
+        val cap30Fps: Boolean = false,
+        val quality: Boolean = false,
+    ) {
+        val count: Int
+            get() = listOf(
+                clientSideCursor, ctrlScrollZoom, rotation, workspace, cap30Fps, quality,
+            ).count { it }
+
+        val any: Boolean get() = count > 0
+    }
+
     companion object {
         fun from(settings: Settings) = SettingsDraft(
             clientSideCursor = settings.clientSideCursor,

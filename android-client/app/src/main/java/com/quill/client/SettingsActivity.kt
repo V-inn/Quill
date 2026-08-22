@@ -74,6 +74,7 @@ class SettingsActivity : ComponentActivity() {
 
             val draft = SettingsDraft(clientSideCursor, ctrlScrollZoom, rotationDegrees, workspaceScale, cap30Fps, quality)
             val session = SessionConfig.applied
+            val staged = draft.stagedAgainst(session)
 
             val apply = {
                 draft.commit(settings)
@@ -98,15 +99,14 @@ class SettingsActivity : ComponentActivity() {
                     showLatencyOverlay = showLatencyOverlay,
                     sideButtonAction = sideButtonAction,
 
-                    // "Differs from what is running", not "differs from what is
-                    // saved". With no session yet, nothing can be out of step
-                    // with one, so nothing is marked.
-                    clientSideCursorStaged = session != null && clientSideCursor != session.clientSideCursor,
-                    ctrlScrollZoomStaged = session != null && ctrlScrollZoom != session.ctrlScrollZoom,
-                    rotationStaged = session != null && rotationDegrees != session.rotationDegrees,
-                    workspaceStaged = session != null && workspaceScale != session.workspaceScalePercent,
-                    cap30FpsStaged = session != null && cap30Fps != session.cap30Fps,
-                    qualityStaged = session != null && quality != session.quality,
+                    // See SettingsDraft.stagedAgainst: "differs from what is
+                    // running", not "differs from what is saved".
+                    clientSideCursorStaged = staged.clientSideCursor,
+                    ctrlScrollZoomStaged = staged.ctrlScrollZoom,
+                    rotationStaged = staged.rotation,
+                    workspaceStaged = staged.workspace,
+                    cap30FpsStaged = staged.cap30Fps,
+                    qualityStaged = staged.quality,
 
                     sessionLive = session != null,
                     previewFrame = FramePreview.peek(),
