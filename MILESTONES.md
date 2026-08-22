@@ -2969,3 +2969,156 @@ to the app, present after the first frame and absent before it.
   written; neither has been exercised with a keyboard or with
   `animator_duration_scale 0`.
 - **Anything GNOME.** Milestone 10's caveat still stands.
+
+## 27. Packaging the daemon: two packages, and where the grant goes
+
+`PUBLISHING-TODO.md` opens with the thing that is not a checkbox: Quill is the
+client half of a two-part system, and the Play Store only distributes the half
+that does nothing on its own. Someone who installs the APK gets "Waiting for
+connection…" forever unless they can compile a Rust daemon on Linux, with KDE or
+GNOME, a VAAPI-capable GPU, dev headers and a sudo'd udev rule. Nothing else on
+that list matters until a normal person can *get the daemon*.
+
+So: `.deb` and `.rpm`, built by `packaging/build-packages.sh`, attached to a
+GitHub release by `.github/workflows/release.yml` — the repo's first CI of any
+kind.
+
+### The split, which is the actual design decision
+
+Two packages on each format, not one:
+
+| | |
+| --- | --- |
+| `quill` | the binary, the wrapper, the systemd user unit, `99-quill-daemon.rules`. Nothing with a privilege implication. |
+| `quill-uinput` | `60-quill-uinput.rules`, alone. |
+
+The requirement that produced this was the user's: Quill should be safe to
+deploy in school and corporate environments with many users per machine, where
+IT is reasonably wary of `/dev/uinput` access for people who are not sitting at
+the computer.
+
+The existing mechanism already answers most of that, and the packaging had to
+avoid weakening it. `TAG+="uaccess"` is not a blanket grant: systemd-logind
+attaches an ACL for the user holding the **active local seat session**, and the
+ACL follows session activation. SSH users, lingering background sessions, and an
+inactive user on a switched seat all get nothing. The rule is byte-for-byte
+Steam's `60-steam-input.rules`, and the alternatives it was chosen over —
+`MODE="0666"`, or a group — *would* have granted it broadly.
+
+What is left is small but real: anyone who sits down and logs in gets
+`/dev/uinput` while active. They already have a physical keyboard, so the
+marginal capability is limited — but it is not nothing, and it should not arrive
+silently with `apt install quill`.
+
+The first design here made it `Suggests:`, so a default install would not pull
+it. The user rejected that, correctly: for the ordinary single-seat desktop the
+rule *is* the working product — without it the daemon falls back to the
+`RemoteDesktop` portal, which carries **no pressure and no tilt**, which is most
+of what Quill is for. It is now `Recommends:`, installed by default on both apt
+and dnf.
+
+Keeping it a separate *package* is what still serves the multi-user case: the
+grant is one named, auditable unit that an administrator can decline with
+`apt install --no-install-recommends quill`, leave out of a lab image, or
+`apt remove quill-uinput` later without touching the daemon. A file buried
+inside `quill` would have offered none of those. `daemon/README.md` has a
+"Multi-user and managed machines" section stating the tradeoff plainly, so
+nobody has to read udev rules to evaluate it.
+
+One caveat recorded there and worth repeating: on KDE, declining the rule is not
+always a graceful degradation. Milestone 10 found that some versions of
+`xdg-desktop-portal-kde` reject `RemoteDesktop` from unsandboxed apps, and on
+those the fallback has no input at all rather than input without pressure.
+
+### The bug the packaging found
+
+The unit has `ProtectSystem=strict` with
+`ReadWritePaths=%h/.local/share/quill %h/.config/quill`, and `install.sh:19` is
+what creates those two directories. A package cannot: it runs once, as root, and
+has no business walking every user's home.
+
+Left alone, a packaged install would have failed for everyone who had never run
+`install.sh` — which is everyone the packages exist for. The failure names
+neither the directory nor the setting:
+
+    Failed at step NAMESPACE spawning /usr/bin/quill-daemon: No such file or
+    directory
+    Main process exited, code=exited, status=226/NAMESPACE
+
+"No such file or directory" reads like a missing binary. It is not.
+
+Fixed with `ExecStartPre=+/usr/bin/mkdir -p %h/.local/share/quill %h/.config/quill`.
+The `+` matters: it exempts that one command from the sandbox, because by the
+time the namespace exists `ProtectSystem=strict` has made the hierarchy
+read-only, and the namespace is exactly what fails when the directories are
+missing. Verified both directions on systemd 257 with a throwaway user unit —
+starts with the line, fails 226/NAMESPACE without it.
+
+### Why the packages are built in containers
+
+`cargo-deb` resolves `depends = "$auto"` by running `dpkg-shlibdeps` on the
+build host. Built on this machine (trixie), the daemon comes out depending on
+`libpipewire-0.3-0t64` — a name bookworm and Ubuntu 24.04 have never heard of,
+producing an uninstallable package for no reason but where it was compiled.
+Building in `debian:12` yields `libpipewire-0.3-0`, which resolves on both.
+
+Fedora's `.rpm` is built in `fedora:latest` with `cargo-generate-rpm`'s
+`--auto-req builtin`, which derives requirements with `ldd` rather than
+rpmbuild's `find-requires` — so no rpm tooling is needed, which matters because
+this development machine has none.
+
+Both containers install rustup rather than the distro's `rustc`: ashpd's zbus
+chain needs 1.87+, the same constraint Milestone 2 hit.
+
+### Two things cargo-deb cannot express
+
+- **Per-variant synopsis.** The one-line `Description:` comes from
+  `package.description` for every package cargo-deb builds, so `quill-uinput`
+  advertised itself as a drawing display. There is no metadata field for it;
+  `build-in-container.sh` unpacks the built deb, rewrites the line, repacks, and
+  fails loudly if the rewrite matched nothing.
+- **`Architecture: all`.** Also unavailable — but correct here anyway, since
+  `quill` is amd64-only and both would be built per-architecture together.
+
+### Verified
+
+Built and installed in fresh containers, four combinations, all passing:
+
+- `debian:12` and `debian:13`, both packages: all five files land, the unit's
+  `ExecStart` points at `/usr/bin/quill-daemon` while `ReadWritePaths` and the
+  data paths keep `%h`, and both synopses read correctly. Installing the
+  bookworm-built deb on trixie confirms the `t64` rename is satisfied.
+- `debian:12` with `--no-install-recommends`: daemon installed,
+  `60-quill-uinput.rules` absent, `quill-uinput` not installed. The opt-out
+  works.
+- `fedora:latest`: same file checks, and `rpm -qR` shows correctly
+  auto-generated requirements (`libva.so.2`, `libpipewire-0.3.so.0`,
+  `libusb-1.0.so.0`, glibc symbol versions).
+
+In each, `quill-daemon` was run with no tablet and no display server: it logs
+its backend guess, tries AOA, and waits — killed by the test's own timeout
+(124), never a crash.
+
+`ExecStartPre=+` verified separately against real systemd 257, both with and
+without the line.
+
+### Not verified
+
+- **The packages have never been installed on a real desktop.** Every check
+  above is a container with no seat, no session, no compositor and no GPU. That
+  a packaged daemon actually *streams* is untested; only that it installs,
+  resolves, and starts.
+- **The systemd user unit has never been started from its packaged location.**
+  `/usr/lib/systemd/user/quill-daemon.service` is a path the user manager
+  searches, and the unit file itself is verified (`systemd-analyze --user
+  verify`, clean), but no container has a user manager to start it in.
+- **`SYSTEMD_USER_WANTS` from a system-wide rules file is untested.** The
+  auto-launch rule works from `/etc/udev/rules.d` on this machine; the packaged
+  copy in `/usr/lib/udev/rules.d` has not been exercised on hardware.
+- **The `.rpm` has only been tested on `fedora:latest`.** No other RPM
+  distribution, and no Fedora machine with an actual desktop.
+- **Only amd64.** No arm64 build exists, and nothing has been said about one.
+- **No repository.** Updates are manual downloads, not `apt upgrade`. That is
+  the remaining half of `PUBLISHING-TODO.md` §0's first bullet.
+- **The release workflow has never run.** It is written against the same script
+  the local builds use, but no tag has been pushed and no CI run exists.
