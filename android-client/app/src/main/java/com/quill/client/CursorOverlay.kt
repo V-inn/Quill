@@ -40,7 +40,9 @@ class CursorOverlay(context: Context) : View(context) {
     private var flip180 = false
 
     fun setFlip180(flip: Boolean) {
+        if (flip180 == flip) return
         flip180 = flip
+        invalidate()
     }
 
     fun setVideoSize(width: Int, height: Int) {
@@ -81,11 +83,33 @@ class CursorOverlay(context: Context) : View(context) {
         val bmp = bitmap ?: return
         val scaleX = width.toFloat() / videoWidth
         val scaleY = height.toFloat() / videoHeight
+
+        // The daemon rotates the whole picture GPU-side when flip180 is on, so
+        // everything the tablet shows -- including the pointer KWin composites
+        // into the video itself -- arrives already turned around. This overlay
+        // draws on top of that, *after* the rotation, so it has to turn its own
+        // bitmap to match or it is the one thing on the panel still the old way
+        // up. Flipping only the position, as this did, put the pointer in the
+        // right place pointing the wrong way.
+        //
+        // Rotating the canvas about the cursor point, rather than rotating the
+        // bitmap and then working out where to put it, is what keeps the
+        // hotspot right: the hotspot pixel already lands on (cursorX, cursorY),
+        // and that is the centre of rotation, so it does not move. Rotating the
+        // bitmap itself would have needed the hotspot mirrored within it too --
+        // under a half turn it moves to the opposite corner -- which is the
+        // easy way to fix the direction and break the aim.
+        val restore = if (flip180) {
+            canvas.save().also { canvas.rotate(180f, cursorX, cursorY) }
+        } else {
+            -1
+        }
         canvas.drawBitmap(
             bmp,
             cursorX - hotspotX * scaleX,
             cursorY - hotspotY * scaleY,
             paint
         )
+        if (restore >= 0) canvas.restoreToCount(restore)
     }
 }
