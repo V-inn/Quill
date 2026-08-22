@@ -3,10 +3,11 @@ package com.quill.client
 import android.graphics.drawable.ColorDrawable
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.graphics.toArgb
 import androidx.core.view.WindowCompat
@@ -50,15 +51,36 @@ class SettingsActivity : ComponentActivity() {
         val settings = Settings(this)
 
         setContent {
-            // Write-through, as before: each toggle persists immediately and
-            // takes effect on the reconnect that leaving this screen causes.
-            // The staged-draft model that makes "Apply" mean something replaces
-            // this next, in its own change.
-            var clientSideCursor by remember { mutableStateOf(settings.clientSideCursor) }
-            var ctrlScrollZoom by remember { mutableStateOf(settings.ctrlScrollZoom) }
-            var flip180 by remember { mutableStateOf(settings.flip180) }
-            var keepScreenAwake by remember { mutableStateOf(settings.keepScreenAwake) }
-            var showLatencyOverlay by remember { mutableStateOf(settings.showLatencyOverlay) }
+            // Session settings are *staged*: held here and written only on
+            // Apply. The old screen wrote every toggle through on the spot,
+            // which made any Apply button a lie -- backing out still left the
+            // change for the next reconnect to pick up.
+            //
+            // rememberSaveable so a rotation or a process death does not
+            // silently drop what you were half-way through choosing.
+            var clientSideCursor by rememberSaveable { mutableStateOf(settings.clientSideCursor) }
+            var ctrlScrollZoom by rememberSaveable { mutableStateOf(settings.ctrlScrollZoom) }
+            var flip180 by rememberSaveable { mutableStateOf(settings.flip180) }
+
+            // Tablet settings are not staged -- there is nothing to stage
+            // against, since they take effect the moment you leave. They keep
+            // writing through, and can never show a staged mark.
+            var keepScreenAwake by rememberSaveable { mutableStateOf(settings.keepScreenAwake) }
+            var showLatencyOverlay by rememberSaveable { mutableStateOf(settings.showLatencyOverlay) }
+
+            val draft = SettingsDraft(clientSideCursor, ctrlScrollZoom, flip180)
+            val session = SessionConfig.applied
+
+            val apply = {
+                draft.commit(settings)
+                finish()
+            }
+            val discard = { finish() }
+
+            // The system back button means "leave", and leaving without
+            // applying is discarding -- so it does exactly what the Discard
+            // button does rather than some third thing.
+            BackHandler(onBack = discard)
 
             SettingsScreen(
                 SettingsScreenState(
@@ -67,18 +89,22 @@ class SettingsActivity : ComponentActivity() {
                     flip180 = flip180,
                     keepScreenAwake = keepScreenAwake,
                     showLatencyOverlay = showLatencyOverlay,
-                    onClientSideCursor = {
-                        clientSideCursor = it
-                        settings.clientSideCursor = it
-                    },
-                    onCtrlScrollZoom = {
-                        ctrlScrollZoom = it
-                        settings.ctrlScrollZoom = it
-                    },
-                    onFlip180 = {
-                        flip180 = it
-                        settings.flip180 = it
-                    },
+
+                    // "Differs from what is running", not "differs from what is
+                    // saved". With no session yet, nothing can be out of step
+                    // with one, so nothing is marked.
+                    clientSideCursorStaged = session != null && clientSideCursor != session.clientSideCursor,
+                    ctrlScrollZoomStaged = session != null && ctrlScrollZoom != session.ctrlScrollZoom,
+                    flip180Staged = session != null && flip180 != session.flip180,
+
+                    sessionLive = session != null,
+                    connectionLabel = session
+                        ?.let { "${it.widthPx} × ${it.heightPx}" }
+                        ?: "Not connected",
+
+                    onClientSideCursor = { clientSideCursor = it },
+                    onCtrlScrollZoom = { ctrlScrollZoom = it },
+                    onFlip180 = { flip180 = it },
                     onKeepScreenAwake = {
                         keepScreenAwake = it
                         settings.keepScreenAwake = it
@@ -87,7 +113,8 @@ class SettingsActivity : ComponentActivity() {
                         showLatencyOverlay = it
                         settings.showLatencyOverlay = it
                     },
-                    onClose = { finish() },
+                    onApply = apply,
+                    onDiscard = discard,
                 )
             )
         }

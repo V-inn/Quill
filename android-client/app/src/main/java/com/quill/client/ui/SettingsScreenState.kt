@@ -35,21 +35,38 @@ data class SettingsScreenState(
     val onFlip180: (Boolean) -> Unit,
     val onKeepScreenAwake: (Boolean) -> Unit,
     val onShowLatencyOverlay: (Boolean) -> Unit,
-    val onClose: () -> Unit,
+
+    /** Saves the staged settings, then leaves -- which is what applies them. */
+    val onApply: () -> Unit,
+
+    /** Leaves without saving. Still reconnects; see [secondaryLabel]. */
+    val onDiscard: () -> Unit,
 ) {
     val stagedCount: Int
         get() = listOf(clientSideCursorStaged, ctrlScrollZoomStaged, flip180Staged).count { it }
 
+    val hasStagedChanges: Boolean get() = stagedCount > 0
+
     /**
-     * The line beside the action. Says what is pending, or -- when nothing is --
-     * discloses the thing that would otherwise be a quiet lie: leaving this
-     * screen reconnects whether or not anything changed, because it destroys
-     * the video surface either way.
+     * The line beside the actions. Names what is pending, or -- when nothing is
+     * -- what the screen would otherwise quietly get wrong: there is no free
+     * exit here. Leaving destroys the video surface either way, so both routes
+     * out cost a reconnect.
      */
     val stagedSummary: String
         get() = when (stagedCount) {
-            0 -> "Closing reconnects either way."
+            0 -> "Nothing staged. Leaving reconnects either way."
             1 -> "1 change staged"
             else -> "$stagedCount changes staged"
         }
+
+    val primaryLabel: String
+        get() = if (hasStagedChanges) "Apply and reconnect" else "Reconnect"
+
+    /**
+     * Null when there is nothing to discard -- a "Discard" next to an unchanged
+     * screen is a button that does the same thing as the one beside it.
+     */
+    val secondaryLabel: String?
+        get() = if (hasStagedChanges) "Discard and reconnect" else null
 }

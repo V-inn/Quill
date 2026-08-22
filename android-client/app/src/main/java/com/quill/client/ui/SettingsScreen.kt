@@ -286,12 +286,12 @@ private fun ActionBar(state: SettingsScreenState, modifier: Modifier = Modifier)
             text = state.stagedSummary,
             modifier = Modifier.weight(1f),
             style = QuillType.data.copy(
-                color = if (state.stagedCount > 0) QuillTokens.CopperLit else QuillTokens.Muted,
+                color = if (state.hasStagedChanges) QuillTokens.CopperLit else QuillTokens.Muted,
             ),
         )
-        PrimaryButton(
-            text = if (state.stagedCount > 0) "Apply and reconnect" else "Close",
-            onClick = state.onClose,
-        )
+        state.secondaryLabel?.let { label ->
+            SecondaryButton(text = label, onClick = state.onDiscard)
+        }
+        PrimaryButton(text = state.primaryLabel, onClick = state.onApply)
     }
 }

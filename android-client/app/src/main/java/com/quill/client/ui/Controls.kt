@@ -269,6 +269,51 @@ fun PrimaryButton(
     }
 }
 
+/**
+ * The quieter of the two exits.
+ *
+ * Only shown when there is genuinely something to discard -- a "Discard" beside
+ * an unchanged screen would just be a second button that does what the first
+ * one does.
+ */
+@Composable
+fun SecondaryButton(
+    text: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val interaction = remember { MutableInteractionSource() }
+    val pressed by interaction.collectIsPressedAsState()
+    val focused by interaction.collectIsFocusedAsState()
+
+    val background by animateColorAsState(
+        targetValue = if (pressed) QuillTokens.RaisePressed else QuillTokens.Raise,
+        animationSpec = quillTween(),
+        label = "secondaryBackground",
+    )
+
+    Box(
+        modifier = modifier
+            .clip(QuillTokens.RowShape)
+            .background(background)
+            .then(
+                if (focused) Modifier.border(2.dp, QuillTokens.Copper, QuillTokens.RowShape) else Modifier
+            )
+            .clickable(
+                interactionSource = interaction,
+                indication = null,
+                role = Role.Button,
+                onClick = onClick,
+            )
+            .focusable(interactionSource = interaction)
+            .defaultMinSize(minHeight = QuillTokens.TouchTarget)
+            .padding(horizontal = QuillTokens.SpaceLg, vertical = QuillTokens.SpaceMd),
+        contentAlignment = Alignment.Center,
+    ) {
+        BasicText(text = text, style = QuillType.button.copy(color = QuillTokens.Chalk))
+    }
+}
+
 /** A hairline. One device pixel would disappear; 1dp is the intent. */
 @Composable
 fun Rule(modifier: Modifier = Modifier) {

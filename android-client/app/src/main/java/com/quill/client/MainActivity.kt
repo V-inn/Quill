@@ -689,6 +689,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         // aspect, and this is where it is already worked out correctly (see the
         // note above on why displayMetrics is not used).
         FramePreview.setPanelSize(widthPx, heightPx)
+        // The moment these stop being preferences and become what the daemon is
+        // actually doing. The settings screen diffs against this to tell a
+        // staged change from a settled one.
+        SessionConfig.record(Settings(this), widthPx, heightPx)
 
         val stylusDevice = InputDevice.getDeviceIds()
             .map { InputDevice.getDevice(it) }
