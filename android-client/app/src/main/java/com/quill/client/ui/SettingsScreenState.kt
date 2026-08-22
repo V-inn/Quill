@@ -17,6 +17,7 @@ data class SettingsScreenState(
     val clientSideCursor: Boolean,
     val ctrlScrollZoom: Boolean,
     val rotationDegrees: Int,
+    val workspaceScalePercent: Int,
     val keepScreenAwake: Boolean,
     val showLatencyOverlay: Boolean,
     val sideButtonAction: Int,
@@ -24,6 +25,7 @@ data class SettingsScreenState(
     val clientSideCursorStaged: Boolean = false,
     val ctrlScrollZoomStaged: Boolean = false,
     val rotationStaged: Boolean = false,
+    val workspaceStaged: Boolean = false,
 
     /** True once a desktop has actually rendered on this tablet. */
     val sessionLive: Boolean = false,
@@ -38,6 +40,10 @@ data class SettingsScreenState(
     /** Panel width / height, for drawing the slab at the true shape. */
     val panelAspect: Float = 1.6f,
 
+    /** Panel resolution, so the workspace choices can name what they produce. */
+    val panelWidthPx: Int = 0,
+    val panelHeightPx: Int = 0,
+
     /** How far the *running* session turns the picture, which is what decides
      * how the captured pixels are already oriented. */
     val sessionRotationDegrees: Int = 0,
@@ -45,6 +51,7 @@ data class SettingsScreenState(
     val onClientSideCursor: (Boolean) -> Unit,
     val onCtrlScrollZoom: (Boolean) -> Unit,
     val onRotation: (Int) -> Unit,
+    val onWorkspaceScale: (Int) -> Unit,
     val onKeepScreenAwake: (Boolean) -> Unit,
     val onShowLatencyOverlay: (Boolean) -> Unit,
     val onSideButtonAction: (Int) -> Unit,
@@ -56,7 +63,8 @@ data class SettingsScreenState(
     val onDiscard: () -> Unit,
 ) {
     val stagedCount: Int
-        get() = listOf(clientSideCursorStaged, ctrlScrollZoomStaged, rotationStaged).count { it }
+        get() = listOf(clientSideCursorStaged, ctrlScrollZoomStaged, rotationStaged, workspaceStaged)
+            .count { it }
 
     val hasStagedChanges: Boolean get() = stagedCount > 0
 

@@ -151,6 +151,29 @@ class Settings(context: Context) {
             .putInt(KEY_SIDE_BUTTON, if (value in VALID_SIDE_BUTTONS) value else SIDE_BUTTON_RIGHT)
             .apply()
 
+    /**
+     * How large a desktop to ask for, as a percentage of the panel's own
+     * resolution: 100, 75 or 60.
+     *
+     * At 100 the virtual monitor is the panel, pixel for pixel, which on an
+     * 11-inch screen is a very dense desktop -- lots of room, small text. Below
+     * that the desktop is smaller than the panel and gets scaled up on the way
+     * in, so everything is bigger, there is less to encode, and less goes over
+     * the cable.
+     *
+     * The aspect never changes, so nothing is ever letterboxed: both axes take
+     * the same factor. That is also what keeps the input mapping to a single
+     * multiply -- see `MainActivity.send`.
+     */
+    var workspaceScalePercent: Int
+        get() {
+            val stored = prefs.getInt(KEY_WORKSPACE_SCALE, 100)
+            return if (stored in VALID_WORKSPACE_SCALES) stored else 100
+        }
+        set(value) = prefs.edit()
+            .putInt(KEY_WORKSPACE_SCALE, if (value in VALID_WORKSPACE_SCALES) value else 100)
+            .apply()
+
     /** Packed into the handshake's `config_flags` byte. */
     fun configFlags(): Int {
         var flags = 0
@@ -181,6 +204,7 @@ class Settings(context: Context) {
         private const val KEY_FLIP_180 = "flip_180"
         private const val KEY_ROTATION_DEGREES = "rotation_deg"
         private const val KEY_SIDE_BUTTON = "side_button_action"
+        private const val KEY_WORKSPACE_SCALE = "workspace_scale_percent"
         private val VALID_ROTATIONS = setOf(0, 90, 180, 270)
 
         // Mirrors protocol.rs. Kept as plain constants in both languages rather
@@ -201,6 +225,9 @@ class Settings(context: Context) {
 
         /** Not a wire value: the event is simply not sent. */
         const val SIDE_BUTTON_NONE = 3
+
+        val WORKSPACE_SCALES = listOf(100, 75, 60)
+        private val VALID_WORKSPACE_SCALES = WORKSPACE_SCALES.toSet()
 
         private val VALID_SIDE_BUTTONS =
             setOf(SIDE_BUTTON_RIGHT, SIDE_BUTTON_MIDDLE, SIDE_BUTTON_ERASER, SIDE_BUTTON_NONE)

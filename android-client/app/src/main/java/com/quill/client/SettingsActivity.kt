@@ -61,6 +61,7 @@ class SettingsActivity : ComponentActivity() {
             var clientSideCursor by rememberSaveable { mutableStateOf(settings.clientSideCursor) }
             var ctrlScrollZoom by rememberSaveable { mutableStateOf(settings.ctrlScrollZoom) }
             var rotationDegrees by rememberSaveable { mutableStateOf(settings.rotationDegrees) }
+            var workspaceScale by rememberSaveable { mutableStateOf(settings.workspaceScalePercent) }
 
             // Tablet settings are not staged -- there is nothing to stage
             // against, since they take effect the moment you leave. They keep
@@ -69,7 +70,7 @@ class SettingsActivity : ComponentActivity() {
             var showLatencyOverlay by rememberSaveable { mutableStateOf(settings.showLatencyOverlay) }
             var sideButtonAction by rememberSaveable { mutableStateOf(settings.sideButtonAction) }
 
-            val draft = SettingsDraft(clientSideCursor, ctrlScrollZoom, rotationDegrees)
+            val draft = SettingsDraft(clientSideCursor, ctrlScrollZoom, rotationDegrees, workspaceScale)
             val session = SessionConfig.applied
 
             val apply = {
@@ -88,6 +89,7 @@ class SettingsActivity : ComponentActivity() {
                     clientSideCursor = clientSideCursor,
                     ctrlScrollZoom = ctrlScrollZoom,
                     rotationDegrees = rotationDegrees,
+                    workspaceScalePercent = workspaceScale,
                     keepScreenAwake = keepScreenAwake,
                     showLatencyOverlay = showLatencyOverlay,
                     sideButtonAction = sideButtonAction,
@@ -98,10 +100,13 @@ class SettingsActivity : ComponentActivity() {
                     clientSideCursorStaged = session != null && clientSideCursor != session.clientSideCursor,
                     ctrlScrollZoomStaged = session != null && ctrlScrollZoom != session.ctrlScrollZoom,
                     rotationStaged = session != null && rotationDegrees != session.rotationDegrees,
+                    workspaceStaged = session != null && workspaceScale != session.workspaceScalePercent,
 
                     sessionLive = session != null,
                     previewFrame = FramePreview.peek(),
                     panelAspect = FramePreview.panelAspect(),
+                    panelWidthPx = FramePreview.panelWidthPx,
+                    panelHeightPx = FramePreview.panelHeightPx,
                     sessionRotationDegrees = session?.rotationDegrees ?: rotationDegrees,
                     connectionLabel = session
                         ?.let { "${it.widthPx} × ${it.heightPx}" }
@@ -110,6 +115,7 @@ class SettingsActivity : ComponentActivity() {
                     onClientSideCursor = { clientSideCursor = it },
                     onCtrlScrollZoom = { ctrlScrollZoom = it },
                     onRotation = { rotationDegrees = it },
+                    onWorkspaceScale = { workspaceScale = it },
                     onKeepScreenAwake = {
                         keepScreenAwake = it
                         settings.keepScreenAwake = it

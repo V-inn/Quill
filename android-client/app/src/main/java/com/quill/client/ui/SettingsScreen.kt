@@ -184,6 +184,25 @@ private fun DisplaySection(state: SettingsScreenState) {
             onRotation = state.onRotation,
             staged = state.rotationStaged,
         )
+        ChoiceRow(
+            label = "Desktop size",
+            options = com.quill.client.Settings.WORKSPACE_SCALES.map { percent ->
+                if (state.panelWidthPx == 0) {
+                    "$percent%"
+                } else {
+                    val w = state.panelWidthPx * percent / 100
+                    val h = state.panelHeightPx * percent / 100
+                    "$w × $h"
+                }
+            },
+            selectedIndex = com.quill.client.Settings.WORKSPACE_SCALES
+                .indexOf(state.workspaceScalePercent).coerceAtLeast(0),
+            onSelect = { state.onWorkspaceScale(com.quill.client.Settings.WORKSPACE_SCALES[it]) },
+            staged = state.workspaceStaged,
+            note = "A smaller desktop makes everything on it bigger, and leaves " +
+                "less to encode and send. The tablet scales it back up to fill " +
+                "the screen, so text gets softer as it gets larger.",
+        )
     }
 }
 

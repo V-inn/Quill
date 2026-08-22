@@ -15,17 +15,20 @@ data class SettingsDraft(
     val clientSideCursor: Boolean,
     val ctrlScrollZoom: Boolean,
     val rotationDegrees: Int,
+    val workspaceScalePercent: Int,
 ) {
     /** Whether this differs from what is on disk, i.e. is there anything to save. */
     fun isDirty(settings: Settings): Boolean =
         clientSideCursor != settings.clientSideCursor ||
             ctrlScrollZoom != settings.ctrlScrollZoom ||
-            rotationDegrees != settings.rotationDegrees
+            rotationDegrees != settings.rotationDegrees ||
+            workspaceScalePercent != settings.workspaceScalePercent
 
     fun commit(settings: Settings) {
         settings.clientSideCursor = clientSideCursor
         settings.ctrlScrollZoom = ctrlScrollZoom
         settings.rotationDegrees = rotationDegrees
+        settings.workspaceScalePercent = workspaceScalePercent
     }
 
     companion object {
@@ -33,6 +36,7 @@ data class SettingsDraft(
             clientSideCursor = settings.clientSideCursor,
             ctrlScrollZoom = settings.ctrlScrollZoom,
             rotationDegrees = settings.rotationDegrees,
+            workspaceScalePercent = settings.workspaceScalePercent,
         )
     }
 }

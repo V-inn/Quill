@@ -454,6 +454,12 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     @Volatile
     private var sideButtonAction = Settings.SIDE_BUTTON_RIGHT
 
+    /** Panel pixels to monitor pixels. 1.0 unless the desktop is smaller than
+     * the panel; see [send]. Fixed for the life of a connection, since the
+     * monitor it refers to is created at connect time. */
+    @Volatile
+    private var workspaceScale = 1f
+
     // --- Multi-touch state (Milestone 9). UI thread only, like the field above.
 
     /** Android pointer id -> multitouch slot, stable for the life of a contact. */
@@ -471,10 +477,25 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private var longPressFired = false
     private var longPressAnchor = 0f to 0f
 
+    /**
+     * The single choke point every coordinate passes through, which is why the
+     * workspace scale is applied here rather than at each of the ten call
+     * sites.
+     *
+     * The daemon's axes are declared against the *monitor*, not the panel, so a
+     * desktop smaller than the panel needs the touch position brought into that
+     * space. Because the aspect never changes, both axes take the same factor
+     * -- including at a quarter turn, where the monitor is the panel
+     * transposed and scaled, and the two cancel out to the same single
+     * multiply.
+     */
     private fun send(type: Int, x: Int, y: Int, pressure: Int = 0, tiltX: Int = 0, tiltY: Int = 0, buttons: Int = 0) {
         // Cheap, non-blocking enqueue on the UI thread; the actual socket
         // write happens on inputWriterThread.
-        eventQueue.offer(PenEvent(type, x, y, pressure, tiltX, tiltY, buttons))
+        val scale = workspaceScale
+        val sx = if (scale == 1f) x else (x * scale).roundToInt()
+        val sy = if (scale == 1f) y else (y * scale).roundToInt()
+        eventQueue.offer(PenEvent(type, sx, sy, pressure, tiltX, tiltY, buttons))
     }
 
     private fun handleMotionEvent(event: MotionEvent, down: Boolean): Boolean {
@@ -738,8 +759,16 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         // image into it and waste most of the screen.
         val settings = Settings(this)
         val swapAxes = settings.rotationSwapsAxes
-        val monitorWidthPx = if (swapAxes) heightPx else widthPx
-        val monitorHeightPx = if (swapAxes) widthPx else heightPx
+        // A desktop smaller than the panel: fewer pixels to lay out, encode and
+        // push over the cable, and everything on it is physically bigger. Both
+        // axes take the same factor, so the aspect is unchanged and nothing is
+        // ever letterboxed.
+        val scale = settings.workspaceScalePercent / 100f
+        workspaceScale = scale
+        val scaledWidth = (widthPx * scale).roundToInt()
+        val scaledHeight = (heightPx * scale).roundToInt()
+        val monitorWidthPx = if (swapAxes) scaledHeight else scaledWidth
+        val monitorHeightPx = if (swapAxes) scaledWidth else scaledHeight
         requestedMonitorWidth = monitorWidthPx
         requestedMonitorHeight = monitorHeightPx
         // The moment these stop being preferences and become what the daemon is
@@ -794,8 +823,13 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             // 9), so leaving them alone here would silently miscalibrate every
             // gesture on both axes -- an easy one to miss, because nothing
             // about the picture would look wrong.
-            val xdpi = (resources.displayMetrics.xdpi * 1000).roundToInt()
-            val ydpi = (resources.displayMetrics.ydpi * 1000).roundToInt()
+            // Scaled with the workspace: these are dots per inch measured in
+            // *monitor* pixels, and a smaller desktop spreads fewer of them
+            // over the same glass. The daemon turns pixel deltas into
+            // millimetres with these for its touchpad thresholds (Milestone 9),
+            // so an unscaled value would misjudge every gesture.
+            val xdpi = (resources.displayMetrics.xdpi * scale * 1000).roundToInt()
+            val ydpi = (resources.displayMetrics.ydpi * scale * 1000).roundToInt()
             writeInt(if (swapAxes) ydpi else xdpi)
             writeInt(if (swapAxes) xdpi else ydpi)
         }

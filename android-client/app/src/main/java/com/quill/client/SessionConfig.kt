@@ -32,6 +32,7 @@ object SessionConfig {
         val clientSideCursor: Boolean,
         val ctrlScrollZoom: Boolean,
         val rotationDegrees: Int,
+        val workspaceScalePercent: Int,
         val widthPx: Int,
         val heightPx: Int,
     )
@@ -41,6 +42,7 @@ object SessionConfig {
             clientSideCursor = settings.clientSideCursor,
             ctrlScrollZoom = settings.ctrlScrollZoom,
             rotationDegrees = settings.rotationDegrees,
+            workspaceScalePercent = settings.workspaceScalePercent,
             widthPx = widthPx,
             heightPx = heightPx,
         )
