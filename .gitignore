@@ -31,3 +31,8 @@ PUBLISHING-TODO.md
 *.jks
 *.keystore
 *.p12
+
+# Claude Code's local state: session checkpoints, machine-local permissions, and
+# working rules that reference paths on this machine. Untracked but not ignored
+# meant a `git add -A` would have swept it in.
+.claude/
