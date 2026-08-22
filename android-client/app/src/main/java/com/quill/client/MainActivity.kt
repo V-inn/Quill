@@ -127,7 +127,6 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         cursorOverlay = CursorOverlay(this)
         gearButton = GearButton(this)
         val gearSize = (GEAR_SIZE_DP * resources.displayMetrics.density).toInt()
-        val gearMargin = (GEAR_MARGIN_DP * resources.displayMetrics.density).toInt()
         val root = FrameLayout(this).apply {
             addView(surfaceView, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
             // Above the video, below the status text.
@@ -138,14 +137,17 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             )
             // Topmost, so it gets first crack at touch/hover dispatch and can
             // consume its own taps before the SurfaceView's forwarder (which
-            // hit-tests nothing) turns them into desktop clicks. Inset from the
-            // very top edge so the immersive-mode swipe that brings the system
-            // bars back still has somewhere to start.
+            // hit-tests nothing) turns them into desktop clicks.
+            //
+            // Laid out at the origin with no margins on purpose: GearButton
+            // owns its own position now (it is draggable and remembers where it
+            // was parked), and drives it entirely through translation so a drag
+            // costs no layout pass over the live video surface. The insets it
+            // keeps from each edge live there too -- see its class doc for why
+            // the top and bottom ones are bigger.
             addView(
                 gearButton,
-                FrameLayout.LayoutParams(gearSize, gearSize, android.view.Gravity.TOP or android.view.Gravity.END).apply {
-                    setMargins(0, gearMargin, gearMargin, 0)
-                }
+                FrameLayout.LayoutParams(gearSize, gearSize, android.view.Gravity.TOP or android.view.Gravity.START)
             )
         }
         setContentView(root)
@@ -1351,6 +1353,5 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
         /** Touch target; the drawn gear is 60% of this (see [GearButton]). */
         private const val GEAR_SIZE_DP = 48f
-        private const val GEAR_MARGIN_DP = 12f
     }
 }

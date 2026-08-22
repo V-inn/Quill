@@ -91,6 +91,24 @@ class Settings(context: Context) {
         get() = prefs.getBoolean(KEY_FLIP_180, false)
         set(value) = prefs.edit().putBoolean(KEY_FLIP_180, value).apply()
 
+    /**
+     * Which screen edge the settings gear is parked against, as a
+     * [GearEdge] ordinal.
+     *
+     * Stored as an edge plus a fraction along it rather than as absolute
+     * pixels, so the position survives a physical rotation, split-screen, and a
+     * different device -- all of which would put a saved pixel coordinate
+     * somewhere meaningless or off-screen entirely.
+     */
+    var gearEdge: Int
+        get() = prefs.getInt(KEY_GEAR_EDGE, GearEdge.RIGHT.ordinal)
+        set(value) = prefs.edit().putInt(KEY_GEAR_EDGE, value).apply()
+
+    /** How far along [gearEdge] the gear sits, 0..1. */
+    var gearFraction: Float
+        get() = prefs.getFloat(KEY_GEAR_FRACTION, DEFAULT_GEAR_FRACTION)
+        set(value) = prefs.edit().putFloat(KEY_GEAR_FRACTION, value.coerceIn(0f, 1f)).apply()
+
     /** Packed into the handshake's `config_flags` byte. */
     fun configFlags(): Int {
         var flags = 0
@@ -104,6 +122,12 @@ class Settings(context: Context) {
         private const val KEY_CLIENT_SIDE_CURSOR = "client_side_cursor"
         private const val KEY_LATENCY_OVERLAY = "latency_overlay"
         private const val KEY_KEEP_SCREEN_AWAKE = "keep_screen_awake"
+        private const val KEY_GEAR_EDGE = "gear_edge"
+        private const val KEY_GEAR_FRACTION = "gear_fraction"
+
+        /** Near the top of the right edge -- roughly where the gear has always
+         * been, so nothing moves for someone who never drags it. */
+        private const val DEFAULT_GEAR_FRACTION = 0.06f
         private const val KEY_CTRL_SCROLL_ZOOM = "ctrl_scroll_zoom"
         private const val KEY_FLIP_180 = "flip_180"
 
