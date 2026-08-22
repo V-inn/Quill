@@ -2969,3 +2969,121 @@ to the app, present after the first frame and absent before it.
   written; neither has been exercised with a keyboard or with
   `animator_duration_scale 0`.
 - **Anything GNOME.** Milestone 10's caveat still stands.
+
+## 28. targetSdk 36: a toolchain generation, and the orientation lock going away
+
+Play's rolling policy rejects a new app more than a year behind the current
+release. Latest stable is API 37, so 36 is the minimum and buys a year. The
+change is two separate pieces of work that were deliberately kept apart, because
+run together a Compose rendering regression and an Android 16 behaviour change
+would have been indistinguishable.
+
+### Stage 1: the toolchain, with targetSdk still 34
+
+`targetSdk = 36` needs `compileSdk = 36`, and that needs a whole generation:
+
+    Gradle   8.9    -> 8.13      AGP 8.11's documented minimum
+    AGP      8.5.2  -> 8.11.1    AGP 8.9's max API is 35; 8.10 is the first at 36
+    Kotlin   1.9.24 -> 2.2.20    KGP 2.2.20 caps at AGP 8.11.1
+    Compose  BOM 2024.06.00 -> 2025.06.01   (1.8.3)
+
+Kotlin 2.1.x was never a candidate: its table caps at AGP 8.7.2, below anything
+that can compile against 36. Build-tools is **35.0.0**, not 36.0.0 — AGP 8.11's
+default and minimum, and the project sets no `buildToolsVersion`.
+
+The two comments this deleted were both correct and both described constraints
+that no longer exist: `kotlinCompilerExtensionVersion` is gone entirely (from
+Kotlin 2.0 the Compose compiler is a Gradle plugin pinned to the Kotlin
+version), and the BOM's pin at 2024.06.00 existed precisely because 2024.09+
+wanted the Kotlin 2.0 compiler.
+
+Undocumented and worth knowing: there is **no published minimum Compose runtime
+for a given Compose compiler**. A mismatch is not a build error; it throws
+`IncompatibleComposeRuntimeVersionException` at runtime. Pinning the BOM to the
+generation contemporaneous with the compiler is a mitigation, not a proof.
+
+Verified on the tablet with the **release** build, which is the one that matters
+— minified with no `proguard-rules.pro` at all, so this was a new R8 and a new
+Compose generation at once. Nothing regressed: handshake geometry and `encoder
+ready` identical, `latency avg=22ms`, the settings screen pixel-for-pixel what
+Compose 1.7 drew, `SettingsDraft`'s staged-vs-live diff correct in both
+directions, back out of settings fine, gear isolation still 0px. The signing
+certificate is unchanged, and all four fonts survive shrinking — under
+`optimizeReleaseResources`' shortened names (`res/8n.ttf`), not `res/font/`,
+which is worth knowing before concluding they were dropped.
+
+### Stage 2: the lock does not hold any more
+
+For apps targeting 36, Android 16 ignores `screenOrientation`, resizability,
+aspect-ratio restrictions **and `setRequestedOrientation()`** on any display
+whose smallest width is at least 600dp. This tablet is 2560x1600 at density 340
+— sw753dp.
+
+Measured, with a controlled A/B on one APK: launched locked to portrait, forced
+the display to landscape, and the activity followed, `port` 1600x2560 to `land`
+2560x1600. With `am compat disable 357141415` (`UNIVERSAL_RESIZABLE_BY_DEFAULT`,
+`enableSinceTargetSdk=36`) the same procedure held the lock. So the change is
+certainly the mechanism.
+
+**The documented opt-out does not work on this device.** This is the dead end
+worth recording. `PROPERTY_COMPAT_ALLOW_RESTRICTED_RESIZABILITY` was added
+activity-scoped, `value=true`, and confirmed present on the right element with
+`aapt2 dump xmltree` — and the lock still broke. It is kept, because it costs
+nothing and should work where the platform honours it, but nothing depends on
+it. It is removed entirely at API 37 regardless, and a user-set per-app override
+in device settings defeats it even now.
+
+### Nothing crashed, which was the problem
+
+`configChanges` keeps the activity alive across the resize, and
+`surfaceChanged` was an empty method. So the decode loop kept feeding frames of
+the old shape into a surface of the new one — a wrong-shaped picture, and every
+touch mapped through that surface landing somewhere it was not aimed. The
+handshake geometry is sent once at connect and the daemon sizes its virtual
+monitor and encoder from it, so nothing on either side noticed.
+
+The fix renegotiates by **reconnecting**, not by adding a mid-stream protocol
+message. A reconnect already re-runs `sendHandshake` with fresh geometry
+(`maximumWindowMetrics` is rotation-aware — the activity's `mMaxBounds` follows
+rotation, which is what makes this work at all), already resizes the daemon's
+monitor and encoder, and is exactly what the settings screen means by "takes
+effect the next time the tablet connects". Closing the input stream is also how
+the existing watchdog forces a reconnect, so this reuses an exercised path
+instead of adding a second one. The guard fields are cleared *before* the close:
+one rotation delivers several `surfaceChanged` callbacks, and each would
+otherwise cost its own reconnect.
+
+Verified live, rotating the tablet while streaming:
+
+    app     surface resized to 2560x1600, reconnecting to renegotiate geometry
+    daemon  encoder ready: capture 2560x1600 -> output 2560x1600   (was 1600x2560)
+    app     handshake: asking for 2560x1600px                      (was 1600x2560)
+    app     queued=30 rendered=30
+
+About three seconds, ending in a correctly sized desktop filling the panel.
+Latency after settling `avg=23ms`, round-trip 0ms.
+
+### Two traps that cost time here
+
+- **`adb` cannot command rotation while this app holds the foreground.**
+  `settings put system user_rotation` is simply ignored; the display stays put,
+  including for the launcher behind it. The reproduction has to background the
+  app, set the rotation, then bring the app up. A physical turn of the tablet
+  did not move it either while the app was in front.
+- **XML comments cannot contain `--`.** This project's prose style uses it as a
+  dash everywhere, and carrying that into `AndroidManifest.xml` fails the build
+  with `ManifestMerger2$MergeFailureException: Error parsing`, which names no
+  line and says nothing about hyphens.
+
+### Not verified
+
+- **One device, one direction.** Portrait to landscape, under a forced rotation,
+  on a Tab S9 FE+ running One UI on Android 16.
+- **Multi-window and free-form resize**, which target 36 also enables, have not
+  been tried at all. The same `surfaceChanged` path should cover them, and that
+  is a should.
+- **Whether the opt-out property works anywhere else.** It failed here; no
+  stock-Android device was available to compare.
+- **The release variant of the resize fix beyond this one session.** It was
+  built, installed and exercised, but R8 8.11 has now seen this code for about
+  an hour.
