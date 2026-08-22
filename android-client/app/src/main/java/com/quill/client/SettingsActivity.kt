@@ -125,8 +125,14 @@ class SettingsActivity : ComponentActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        // The captured frame exists for this screen and nothing else.
-        FramePreview.clear()
+        // The captured frame exists for this screen and nothing else -- but
+        // `onDestroy` also runs when this activity is merely being *recreated*,
+        // which is what a physical rotation does, since unlike MainActivity
+        // this one is free to turn. Recycling the bitmap there left the
+        // rebuilt screen with no picture until the next trip through the gear.
+        // `isFinishing` is exactly the distinction between going away and
+        // coming straight back.
+        if (isFinishing) FramePreview.clear()
     }
 
     /** Same edge-to-edge immersive treatment `MainActivity` uses.
