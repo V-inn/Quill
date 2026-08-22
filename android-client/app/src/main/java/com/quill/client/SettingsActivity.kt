@@ -98,6 +98,9 @@ class SettingsActivity : ComponentActivity() {
                     flip180Staged = session != null && flip180 != session.flip180,
 
                     sessionLive = session != null,
+                    previewFrame = FramePreview.peek(),
+                    panelAspect = FramePreview.panelAspect(),
+                    sessionFlip180 = session?.flip180 ?: flip180,
                     connectionLabel = session
                         ?.let { "${it.widthPx} × ${it.heightPx}" }
                         ?: "Not connected",

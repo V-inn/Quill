@@ -166,9 +166,8 @@ private fun SinglePane(state: SettingsScreenState) {
 }
 
 /**
- * The display half. For now this is the 180-degree flip as a switch, exactly as
- * before -- the slab that replaces it lands in its own change, once the frame
- * capture it draws inside is proven on hardware.
+ * The display half: the slab, which replaced a switch labelled "Rotate the image
+ * 180°". See [SlabControl] for why a picture can say what that label could not.
  */
 @Composable
 private fun DisplaySection(state: SettingsScreenState) {
@@ -176,14 +175,14 @@ private fun DisplaySection(state: SettingsScreenState) {
         eyebrow = "Display",
         note = "Takes effect the next time the tablet connects.",
     ) {
-        SwitchRow(
-            label = "Rotate the image 180°",
-            checked = state.flip180,
-            onCheckedChange = state.onFlip180,
+        SlabControl(
+            frame = state.previewFrame,
+            panelAspect = state.panelAspect,
+            flip180 = state.flip180,
+            sessionFlip180 = state.sessionFlip180,
+            sessionLive = state.sessionLive,
+            onFlip180 = state.onFlip180,
             staged = state.flip180Staged,
-            note = "Which way up the desktop belongs depends on which end of the " +
-                "tablet the cable enters, and only you can see that. Touch and pen " +
-                "coordinates rotate with the image, so they keep lining up either way.",
         )
     }
 }

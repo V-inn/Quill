@@ -30,6 +30,17 @@ data class SettingsScreenState(
     /** `2560 × 1600`, or why there is no picture. */
     val connectionLabel: String = "Not connected",
 
+    /** Last frame of the real desktop, for the slab. Null before the first
+     * connection, or when the capture did not land in time. */
+    val previewFrame: android.graphics.Bitmap? = null,
+
+    /** Panel width / height, for drawing the slab at the true shape. */
+    val panelAspect: Float = 1.6f,
+
+    /** What the *running* session's flip is, which is what decides whether the
+     * captured pixels are already upside down. */
+    val sessionFlip180: Boolean = false,
+
     val onClientSideCursor: (Boolean) -> Unit,
     val onCtrlScrollZoom: (Boolean) -> Unit,
     val onFlip180: (Boolean) -> Unit,

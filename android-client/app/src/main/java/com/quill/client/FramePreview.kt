@@ -69,6 +69,13 @@ object FramePreview {
         panelHeightPx = height
     }
 
+    /** Panel width / height, or a sane landscape default before any handshake. */
+    fun panelAspect(): Float {
+        val w = panelWidthPx
+        val h = panelHeightPx
+        return if (w > 0 && h > 0) w.toFloat() / h.toFloat() else 1.6f
+    }
+
     /** The last captured frame, or null. The caller does **not** own it. */
     fun peek(): Bitmap? = frame?.takeIf { !it.isRecycled }
 
