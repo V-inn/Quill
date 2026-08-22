@@ -1,6 +1,9 @@
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
+    // Versioned in the root build file, where it sits next to the Kotlin
+    // version it has to match exactly.
+    id("org.jetbrains.kotlin.plugin.compose")
 }
 
 // Release signing, read from ~/.gradle/gradle.properties rather than from
@@ -21,7 +24,7 @@ val canSignRelease = listOf(
 
 android {
     namespace = "com.quill.client"
-    compileSdk = 34
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.quill.client"
@@ -63,25 +66,24 @@ android {
         // MainActivity's connection loop.
         buildConfig = true
     }
-    composeOptions {
-        // Bound to Kotlin 1.9.24 exactly (see the root build.gradle.kts). They
-        // are a matched pair; the build fails at configure time if they drift,
-        // which is the failure mode you want. Do not bump Kotlin without
-        // bumping this, and do not bump either as a side effect of some other
-        // change.
-        kotlinCompilerExtensionVersion = "1.5.14"
-    }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-    kotlinOptions {
-        jvmTarget = "17"
+}
+
+// Was `android { kotlinOptions { jvmTarget = "17" } }`, which Kotlin 2.2
+// deprecates and 2.3 removes. Must stay 17 to match compileOptions above, or
+// AGP fails the build on inconsistent JVM-target compatibility -- the JDK doing
+// the building (21 here) is a separate thing from the bytecode level produced.
+kotlin {
+    compilerOptions {
+        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
     }
 }
 
 dependencies {
-    implementation("androidx.core:core-ktx:1.13.1")
+    implementation("androidx.core:core-ktx:1.16.0")
 
     // Compose, for the settings screen only -- MainActivity, GearButton and
     // CursorOverlay stay plain Views and never load a Compose class, so the
@@ -94,16 +96,20 @@ dependencies {
     // have been fought at every control. See ui/QuillTheme.kt for the handful
     // of things built in its place.
     //
-    // BOM pinned at 2024.06.00: Compose 1.7.x (BOM 2024.09+) expects the
-    // Kotlin 2.0 compiler, and this project is on 1.9.24.
-    val composeBom = platform("androidx.compose:compose-bom:2024.06.00")
+    // 2025.06.01 is Compose 1.8.3, the runtime generation contemporaneous with
+    // the Kotlin 2.2 compiler above. That pairing is the reason for the pin:
+    // there is no published minimum runtime version for a given Compose
+    // compiler, and a mismatch does not fail the build -- it throws
+    // IncompatibleComposeRuntimeVersionException at runtime, on the one screen
+    // that uses Compose. Move the BOM and the Kotlin version together.
+    val composeBom = platform("androidx.compose:compose-bom:2025.06.01")
     implementation(composeBom)
     implementation("androidx.compose.runtime:runtime")
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-graphics")
     implementation("androidx.compose.foundation:foundation")
     implementation("androidx.compose.animation:animation")
-    implementation("androidx.activity:activity-compose:1.9.0")
+    implementation("androidx.activity:activity-compose:1.10.1")
     debugImplementation("androidx.compose.ui:ui-tooling")
 
     // androidx.appcompat was declared but never imported -- the only androidx
