@@ -77,6 +77,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     private lateinit var cursorOverlay: CursorOverlay
 
+    private lateinit var latencyOverlay: LatencyOverlay
+
     /** The one settings entry point that survives streaming -- see [GearButton]. */
     private lateinit var gearButton: GearButton
 
@@ -125,12 +127,18 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         // from settings recreates the *surface*, not this activity, so an
         // onCreate-only read went stale the moment anyone changed the setting.
         cursorOverlay = CursorOverlay(this)
+        latencyOverlay = LatencyOverlay(this)
         gearButton = GearButton(this)
         val gearSize = (GEAR_SIZE_DP * resources.displayMetrics.density).toInt()
         val root = FrameLayout(this).apply {
             addView(surfaceView, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
             // Above the video, below the status text.
             addView(cursorOverlay, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+            // Above the pointer so it stays readable, below the status text so
+            // a "replug the cable" message is never hidden by a diagnostic, and
+            // below the gear so nothing can shadow its touch target. Unlike the
+            // gear it must not consume input -- see LatencyOverlay's class doc.
+            addView(latencyOverlay, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
             addView(
                 statusText,
                 FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, android.view.Gravity.CENTER)
@@ -194,8 +202,17 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private fun applyLocalSettings() {
         val settings = Settings(this)
         cursorOverlay.setFlip180(settings.flip180)
+        showLatency = settings.showLatencyOverlay
+        latencyOverlay.visibility =
+            if (showLatency) android.view.View.VISIBLE else android.view.View.GONE
         setScreenAwake(rendering)
     }
+
+    /** Mirrors `Settings.showLatencyOverlay` so the render thread can skip the
+     * per-frame handoff with a single field read rather than touching
+     * SharedPreferences or the view. */
+    @Volatile
+    private var showLatency = false
 
     override fun onResume() {
         super.onResume()
@@ -915,6 +932,9 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         val offset = ((androidRecvMs - daemonSendMs) - (daemonRecvMs - androidSendEchoMs)) / 2
         val roundTripSum = (daemonRecvMs - androidSendEchoMs) + (androidRecvMs - daemonSendMs)
         Log.i(tag, "clock-sync: offset=${offset}ms (android-daemon), round-trip sum=${roundTripSum}ms")
+        // The overlay needs this to know whether to trust its own numbers; see
+        // LatencyOverlay.syncRoundTripMs.
+        if (::latencyOverlay.isInitialized) latencyOverlay.setClockSync(roundTripSum)
         return offset
     }
 
@@ -1215,8 +1235,21 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                                 if (latencyMs > latencyMaxMs) latencyMaxMs = latencyMs
                                 latencySampleCount++
                             }
+                            if (showLatency) {
+                                val avg = if (latencySampleCount > 0) latencySumMs / latencySampleCount else 0
+                                latencyOverlay.submit(
+                                    latencyMs,
+                                    avg,
+                                    if (latencySampleCount > 0) latencyMinMs else 0,
+                                    if (latencySampleCount > 0) latencyMaxMs else 0,
+                                    pendingSentTimesMs.size,
+                                )
+                            }
                             if (renderedCount == 1L || renderedCount % 30 == 0L) {
                                 val avg = if (latencySampleCount > 0) latencySumMs / latencySampleCount else 0
+                                // The log stays: logcat is how every latency
+                                // question in MILESTONES was actually answered,
+                                // and the overlay is a readout, not a replacement.
                                 Log.i(
                                     tag,
                                     "queued=${queuedCount.get()} rendered=$renderedCount, " +
