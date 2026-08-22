@@ -58,6 +58,10 @@ android {
 
     buildFeatures {
         compose = true
+        // For BuildConfig.DEBUG: the adb-forward transport is a development
+        // path and must not be reachable in a release build. See
+        // MainActivity's connection loop.
+        buildConfig = true
     }
     composeOptions {
         // Bound to Kotlin 1.9.24 exactly (see the root build.gradle.kts). They

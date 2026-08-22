@@ -321,12 +321,16 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
      * USB_ACCESSORY_ATTACHED intent in that case since the USB device
      * itself never actually detached, so check whether one's already
      * attached and permission already granted (from the original attach
-     * event) instead of silently falling back to the adb-forward path. */
+     * event) rather than treating it as absent. */
     private fun alreadyAttachedAccessory(): UsbAccessory? {
         val usbManager = getSystemService(USB_SERVICE) as UsbManager
         val accessory = usbManager.accessoryList?.firstOrNull() ?: return null
         if (!usbManager.hasPermission(accessory)) {
-            Log.w(tag, "accessory attached but no permission -- falling back to adb-forward")
+            // Happens after a reinstall: the grant rides the ATTACHED intent,
+            // and replacing the package drops it. Debug builds fall back to the
+            // adb-forward transport; release builds have no fallback and simply
+            // wait for a replug, which the status overlay already asks for.
+            Log.w(tag, "accessory attached but no permission -- a replug re-grants it")
             return null
         }
         return accessory
@@ -396,9 +400,18 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                     val accessory = alreadyAttachedAccessory() ?: usbAccessory
                     if (accessory != null) {
                         runAoaDecodeLoop(holder, accessory)
-                    } else {
+                    } else if (BuildConfig.DEBUG) {
+                        // Development only. The adb-forward transport listens on
+                        // a TCP socket, so it needs INTERNET -- a permission
+                        // release builds deliberately do not ask for. Reaching
+                        // this in a release build threw SecurityException from
+                        // ServerSocket.bind on every retry, turning "no daemon
+                        // yet" into a crash loop behind the waiting screen.
                         runAdbForwardDecodeLoop(holder)
                     }
+                    // Release with no accessory: nothing to do but wait for one.
+                    // The loop below already sleeps and retries, and the status
+                    // overlay is already saying so.
                 } catch (e: Exception) {
                     // Belt-and-suspenders: runDecodeLoop already catches
                     // its own errors, but openAccessory() itself and
