@@ -3075,8 +3075,54 @@ Latency after settling `avg=23ms`, round-trip 0ms.
   with `ManifestMerger2$MergeFailureException: Error parsing`, which names no
   line and says nothing about hyphens.
 
+### The first fix was wrong, and the rotation setting caught it
+
+Renegotiating on *every* surface shape change broke the rotation setting from
+Milestone 24, which the user spotted immediately. That setting is defined
+relative to the panel: at 90 the handshake asks for the panel transposed, so a
+landscape tablet drives a portrait desktop. Re-reading the panel after a turn
+applies that swap to an already-swapped panel — they compound, and the desktop
+arrives sideways.
+
+The session now **pins** the panel geometry captured at `onCreate` and never
+re-reads it on a turn, so the setting keeps meaning what the user picked and
+turning the tablet leaves the stream alone — the same promise the orientation
+lock used to make. `surfaceChanged` compares the surface against that pinned
+pair *unordered*, since a quarter turn is the same two numbers reversed.
+`onResume` re-captures, so returning from settings is the explicit re-base.
+
+The multi-window branch was narrowed to nothing useful on purpose:
+`maximumWindowMetrics` reports the display maximum and **does not shrink for a
+multi-window window**, so a reconnect there would ask for exactly what it asked
+for last time while every drag of the split divider paid for it.
+
+### Split-screen does not work, and the reason is one line
+
+`send` (`MainActivity.kt:613`) passes **view-local pixels** scaled only by
+`workspaceScale`, against uinput axes the daemon declares over the whole
+*panel*. That identity holds only while the app is fullscreen. In split view the
+view is half as wide, so the whole desktop folds into half of itself. Supporting
+it means moving both the monitor request and the input mapping onto
+`currentWindowMetrics` — a feature, and not attempted here.
+
+### A pre-existing sharp edge this made easier to hit
+
+Applying a rotation while a daemon is already running can leave that daemon on
+its old pipeline. The app reads the unrotated video format, concludes the daemon
+is too old, and **writes `rotationDegrees = 0`** — silently discarding the
+user's setting over what can be a transient mismatch
+(`checkDaemonUnderstoodRotation`). Verified that a *fresh* daemon handles the
+same request correctly: `(re)creating Virtual-QuillDisplay at 1600x2560`,
+`encoder ready: capture 1600x2560 -> output 2560x1600, rotation 90deg`. The
+reset predates this work; adding reconnects only made it easier to reach.
+
 ### Not verified
 
+- **The panel never actually turned in any test.** On this device the window
+  keeps its orientation while the app is in front — a physical turn did not move
+  it, and the only reproduction of the override was an adb-forced rotation
+  against an app launched the other way up. The transpose early-return is
+  therefore reasoned, not exercised by a real transpose.
 - **One device, one direction.** Portrait to landscape, under a forced rotation,
   on a Tab S9 FE+ running One UI on Android 16.
 - **Multi-window and free-form resize**, which target 36 also enables, have not
