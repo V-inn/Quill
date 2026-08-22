@@ -7,7 +7,9 @@
 # SYSTEMD_USER_WANTS reaches into the logged-in graphical session's systemd
 # --user instance from udev's root context -- the standard mechanism for
 # this (used by e.g. game controllers, docks), rather than a fragile
-# su/DISPLAY-guessing shell script. Requires the unit to exist at
-# ~/.config/systemd/user/quill-daemon.service and the user session to
-# already be active (or lingering enabled).
+# su/DISPLAY-guessing shell script. Requires the unit to exist where the user
+# manager looks for it -- ~/.config/systemd/user/quill-daemon.service for a
+# hand install, /usr/lib/systemd/user/quill-daemon.service for a packaged one,
+# with the former overriding the latter -- and the user session to already be
+# active (or lingering enabled).
 ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="04e8", ENV{SYSTEMD_USER_WANTS}+="quill-daemon.service", TAG+="systemd"
