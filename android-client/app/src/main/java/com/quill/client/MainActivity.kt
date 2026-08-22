@@ -106,19 +106,34 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     @Volatile
     private var requestedMonitorHeight = 0
 
-    /** The live connection's input stream, and the surface size that was true
-     * when its handshake went out. Together they let [surfaceChanged] notice
-     * that the geometry the daemon is producing for no longer matches the
-     * surface it is being drawn into, and force a renegotiation.
-     *
-     * Both are null/zero whenever no handshake is in force, which is what makes
-     * [surfaceChanged] a no-op during startup and teardown. */
+    /** The live connection's input stream, so [surfaceChanged] can drop it and
+     * let the retry loop renegotiate. Null whenever no handshake is in force,
+     * which is what makes [surfaceChanged] a no-op during startup and
+     * teardown. */
     @Volatile
     private var activeInput: BufferedAccessoryInput? = null
+
+    /**
+     * The panel geometry this session negotiates against, captured once at
+     * [onCreate] and deliberately *not* re-read when the panel rotates.
+     *
+     * This is what keeps the rotation setting meaning what it has always
+     * meant. A quarter turn in settings is defined relative to the panel (see
+     * [Settings.rotationDegrees]): at 90 the handshake asks for the panel's
+     * dimensions transposed, so a landscape tablet drives a portrait desktop.
+     * Re-reading the panel after a physical rotation would apply that swap to
+     * an already-swapped panel, and the two compound -- the desktop arrives
+     * sideways and the setting the user picked stops describing what they see.
+     *
+     * So the session keeps the shape it started with. Turning the tablet no
+     * longer changes what the daemon is asked for, which is the same promise
+     * Milestone 15's orientation lock used to make before Android 16 took the
+     * lock away.
+     */
     @Volatile
-    private var connectedSurfaceW = 0
+    private var panelWidthPx = 0
     @Volatile
-    private var connectedSurfaceH = 0
+    private var panelHeightPx = 0
 
     // Milestone 8: set from the launching intent (or a later
     // USB_ACCESSORY_ATTACHED broadcast) when the daemon has switched the
@@ -140,6 +155,12 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         } else {
             ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
         }
+        // The lock above is no longer enough on its own. For apps targeting API
+        // 36 Android 16 ignores it on any display at least 600dp wide, and this
+        // tablet is sw753dp -- so the panel really can turn under a running
+        // session now. Capturing the geometry here, once, is what stops that
+        // turn from redefining the rotation setting: see [panelWidthPx].
+        capturePanelGeometry()
         usbAccessory = accessoryFromIntent(intent) ?: alreadyAttachedAccessory()
         hideSystemBars()
         surfaceView = SurfaceView(this)
@@ -244,6 +265,17 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     override fun onResume() {
         super.onResume()
         applyLocalSettings()
+        // Re-base the session's panel geometry here, and only here.
+        //
+        // Rotation is never adopted silently (see [surfaceChanged]), which
+        // keeps the rotation setting meaning what the user picked -- but on its
+        // own that would leave someone who turned the tablet mid-session stuck
+        // with the old shape until they killed the app. Coming back from the
+        // settings screen is the explicit "make it right" moment the UI already
+        // offers, and it reconnects anyway, so adopting the current panel here
+        // gives that gesture a use without ever surprising a session that is
+        // just streaming.
+        capturePanelGeometry()
         // Belt and braces with SettingsActivity.onDestroy: whichever runs,
         // the captured frame does not outlive the screen that displayed it.
         FramePreview.clear()
@@ -448,47 +480,75 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     }
 
     /**
-     * Renegotiates the stream when the surface changes shape under it.
+     * Handles the surface changing shape under a running session.
      *
      * This was an empty method for as long as the activity could rely on the
      * orientation lock it sets in [onCreate] holding for the whole session
      * (Milestone 15). Android 16 ends that: for apps targeting API 36, a
-     * display whose smallest width is at least 600dp ignores
-     * screenOrientation, resizability and setRequestedOrientation entirely,
-     * and this tablet is sw753dp. Measured, not assumed -- with targetSdk 36
-     * the activity launched locked to portrait and then followed the display
-     * into landscape anyway. The documented opt-out property does not work
-     * here; see the manifest.
+     * display whose smallest width is at least 600dp ignores screenOrientation,
+     * resizability and setRequestedOrientation entirely, and this tablet is
+     * sw753dp. Measured, not assumed. The documented opt-out property does not
+     * work here either; see the manifest.
      *
-     * Without this, nothing crashed, which is the problem. `configChanges`
-     * keeps the activity from being recreated, so the decode loop simply kept
-     * feeding frames of the old shape into a surface of the new one: a
-     * wrong-shaped picture, and every touch mapped through that surface
-     * landing somewhere it was not aimed.
+     * A physical turn is deliberately *not* renegotiated. The rotation setting
+     * is defined relative to the panel, so re-handshaking against a turned
+     * panel applies the setting's swap on top of a panel that has already
+     * swapped: the two compound and the desktop arrives sideways. The session
+     * therefore keeps the geometry it captured at [onCreate] -- see
+     * [panelWidthPx] -- and turning the tablet leaves the stream alone, which
+     * is the promise the orientation lock used to make.
+     *
+     * What is left to detect is a *real* resize, where the window genuinely has
+     * a different amount of room rather than the same room turned on its side:
+     * multi-window and freeform, which targeting 36 also enables. There the
+     * captured geometry is stale in a way rotation never makes it, so it is
+     * re-captured and the connection dropped to renegotiate.
      *
      * The renegotiation is a reconnect, deliberately, rather than a new
-     * mid-stream protocol message. A reconnect already re-runs [sendHandshake]
-     * with fresh geometry, already re-sizes the daemon's virtual monitor and
-     * encoder, and is the same thing the settings screen does when it says a
-     * change takes effect the next time the tablet connects. Closing the input
-     * is also exactly how the watchdog forces a reconnect, so this reuses a
-     * path that is already exercised rather than adding a second one.
+     * mid-stream protocol message: a reconnect already re-runs [sendHandshake],
+     * already resizes the daemon's virtual monitor and encoder, and is the same
+     * thing the settings screen means when it says a change takes effect the
+     * next time the tablet connects. Closing the input is also exactly how the
+     * watchdog forces a reconnect, so this reuses a path already exercised.
      */
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, w: Int, h: Int) {
         val input = activeInput ?: return
-        // Startup: the first surfaceChanged arrives before any handshake.
-        if (connectedSurfaceW == 0 || connectedSurfaceH == 0) return
-        if (w == connectedSurfaceW && h == connectedSurfaceH) return
+        if (panelWidthPx == 0 || panelHeightPx == 0) return
 
-        // Cleared before closing, not after: a rotation delivers several
-        // surfaceChanged callbacks, and without this each one would close a
-        // stream and cost another reconnect.
-        connectedSurfaceW = 0
-        connectedSurfaceH = 0
+        // Compared as an unordered pair: the same panel turned a quarter is the
+        // same two numbers the other way round, and that is precisely the case
+        // that must not renegotiate.
+        val sameArea = (w == panelWidthPx && h == panelHeightPx) ||
+            (w == panelHeightPx && h == panelWidthPx)
+        if (sameArea) return
+
+        // A surface that is not the panel and not the panel turned means the
+        // window no longer owns the whole display: split-screen or freeform.
+        // Re-capturing is useless there and reconnecting would be worse than
+        // useless -- `maximumWindowMetrics` reports the *display* maximum and
+        // does not shrink for a multi-window window, so the next handshake
+        // would ask for exactly what the last one asked for, and every drag of
+        // the split divider would cost a reconnect that changed nothing.
+        //
+        // So only a genuine change in the panel itself is adopted. Input is
+        // already wrong in multi-window for a related reason -- `send` passes
+        // view-local pixels against axes declared over the whole panel -- and
+        // fixing that means moving both the request and the input mapping onto
+        // `currentWindowMetrics`, which is a feature, not this change.
+        val previousW = panelWidthPx
+        val previousH = panelHeightPx
+        capturePanelGeometry()
+        if (panelWidthPx == previousW && panelHeightPx == previousH) {
+            Log.i(tag, "surface is ${w}x$h but the panel is unchanged (multi-window?); leaving the stream alone")
+            return
+        }
+
+        // Cleared before the close, not after: one resize delivers several
+        // surfaceChanged callbacks, and each would otherwise cost a reconnect.
         activeInput = null
 
-        Log.i(tag, "surface resized to ${w}x$h, reconnecting to renegotiate geometry")
-        showStatus("Screen rotated -- reconnecting...")
+        Log.i(tag, "panel changed to ${panelWidthPx}x$panelHeightPx, reconnecting to renegotiate geometry")
+        showStatus("Screen resized -- reconnecting...")
         try {
             input.close()
         } catch (e: Exception) {
@@ -805,6 +865,31 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     @Volatile
     private var pressureMax = 4095 // overwritten from the real stylus MotionRange once known
 
+    /**
+     * Reads the panel's true full size into [panelWidthPx]/[panelHeightPx].
+     *
+     * `resources.displayMetrics` is the legacy "app usable size" API -- it
+     * still excludes the system-bar-reserved region even with edge-to-edge
+     * active (the bars are hidden, but that reserved region isn't reflected
+     * here), which under-reports the real touch surface and made pen/finger
+     * position drift increasingly off target towards the bottom of the screen
+     * (the S Pen digitizer's real range doesn't care about transient nav-bar
+     * visibility). `maximumWindowMetrics` is the modern (API 30+) replacement
+     * that always reports the display's true full size.
+     */
+    private fun capturePanelGeometry() {
+        val bounds = if (android.os.Build.VERSION.SDK_INT >= 30) {
+            windowManager.maximumWindowMetrics.bounds
+        } else {
+            @Suppress("DEPRECATION")
+            val p = android.graphics.Point()
+            windowManager.defaultDisplay.getRealSize(p)
+            android.graphics.Rect(0, 0, p.x, p.y)
+        }
+        panelWidthPx = bounds.width()
+        panelHeightPx = bounds.height()
+    }
+
     private fun sendHandshake(out: DataOutputStream) {
         // Real Display metrics + InputDevice.getMotionRange() -- the design
         // doc's capability handshake, not hardcoded per-device constants.
@@ -818,16 +903,13 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         // real range doesn't care about transient nav-bar visibility).
         // `maximumWindowMetrics` is the modern (API 30+) replacement that
         // always reports the display's true full size.
-        val bounds = if (android.os.Build.VERSION.SDK_INT >= 30) {
-            windowManager.maximumWindowMetrics.bounds
-        } else {
-            @Suppress("DEPRECATION")
-            val p = android.graphics.Point()
-            windowManager.defaultDisplay.getRealSize(p)
-            android.graphics.Rect(0, 0, p.x, p.y)
-        }
-        val widthPx = bounds.width()
-        val heightPx = bounds.height()
+        // Deliberately the session's captured geometry, not a fresh read. See
+        // [panelWidthPx] for why re-reading here would break the rotation
+        // setting. The fresh read is only a fallback for the impossible case of
+        // a handshake before onCreate finished.
+        if (panelWidthPx == 0 || panelHeightPx == 0) capturePanelGeometry()
+        val widthPx = panelWidthPx
+        val heightPx = panelHeightPx
         // The settings screen's preview needs the panel's real geometry for its
         // aspect, and this is where it is already worked out correctly (see the
         // note above on why displayMetrics is not used).
@@ -1276,10 +1358,6 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 // this, not against the display, because the surface is what
                 // the decoded frames are actually drawn into.
                 activeInput = input
-                holder.surfaceFrame.let {
-                    connectedSurfaceW = it.width()
-                    connectedSurfaceH = it.height()
-                }
                 val clockOffsetMs = readClockOffset(input)
                 val (width, height) = readVideoFormat(input)
                 runOnUiThread { cursorOverlay.setVideoSize(width, height) }
@@ -1560,8 +1638,6 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             // for surfaceChanged to renegotiate, and leaving these set would
             // have it close an input stream belonging to the *next* connection.
             activeInput = null
-            connectedSurfaceW = 0
-            connectedSurfaceH = 0
             cursorOverlay.clear()
             watchdogRunning.set(false)
             watchdogThread.interrupt()
