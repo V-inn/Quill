@@ -3133,3 +3133,140 @@ reset predates this work; adding reconnects only made it easier to reach.
 - **The release variant of the resize fix beyond this one session.** It was
   built, installed and exercised, but R8 8.11 has now seen this code for about
   an hour.
+
+---
+
+## 29. The first-run screen, and reading a daemon's silence
+
+Publishing work, driven by `PUBLISHING-TODO.md` §1 and §4. Three things: the
+screen someone sees when they have installed the app and nothing else, a way to
+tell a mismatched daemon apart from an unplugged cable, and the release
+artifacts a store actually takes.
+
+### What the app used to say to a stranger
+
+`Waiting for connection... (attempt 29) / If this doesn't clear in a few
+seconds, unplug and replug the USB cable.`
+
+Every word of that is true and none of it helps. It presumes the reader knows
+there is a daemon, has it installed, and has it running — which describes
+exactly one person. Play's Minimum Functionality policy exists for this shape of
+app, and this screen is what a reviewer would see.
+
+The overlay now picks its text from three facts the app can actually establish
+(`ConnectionStatus.kt`, kept free of Android types so it is testable):
+
+- **Is a USB accessory open?** The daemon is what puts the tablet into AOA
+  accessory mode (`aoa.rs`), so an accessory existing *is* evidence a daemon is
+  on the other end. Telling someone to replug a cable that is plugged in is
+  worse than saying nothing.
+- **Has this install ever streamed?** Persisted as `has_ever_connected` and
+  asserted on the first **rendered frame**, not on a successful handshake — a
+  handshake proves something answered, a frame proves the whole pipeline
+  worked. Never cleared.
+- **Are handshakes going unanswered?** See below.
+
+A first run with nothing on the cable now explains what the Linux half is and
+where to get it. Every other state keeps `(tap here for settings)`, which while
+disconnected is the only way into settings there is.
+
+### A version mismatch cannot be announced
+
+`PUBLISHING-TODO` assumed a general "daemon too old" message could be added
+because the handshake carries a version. It cannot, and the reason is worth
+recording: the version travels **upstream only**. A daemon that has just decided
+it does not understand this client has no idea what bytes that client would
+parse — anything it sent would be a guess, and a wrong guess is how Milestones
+13, 14, 17 and 18 were spent. So it logs the mismatch on its own side
+(`input_receiver.rs`) and says nothing.
+
+Silence is therefore the message. What was wrong was how long the client waited
+to hear it:
+
+- The daemon's clock-sync receive timeout on AOA is **120s**.
+- The client's pre-stream watchdog budget is **180s**, sized for the portal's
+  screen-picker dialog, which needs a human.
+
+So a mismatched pair sat mute for two minutes per attempt while the overlay
+claimed it was still waiting for a connection.
+
+But the picker is not in this window. The daemon replies to the handshake from
+its input thread the instant it reads it, *before* it touches the portal
+(`portal_capture.rs`'s `setup_transport`) — so the first reply, unlike the first
+frame, is never waiting on a person. That splits the watchdog into three phases
+instead of two: **15s** until the handshake is answered, then the 180s startup
+budget until the first frame, then the 15s steady-state one. Two consecutive
+unanswered handshakes switch the overlay to naming the daemon as the problem.
+
+This works against daemons that are already installed, which a new protocol
+message would not — the whole point.
+
+### Release artifacts
+
+- `bundleRelease` produces a signed `.aab` (2.1 MB); `keytool -printcert
+  -jarfile` confirms the expected `f9264e72…9f6f7d`. Play has required bundles
+  for new apps since 2021.
+- `android-client/release-apk.sh <tag>` is the GitHub-release path. It refuses a
+  tag that disagrees with `versionName`, and refuses to upload an APK whose
+  certificate is not the expected fingerprint — an APK signed by anything else
+  is an update nobody can install. It never touches the keystore password;
+  Gradle reads that itself, and the check afterwards reads the certificate off
+  the built APK, which needs no password.
+- The latency overlay **stays** in release builds. It defaults off, needs no
+  permission, and is the only way anyone reporting "it feels laggy" can say
+  something falsifiable. The adb-forward transport is already gone: `strings`
+  over the release `classes.dex` finds no `ServerSocket` and no listener log
+  line, because `BuildConfig.DEBUG` folds to false and R8 drops the branch.
+
+### A claim in PUBLISHING-TODO that was false
+
+§0 said the `.deb`/`.rpm` packaging and its tag workflow were done. Both commits
+(`7d4dee5`, `35829a9`) are on an unmerged local branch, `daemon-packaging`;
+`main` has no `.github/` directory and no `daemon/packaging/build-packages.sh`.
+The work exists, the distribution does not. Corrected in place, with a note to
+check the rest of that file's "done" marks the same way.
+
+### Verified on hardware
+
+The **release** APK, installed on the Tab S9 FE+ (SM-X610, Android 16), not a
+debug build -- so R8 8.11 has seen all of it.
+
+- **The unanswered-handshake path, by accident and then on purpose.** The tablet
+  was still in AOA accessory mode from an earlier session when the daemon was
+  stopped, which is the mismatched-daemon shape exactly: an accessory to open, a
+  handshake to write, and nothing on the other end. `no data for 15000ms,
+  forcing reconnect` / `connection ended with the handshake unanswered (1 in a
+  row)` / `(2 in a row)`, ~16s apart. The old code would have spent 180s per
+  attempt here.
+- **The "not answering" screen**, rendered on the panel on the third attempt,
+  naming the daemon and the URL.
+- **The settings screen under R8.** Opened from the status overlay; Compose,
+  both font families, the switches and the staged-vs-live footer all intact. A
+  minification problem here is the one a debug build cannot show.
+- **Recovery.** Starting the daemon reconnected without touching the app:
+  `clock-sync: offset=2786ms, round-trip sum=1ms`, `video format: 2560x1600`,
+  `latency avg=13ms min=9ms max=25ms`.
+
+One thing worth recording because it looked like a regression and was not: the
+*first* reconnect after eleven unanswered handshakes reported `round-trip
+sum=327749ms` and a 750ms latency. That is Milestone 19's bad calibration, from
+stale queued USB data, and the clean cycle above is what it looks like when the
+link has settled. Checking the round-trip beside the latency is what kept it
+from being reported as a 700ms regression.
+
+### Not verified
+
+- **The first-run explanation has never been seen on the tablet.** Reaching it
+  needs `has_ever_connected` false *and* no accessory attached, i.e. a data wipe
+  plus a replug; it is covered by unit tests and by nothing else.
+- **No genuinely mismatched daemon was built.** The silence was produced by
+  stopping the daemon, which is the same wire behaviour a rejected handshake
+  produces but not the same cause. Building the real thing means building a
+  second protocol version.
+- **`has_ever_connected` migration.** An existing install has the flag unset, so
+  the first launch after updating shows the first-run explanation to someone who
+  is not on their first run. It clears on the next rendered frame. Judged
+  acceptable rather than versioned around; nobody but this project has an
+  existing install.
+- **The `.aab` has never been uploaded anywhere**, so nothing has checked it the
+  way Play would.
