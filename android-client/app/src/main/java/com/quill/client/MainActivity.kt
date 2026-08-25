@@ -106,6 +106,20 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     @Volatile
     private var requestedMonitorHeight = 0
 
+    /**
+     * Consecutive connections that wrote a handshake and never heard anything
+     * back, reset by the first clock-sync reply that does arrive.
+     *
+     * This is the only evidence the app has of a daemon that refuses it. A
+     * version mismatch is diagnosed on the daemon side and logged there (see
+     * `input_receiver.rs`), but nothing is sent back -- and nothing can be,
+     * since a daemon that has just decided it does not understand this client
+     * has no idea what bytes that client would make sense of. Silence is
+     * therefore the message, and counting it is how the tablet reads it.
+     */
+    @Volatile
+    private var silentHandshakes = 0
+
     /** The live connection's input stream, so [surfaceChanged] can drop it and
      * let the retry loop renegotiate. Null whenever no handshake is in force,
      * which is what makes [surfaceChanged] a no-op during startup and
@@ -449,18 +463,32 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             var attempt = 0
             while (running) {
                 attempt++
-                // After the first attempt, be explicit that a stuck
-                // connection needs a cable replug: the daemon has no way
-                // to detect and reset a stale AOA session on its own (see
-                // the class doc above), so silently retrying forever with
-                // no feedback would leave the user staring at a black
-                // screen with no idea what to do.
+                // Read fresh every attempt, and read *before* the status is
+                // chosen: whether an accessory exists is most of what the
+                // overlay has to say, since the daemon is what puts this tablet
+                // into accessory mode in the first place.
+                //
+                // Kept inside its own try: this used to sit under the larger
+                // one below, and `alreadyAttachedAccessory()` throwing is
+                // exactly the case that comment warns about -- an exception
+                // here must not escape the `while`, or the retry loop dies
+                // silently and the app never reconnects again.
+                val accessory = try {
+                    alreadyAttachedAccessory() ?: usbAccessory
+                } catch (e: Exception) {
+                    Log.e(tag, "could not read the USB accessory state", e)
+                    null
+                }
                 showStatus(
-                    if (attempt == 1) "Waiting for connection..."
-                    else "Waiting for connection... (attempt $attempt)\nIf this doesn't clear in a few seconds, unplug and replug the USB cable."
+                    ConnectionStatus.message(
+                        everConnected = Settings(this@MainActivity).hasEverConnected,
+                        accessoryPresent = accessory != null,
+                        attempt = attempt,
+                        silentHandshakes = silentHandshakes,
+                        debugTransport = BuildConfig.DEBUG,
+                    )
                 )
                 try {
-                    val accessory = alreadyAttachedAccessory() ?: usbAccessory
                     if (accessory != null) {
                         runAoaDecodeLoop(holder, accessory)
                     } else if (BuildConfig.DEBUG) {
@@ -1163,7 +1191,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         val sentAtMs = input.readLong()
         val length = input.readInt()
         if (length < 0 || length > 16 * 1024 * 1024) {
-            throw java.io.IOException("bogus payload length \$length for message type \$type")
+            throw java.io.IOException("bogus payload length $length for message type $type")
         }
         return Message(type, sentAtMs, if (length == 0) ByteArray(0) else input.readExact(length))
     }
@@ -1171,7 +1199,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private fun expect(input: BufferedAccessoryInput, type: Int): Message {
         val m = readMessage(input)
         if (m.type != type) {
-            throw java.io.IOException("expected message type \$type, got \${m.type}")
+            throw java.io.IOException("expected message type $type, got ${m.type}")
         }
         return m
     }
@@ -1339,6 +1367,24 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     // timeout + ready timeout + portal renegotiation, ~8-10s worst case).
     private val WATCHDOG_TIMEOUT_MS = 15000L
 
+    /**
+     * How long a written handshake may go unanswered before the connection is
+     * abandoned and retried.
+     *
+     * The daemon replies to the handshake the instant it reads it, from the
+     * input thread, before it touches the portal (see `portal_capture.rs`'s
+     * `setup_transport`) -- so unlike the first *frame*, the first reply is
+     * never waiting on a human or on a screen-picker dialog. Silence here means
+     * the daemon did not accept what it read: a protocol-version mismatch, or a
+     * stale session it could not resync.
+     *
+     * Without this the wait was [WATCHDOG_STARTUP_TIMEOUT_MS], three minutes,
+     * and the daemon's own side of the same standoff is 120s (its clock-sync
+     * receive timeout) -- so a mismatched pair sat mute for two minutes per
+     * attempt with the overlay claiming it was still "waiting for connection".
+     */
+    private val HANDSHAKE_REPLY_TIMEOUT_MS = 15000L
+
     // Before the first frame arrives, the daemon may legitimately be blocked on
     // a human: the portal's screen-picker dialog appears whenever the saved
     // restore token is missing or rejected, and someone has to walk over and
@@ -1360,10 +1406,17 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         // Flips once real video starts, switching the watchdog from its
         // human-in-the-loop startup budget to the steady-state one.
         val streaming = java.util.concurrent.atomic.AtomicBoolean(false)
+        // Flips when the clock-sync reply lands, which is the first proof the
+        // daemon accepted the handshake at all. Until then the generous startup
+        // budget does not apply -- see [HANDSHAKE_REPLY_TIMEOUT_MS].
+        val handshakeAnswered = java.util.concurrent.atomic.AtomicBoolean(false)
         val watchdogThread = Thread {
             while (watchdogRunning.get()) {
-                val budget =
-                    if (streaming.get()) WATCHDOG_TIMEOUT_MS else WATCHDOG_STARTUP_TIMEOUT_MS
+                val budget = when {
+                    streaming.get() -> WATCHDOG_TIMEOUT_MS
+                    !handshakeAnswered.get() -> HANDSHAKE_REPLY_TIMEOUT_MS
+                    else -> WATCHDOG_STARTUP_TIMEOUT_MS
+                }
                 if (System.currentTimeMillis() - lastDataAtMs.get() > budget) {
                     Log.w(tag, "no data for ${budget}ms, forcing reconnect")
                     input.close()
@@ -1386,6 +1439,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 // the decoded frames are actually drawn into.
                 activeInput = input
                 val clockOffsetMs = readClockOffset(input)
+                // The daemon accepted the handshake: stop holding it to the
+                // short reply budget, and forget any earlier silence.
+                handshakeAnswered.set(true)
+                silentHandshakes = 0
                 val (width, height) = readVideoFormat(input)
                 runOnUiThread { cursorOverlay.setVideoSize(width, height) }
                 lastDataAtMs.set(System.currentTimeMillis())
@@ -1547,7 +1604,16 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
                             codec!!.releaseOutputBuffer(pendingRenderIndex, true)
                             renderedCount++
-                            if (renderedCount == 1L) hideStatus()
+                            if (renderedCount == 1L) {
+                                hideStatus()
+                                // A desktop is on the panel, so the Linux half
+                                // demonstrably exists on this machine and the
+                                // first-run explanation should never appear
+                                // again. Asserted here rather than at the
+                                // handshake: the handshake succeeding proves
+                                // only that something answered.
+                                Settings(this@MainActivity).hasEverConnected = true
+                            }
                             var latencyMs = 0L
                             lastSentAtMs?.let { sentAtMs ->
                                 latencyMs = (System.currentTimeMillis() - clockOffsetMs) - sentAtMs
@@ -1665,6 +1731,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             // for surfaceChanged to renegotiate, and leaving these set would
             // have it close an input stream belonging to the *next* connection.
             activeInput = null
+            if (!handshakeAnswered.get()) {
+                silentHandshakes++
+                Log.w(tag, "connection ended with the handshake unanswered ($silentHandshakes in a row)")
+            }
             cursorOverlay.clear()
             watchdogRunning.set(false)
             watchdogThread.interrupt()

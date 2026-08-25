@@ -37,6 +37,24 @@ class Settings(context: Context) {
         get() = prefs.getBoolean(KEY_CLIENT_SIDE_CURSOR, false)
         set(value) = prefs.edit().putBoolean(KEY_CLIENT_SIDE_CURSOR, value).apply()
 
+    /**
+     * True once this install has actually put a desktop on the panel.
+     *
+     * Not a user setting, and not shown anywhere in the settings screen: it
+     * exists so the status overlay can tell "your cable is unplugged" apart
+     * from "you have never installed the Linux half of this program", which
+     * are the same screen today and want completely different words. See
+     * [ConnectionStatus].
+     *
+     * Written from the render thread on the first rendered frame, so it is
+     * asserted by the one event that proves the whole pipeline worked, not by a
+     * handshake that may still fail afterwards. Never cleared: a daemon that
+     * has worked once was installed once, and that is what the flag records.
+     */
+    var hasEverConnected: Boolean
+        get() = prefs.getBoolean(KEY_HAS_EVER_CONNECTED, false)
+        set(value) = prefs.edit().putBoolean(KEY_HAS_EVER_CONNECTED, value).apply()
+
     /** Draws the running per-frame latency over the video. */
     var showLatencyOverlay: Boolean
         get() = prefs.getBoolean(KEY_LATENCY_OVERLAY, false)
@@ -231,6 +249,7 @@ class Settings(context: Context) {
         private const val KEY_CLIENT_SIDE_CURSOR = "client_side_cursor"
         private const val KEY_LATENCY_OVERLAY = "latency_overlay"
         private const val KEY_KEEP_SCREEN_AWAKE = "keep_screen_awake"
+        private const val KEY_HAS_EVER_CONNECTED = "has_ever_connected"
         private const val KEY_GEAR_EDGE = "gear_edge"
         private const val KEY_GEAR_FRACTION = "gear_fraction"
 
