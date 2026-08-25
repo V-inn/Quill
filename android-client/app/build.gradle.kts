@@ -30,6 +30,24 @@ android {
         applicationId = "com.quill.client"
         minSdk = 26
         targetSdk = 36
+        // Two numbers with very different lifetimes, and only one of them is
+        // for people.
+        //
+        // `versionCode` is Play's ordering key. It can never go down, not even
+        // across a deleted release: the store refuses an upload whose code is
+        // not above every code it has already seen, forever, and there is no
+        // way to reclaim a burnt one. So it is a plain counter, incremented by
+        // one per uploaded build -- deliberately not derived from the version
+        // name, a date, or a commit count, all of which can move backwards or
+        // collide when a release is rebuilt.
+        //
+        // `versionName` is the string a person reads, and `release-apk.sh`
+        // requires the tag it is publishing to match it exactly -- that check
+        // is the only thing keeping a `v0.2` release from carrying a build that
+        // still calls itself 0.1.
+        //
+        // Still 1/"0.1": nothing has been published yet. Both move together in
+        // one deliberate commit when it is.
         versionCode = 1
         versionName = "0.1"
     }
