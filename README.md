@@ -54,11 +54,12 @@ Grab the packages for your distribution from the
 # Debian / Ubuntu
 sudo apt install ./quill_*.deb ./quill-uinput_*.deb
 
-# Fedora
-sudo dnf install ./quill-*.rpm ./quill-uinput-*.rpm
+# Fedora  -- the [0-9] is what keeps `quill-*` from also matching quill-uinput
+sudo dnf install ./quill-[0-9]*.rpm ./quill-uinput-*.rpm
 
 # ...plus krfb on KDE, for the virtual monitor. GNOME needs nothing extra.
-sudo apt install krfb
+sudo apt install krfb      # Debian / Ubuntu
+sudo dnf install krfb      # Fedora
 ```
 
 Then **log out and back in**, so the pen permission applies to your session.

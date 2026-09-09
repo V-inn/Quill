@@ -13,6 +13,15 @@
 # `depends = "$auto"` against the machine it builds on, so building on anything
 # newer than the oldest supported release bakes in package names that release
 # has never heard of.
+#
+# The rpm side does not have an equivalent oldest-release image, and
+# `fedora:latest` is a deliberate exception, not an oversight: cargo-generate-rpm's
+# builtin auto-req emits soname-level requires (`libva.so.2()(64bit)`) and no
+# glibc symbol-version requirement at all, so the rpm *installs* happily on RHEL
+# 9 or an older Fedora and then the daemon dies at exec with a missing GLIBC
+# symbol. The rpm is therefore supported on current Fedora only. Building it on
+# an older baseline would widen that, and QUILL_RPM_IMAGE in
+# packaging/build-packages.sh is how to try one.
 
 name: Release
 
@@ -91,5 +100,16 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           ls -l artifacts
+          # A tag push creates no release, and `gh release upload` against a
+          # tag that has none fails with `release not found` -- so the packages
+          # would exist only as workflow artifacts while both READMEs send
+          # people to /releases/latest. Create it here unless a release was cut
+          # by hand first, in which case leave its notes alone.
+          if ! gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release create "${GITHUB_REF_NAME}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "${GITHUB_REF_NAME}" \
+              --generate-notes
+          fi
           gh release upload "${GITHUB_REF_NAME}" artifacts/* \
             --repo "${GITHUB_REPOSITORY}" --clobber

@@ -6,7 +6,13 @@ name = "quill-daemon"
 # this project comes from a single tablet model.
 version = "0.2.0"
 edition = "2021"
-description = "Turns an Android tablet into a pressure-sensitive drawing display for a Linux desktop, over USB"
+# Kept under ~66 characters on purpose. cargo-deb uses this as the deb synopsis
+# and folds anything longer across lines, and a folded synopsis is not one:
+# apt shows the first line only, and the tail becomes the opening line of the
+# extended description. At 97 characters this read "...for a Linux" in apt and
+# leaked " desktop, over USB" into the body of both packages. The full sentence
+# lives in the extended descriptions below.
+description = "Use an Android tablet as a pressure-sensitive drawing display"
 homepage = "https://github.com/V-inn/Quill"
 repository = "https://github.com/V-inn/Quill"
 readme = "README.md"
@@ -145,8 +151,14 @@ assets = [
     { source = "../LICENSE", dest = "/usr/share/licenses/quill/LICENSE", mode = "644", doc = true },
 ]
 post_install_script = '''
-/usr/bin/udevadm control --reload-rules || :
-/usr/bin/udevadm trigger --subsystem-match=usb || :
+# Resolved through PATH, not hardcoded: udevadm is /usr/sbin/udevadm on RHEL,
+# CentOS Stream and Alma, and `/usr/bin/udevadm ... || :` would turn "command
+# not found" into a silent success -- installing the rules and never loading
+# them, while the text below says a re-login is enough.
+if command -v udevadm >/dev/null 2>&1; then
+    udevadm control --reload-rules || :
+    udevadm trigger --subsystem-match=usb || :
+fi
 cat <<'EOF'
 
 quill: daemon installed at /usr/bin/quill-daemon.
@@ -160,8 +172,10 @@ immediately if that user runs:
 EOF
 '''
 post_uninstall_script = '''
-/usr/bin/udevadm control --reload-rules || :
-/usr/bin/udevadm trigger --subsystem-match=usb || :
+if command -v udevadm >/dev/null 2>&1; then
+    udevadm control --reload-rules || :
+    udevadm trigger --subsystem-match=usb || :
+fi
 '''
 
 [package.metadata.generate-rpm.recommends]
@@ -178,8 +192,11 @@ assets = [
     { source = "packaging/60-quill-uinput.rules", dest = "/usr/lib/udev/rules.d/60-quill-uinput.rules", mode = "644" },
 ]
 post_install_script = '''
-/usr/bin/udevadm control --reload-rules || :
-/usr/bin/udevadm trigger --subsystem-match=misc || :
+if command -v udevadm >/dev/null 2>&1; then
+    udevadm control --reload-rules || :
+    # misc, not usb: /dev/uinput is SUBSYSTEM=="misc".
+    udevadm trigger --subsystem-match=misc || :
+fi
 cat <<'EOF'
 
 quill-uinput: /dev/uinput is now granted to the user holding the *active local
@@ -195,9 +212,19 @@ the daemon then falls back to the RemoteDesktop portal, which carries neither.
 EOF
 '''
 post_uninstall_script = '''
-/usr/bin/udevadm control --reload-rules || :
-/usr/bin/udevadm trigger --subsystem-match=misc || :
+if command -v udevadm >/dev/null 2>&1; then
+    udevadm control --reload-rules || :
+    udevadm trigger --subsystem-match=misc || :
+fi
 '''
 
 [package.metadata.generate-rpm.variants.uinput.requires]
 quill = "*"
+
+# Cleared, not inherited -- the same reason the deb variant clears them. A
+# variant overrides only the keys it names, so without these the one-udev-rule
+# package would recommend *itself*, pull mesa-va-drivers onto a machine that has
+# no use for them, and suggest krfb.
+[package.metadata.generate-rpm.variants.uinput.recommends]
+
+[package.metadata.generate-rpm.variants.uinput.suggests]

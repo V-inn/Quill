@@ -39,8 +39,8 @@ your distribution from the
 # Debian / Ubuntu
 sudo apt install ./quill_*.deb ./quill-uinput_*.deb
 
-# Fedora
-sudo dnf install ./quill-*.rpm ./quill-uinput-*.rpm
+# Fedora  -- the [0-9] is what keeps `quill-*` from also matching quill-uinput
+sudo dnf install ./quill-[0-9]*.rpm ./quill-uinput-*.rpm
 ```
 
 Installing `quill` alone is enough to get a picture; `quill-uinput` is what
@@ -80,7 +80,11 @@ machine, the tradeoff is genuinely yours to make.
 To install without it:
 
 ```sh
+# Debian / Ubuntu
 sudo apt install --no-install-recommends ./quill_*.deb
+
+# Fedora
+sudo dnf install --setopt=install_weak_deps=False ./quill-[0-9]*.rpm
 ```
 
 One KDE caveat worth knowing before you decline it: some versions of

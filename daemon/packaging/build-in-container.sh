@@ -21,6 +21,15 @@ format=${1:?usage: build-in-container.sh deb|rpm}
 src_root=${QUILL_SRC:-/src}
 cd "$src_root/daemon"
 
+# Everything under /src is bind-mounted from the host and the container runs as
+# root, so without this the developer cannot delete -- or rebuild into -- their
+# own build directory. On EXIT rather than at the end: `set -e` means any
+# failure above would otherwise leave the staging tree root-owned, and the next
+# run's `cp` and even `--clean`'s `rm -rf` would then need sudo.
+if [ -n "${HOST_UID:-}" ] && [ -n "${HOST_GID:-}" ]; then
+    trap 'chown -R "$HOST_UID:$HOST_GID" "$src_root"' EXIT
+fi
+
 # Pinned so a release is reproducible and an upstream change cannot alter what
 # a tagged build produces without a commit here.
 CARGO_DEB_VERSION=3.7.0
@@ -106,11 +115,17 @@ cargo build --release --bin quill-daemon
 case "$format" in
     deb)
         cargo install --locked --quiet "cargo-deb@${CARGO_DEB_VERSION}"
+        out=target/debian
+        # build-packages.sh keeps the staging tree between runs so it does not
+        # recompile the world, and neither cargo-deb nor cargo-generate-rpm
+        # cleans its output directory. Left alone it accumulates every version
+        # ever built here, which breaks the single-match glob below and gets
+        # stale packages copied out as if they were this run's.
+        rm -f "$out"/*.deb
         # --no-build: the release binary is already there, and letting cargo-deb
         # drive the build would pull in the two diagnostic binaries.
         cargo deb --no-build
         cargo deb --no-build --variant uinput
-        out=target/debian
 
         # cargo-deb has no field for a per-variant synopsis: the one-line
         # Description comes from `package.description` for every package it
@@ -118,7 +133,12 @@ case "$format" in
         # is rewritten here -- unpack, replace the first Description line,
         # repack -- and verified, because a silent no-op would ship the wrong
         # text.
-        uinput_deb=$(ls "$out"/quill-uinput_*.deb)
+        uinput_debs=("$out"/quill-uinput_*.deb)
+        [ ${#uinput_debs[@]} -eq 1 ] && [ -f "${uinput_debs[0]}" ] || {
+            echo "packaging: expected exactly one quill-uinput deb in $out, got ${uinput_debs[*]}" >&2
+            exit 1
+        }
+        uinput_deb=${uinput_debs[0]}
         work=$(mktemp -d)
         dpkg-deb -R "$uinput_deb" "$work"
         sed -i '0,/^Description: /s|^Description: .*|Description: udev rule letting Quill'"'"'s pen report pressure and tilt|' \
@@ -127,19 +147,32 @@ case "$format" in
             echo "packaging: quill-uinput synopsis rewrite matched nothing" >&2
             exit 1
         }
+        # The rewrite replaces one line, so it only holds while cargo-deb keeps
+        # the synopsis on one line. Let package.description grow past cargo-deb's
+        # fold width and the tail of the *daemon's* synopsis survives as the
+        # first line of this package's extended description -- which is exactly
+        # what shipped before this check existed.
+        awk '/^Description: /{getline; print; exit}' "$work/DEBIAN/control" \
+            | grep -q '^ Installs one udev rule ' || {
+            echo "packaging: quill-uinput description carries a wrapped synopsis -- package.description too long?" >&2
+            exit 1
+        }
         rm -f "$uinput_deb"
         dpkg-deb --build --root-owner-group "$work" "$uinput_deb"
         rm -rf "$work"
         ;;
     rpm)
         cargo install --locked --quiet "cargo-generate-rpm@${CARGO_GENERATE_RPM_VERSION}"
+        out=target/generate-rpm
+        # Same reason as the deb side: a cached staging tree keeps every rpm
+        # built here, and build-packages.sh copies the directory wholesale.
+        rm -f "$out"/*.rpm
         # builtin auto-req reads the binary with ldd instead of shelling out to
         # rpmbuild's find-requires, so no rpm tooling is needed in the image.
         cargo generate-rpm --auto-req builtin
         # The uinput package is one text file; there is nothing to scan, and
         # leaving auto-req on would only add a dependency on /bin/sh.
         cargo generate-rpm --variant uinput --auto-req disabled
-        out=target/generate-rpm
         ;;
     *)
         echo "build-in-container.sh: unknown format '$format'" >&2
@@ -148,9 +181,3 @@ case "$format" in
 esac
 
 ls -l "$out"
-
-# Everything under /src is bind-mounted from the host, and the container runs
-# as root; without this the developer cannot delete their own build directory.
-if [ -n "${HOST_UID:-}" ] && [ -n "${HOST_GID:-}" ]; then
-    chown -R "$HOST_UID:$HOST_GID" "$src_root"
-fi
