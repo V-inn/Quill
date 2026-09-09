@@ -919,11 +919,11 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
      * visibility). `maximumWindowMetrics` is the modern (API 30+) replacement
      * that always reports the display's true full size.
      */
+    @Suppress("DEPRECATION") // the pre-API-30 branch below, deliberately kept
     private fun capturePanelGeometry() {
         val bounds = if (android.os.Build.VERSION.SDK_INT >= 30) {
             windowManager.maximumWindowMetrics.bounds
         } else {
-            @Suppress("DEPRECATION")
             val p = android.graphics.Point()
             windowManager.defaultDisplay.getRealSize(p)
             android.graphics.Rect(0, 0, p.x, p.y)
