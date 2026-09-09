@@ -19,7 +19,12 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 daemon_dir=$(pwd)
 repo_root=$(cd .. && pwd)
 
-# Overridable so a newer baseline can be tried without editing this file.
+# Overridable so a different baseline can be tried without editing this file.
+# debian:12 is the oldest release supported, for the dpkg-shlibdeps reason
+# above. fedora:latest is *not* the equivalent choice and is not one either:
+# cargo-generate-rpm's builtin auto-req records soname requires with no glibc
+# symbol-version requirement, so an rpm built here installs cleanly on RHEL 9 or
+# an older Fedora and only then fails at exec. The rpm is current-Fedora-only.
 DEB_IMAGE=${QUILL_DEB_IMAGE:-debian:12}
 RPM_IMAGE=${QUILL_RPM_IMAGE:-fedora:latest}
 
@@ -73,6 +78,13 @@ for format in "${formats[@]}"; do
 
     # Separate target dirs per format would be tidier, but cargo's is shared and
     # the two formats write to different subdirectories anyway.
+    #
+    # Both sides are cleared first. The staging tree is cached on purpose, so
+    # without this the output directory -- the one this script prints as the
+    # result, and a human then attaches to a release -- would hold 0.2.0 beside
+    # 0.3.0 with nothing saying which is current. build-in-container.sh clears
+    # the directory it builds into for the same reason.
+    rm -f "$out"/*."$format"
     cp "$stage/daemon/$built"/*."$format" "$out/"
 done
 
