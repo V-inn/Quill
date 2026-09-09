@@ -47,19 +47,36 @@ You need a GPU that can encode H.264 through VAAPI — the encoder is hardware-o
 Check with `vainfo | grep -E 'VAProfileH264.*EncSlice'`; if that prints nothing,
 Quill will not run. Intel and AMD graphics generally work, NVIDIA does not.
 
+Grab the packages for your distribution from the
+[latest release](https://github.com/V-inn/Quill/releases/latest):
+
 ```sh
 # Debian / Ubuntu
-sudo apt install build-essential pkg-config curl clang libclang-dev \
-                 libva-dev libpipewire-0.3-dev libusb-1.0-0-dev
+sudo apt install ./quill_*.deb ./quill-uinput_*.deb
+
+# Fedora
+sudo dnf install ./quill-*.rpm ./quill-uinput-*.rpm
 
 # ...plus krfb on KDE, for the virtual monitor. GNOME needs nothing extra.
 sudo apt install krfb
-
-# Rust, if you don't have it
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
+Then **log out and back in**, so the pen permission applies to your session.
+
+`quill-uinput` is the one thing here that touches the rest of the machine: a
+single udev rule granting `/dev/uinput` to whoever is sitting at the computer,
+which is what lets the pen report pressure and tilt. On a shared machine, read
+[Multi-user and managed machines](./daemon/README.md#multi-user-and-managed-machines)
+before installing it.
+
+<details>
+<summary>Or build it yourself</summary>
+
 ```sh
+sudo apt install build-essential pkg-config curl clang libclang-dev \
+                 libva-dev libpipewire-0.3-dev libusb-1.0-0-dev krfb
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
 git clone https://github.com/V-inn/Quill.git
 cd Quill/daemon
 cargo build --release
@@ -68,8 +85,9 @@ cargo build --release
 
 `install.sh` prints two `sudo` lines to run — one udev rule that lets Quill create
 the virtual pen (this is the only step that needs root, and only once), and one
-that starts the daemon when you plug the tablet in. **Log out and back in
-afterwards**, so the pen permission applies to your session.
+that starts the daemon when you plug the tablet in.
+
+</details>
 
 Full detail, every option, and a troubleshooting table:
 [`daemon/README.md`](./daemon/README.md).

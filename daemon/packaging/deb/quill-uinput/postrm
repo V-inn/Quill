@@ -1,0 +1,21 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = "remove" ]; then
+    if command -v udevadm >/dev/null 2>&1; then
+        udevadm control --reload-rules || true
+        udevadm trigger --subsystem-match=misc || true
+    fi
+    # Honest about what removal does and does not do: udev will not re-apply
+    # the ACL to a *new* /dev/uinput, but an ACL already attached to a running
+    # session stays until that session ends. Nothing in udev revokes it.
+    cat <<'EOF'
+
+quill-uinput removed. An ACL already granted to the session that is currently
+running stays in place until that session ends -- log out and back in to be
+sure /dev/uinput is no longer reachable.
+
+EOF
+fi
+
+exit 0

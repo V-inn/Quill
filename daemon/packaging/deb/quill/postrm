@@ -1,0 +1,13 @@
+#!/bin/sh
+# Runs after dpkg has removed the files, which is the only point at which
+# reloading udev reflects what is actually on disk.
+set -e
+
+if [ "$1" = "remove" ]; then
+    if command -v udevadm >/dev/null 2>&1; then
+        udevadm control --reload-rules || true
+        udevadm trigger --subsystem-match=usb || true
+    fi
+fi
+
+exit 0

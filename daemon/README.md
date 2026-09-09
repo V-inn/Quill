@@ -28,7 +28,79 @@ The tablet half lives in [`../android-client`](../android-client/README.md).
 
 ---
 
+## Install from a package
+
+If you are on Debian, Ubuntu or Fedora, this is the whole install — no build
+toolchain, no Rust, no udev rules to copy by hand. Download the two files for
+your distribution from the
+[latest release](https://github.com/V-inn/Quill/releases/latest), then:
+
+```sh
+# Debian / Ubuntu
+sudo apt install ./quill_*.deb ./quill-uinput_*.deb
+
+# Fedora
+sudo dnf install ./quill-*.rpm ./quill-uinput-*.rpm
+```
+
+Installing `quill` alone is enough to get a picture; `quill-uinput` is what
+makes the pen report real pressure and tilt. Both package managers pull it in
+by default when the two files are alongside each other, because `quill`
+recommends it — see below for when you would not want that.
+
+You still need the compositor and GPU support from
+[What you need](#what-you-need): KDE Plasma or GNOME on Wayland, `krfb`
+installed if you are on KDE, and a GPU that can encode H.264 through VAAPI.
+Neither package can check those for you at install time.
+
+Then **log out and back in** — the pen permission is an ACL attached to your
+session when it becomes active, so it does not reach the session that was
+already running — plug the tablet in, and unlock it.
+
+### Multi-user and managed machines
+
+Everything a Quill install adds to a shared machine is in one package,
+`quill-uinput`, which contains exactly one udev rule. Read it before deciding;
+it is four lines and one of them is the rule.
+
+That rule tags `/dev/uinput` with `uaccess`, which makes systemd-logind attach
+an ACL for **the user holding the active local seat session**. It does not
+grant anything to users connected over SSH, to background or lingering
+sessions, or to an inactive session on a switched seat — the ACL follows
+session activation. It is byte-for-byte the rule Steam ships as
+`60-steam-input.rules`. The alternatives it was chosen over — `MODE="0666"`, or
+a group — *would* have granted it more broadly.
+
+What it costs to decline it: the daemon falls back to the `RemoteDesktop`
+portal, which carries **no pressure and no tilt**. On a machine that is only
+ever used by the person sitting at it, that is most of Quill's value, which is
+why the package is recommended rather than merely suggested. On a lab or shared
+machine, the tradeoff is genuinely yours to make.
+
+To install without it:
+
+```sh
+sudo apt install --no-install-recommends ./quill_*.deb
+```
+
+One KDE caveat worth knowing before you decline it: some versions of
+`xdg-desktop-portal-kde` reject `RemoteDesktop` requests from unsandboxed
+applications, so on those the fallback does not degrade input — it has no input
+at all. GNOME is unaffected.
+
+`quill` itself installs no setuid binary, adds no user or group, and starts
+nothing at boot. Its only other system-wide file is
+`/usr/lib/udev/rules.d/99-quill-daemon.rules`, which starts the daemon in the
+seated user's own session when a Samsung USB device is attached and grants
+nothing. Both rules go in `/usr/lib/udev/rules.d`, so anything you put in
+`/etc/udev/rules.d` overrides them.
+
+---
+
 ## Build
+
+Only needed if there is no package for your distribution, or you want to change
+something. If you installed from a package, skip to [Run](#run).
 
 ### Dependencies
 
@@ -70,7 +142,7 @@ cargo build --release
 
 ---
 
-## Install
+## Install from source
 
 `packaging/install.sh` puts the binary and a `systemd --user` unit where they
 belong, then prints the two `sudo` lines you have to run yourself:

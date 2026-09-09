@@ -2,6 +2,11 @@
 daemon/target/
 experiments/capture-latency-probe/target/
 
+# Written by packaging/build-packages.sh: the wrapper and systemd unit with
+# ~/.local/bin rewritten to /usr/bin. Generated on every packaging run, so a
+# tracked copy could only ever be a stale one.
+daemon/packaging/generated/
+
 # C build artifacts (experiments)
 experiments/**/*.o
 experiments/evdi-bringup/evdi_test_client

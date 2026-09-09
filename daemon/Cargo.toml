@@ -1,7 +1,19 @@
 [package]
 name = "quill-daemon"
-version = "0.1.0"
+# 0.2.0, not 0.1.0: every development build ever made called itself 0.1.0, and
+# the first artifact anyone else installs should be distinguishable from those.
+# Not 1.0 -- GNOME has never been run on real hardware and every measurement in
+# this project comes from a single tablet model.
+version = "0.2.0"
 edition = "2021"
+description = "Turns an Android tablet into a pressure-sensitive drawing display for a Linux desktop, over USB"
+homepage = "https://github.com/V-inn/Quill"
+repository = "https://github.com/V-inn/Quill"
+readme = "README.md"
+license = "MIT"
+# Used as the Debian maintainer and the RPM packager. Change this and nothing
+# else if the published contact address should differ from the commit author.
+authors = ["Vinicius Flesch Kern <viniciusflesch1@gmail.com>"]
 
 [dependencies]
 ashpd = "0.12.3"
@@ -25,3 +37,167 @@ zbus = { version = "5.19", default-features = false, features = ["tokio"] }
 
 [build-dependencies]
 bindgen = "0.70"
+
+# --- Packaging --------------------------------------------------------------
+#
+# Two packages, on both formats:
+#
+#   quill          the daemon, the wrapper, the systemd --user unit, and the
+#                  auto-launch udev rule -- nothing with a privilege implication
+#   quill-uinput   one udev rule, alone: TAG+="uaccess" on /dev/uinput
+#
+# The split is the point. `uaccess` grants /dev/uinput to the user holding the
+# *active local seat session* -- not to SSH users, not to an inactive session on
+# a switched seat -- but it is still a grant, and on a shared machine it should
+# be a named package an administrator can see, decline, or remove on its own
+# rather than a file buried inside the daemon.
+#
+# It is Recommends and not Suggests because for the ordinary single-seat user it
+# is the working product: without it the daemon falls back to the RemoteDesktop
+# portal, which carries no pressure and no tilt. `--no-install-recommends`, or
+# excluding one named package from a managed image, is the opt-out.
+#
+# Both formats build from `packaging/build-packages.sh`, in containers, because
+# `$auto` dependency resolution reads the *build host* -- a trixie host writes
+# `libpipewire-0.3-0t64`, a package name bookworm has never heard of.
+#
+# `packaging/generated/` holds the two files that differ between a hand install
+# and a packaged one: `install.sh` puts the binary in ~/.local/bin, a package
+# puts it in /usr/bin. build-packages.sh rewrites exactly that one path in each,
+# and fails loudly if the substitution matches nothing.
+
+[package.metadata.deb]
+name = "quill"
+section = "utils"
+priority = "optional"
+license-file = ["../LICENSE", "0"]
+depends = "$auto"
+# va-driver-all: the encoder is VAAPI H.264 with no software fallback, so a
+# machine with no VA driver installed has no working Quill. Recommends rather
+# than Depends because most desktops already have one via mesa.
+recommends = "quill-uinput, va-driver-all"
+# krfb provides krfb-virtualmonitor, which the KDE path shells out to. Suggests,
+# not Recommends: apt installs Recommends by default, and this is KDE-only --
+# it would drag KDE components onto a GNOME machine that needs none of them.
+suggests = "krfb"
+maintainer-scripts = "packaging/deb/quill"
+extended-description = """
+Quill turns an Android tablet into a pressure-sensitive drawing display for a
+Linux desktop. This package is the Linux half: it captures a virtual monitor,
+encodes it to H.264 on the GPU, ships the frames to the tablet over USB, and
+turns the pen and touch records that come back into real Linux input devices.
+
+It needs the Quill Android app on the tablet to do anything.
+
+Requires KDE Plasma or GNOME on Wayland, and a GPU with VAAPI H.264 encode.
+"""
+assets = [
+    ["target/release/quill-daemon", "usr/bin/quill-daemon", "755"],
+    ["packaging/generated/quill", "usr/bin/quill", "755"],
+    ["packaging/generated/quill-daemon.service", "usr/lib/systemd/user/quill-daemon.service", "644"],
+    # /usr/lib/udev/rules.d, not /etc: /etc is the administrator's, and a
+    # package that writes there takes away their ability to override us.
+    ["packaging/99-quill-daemon.rules", "usr/lib/udev/rules.d/99-quill-daemon.rules", "644"],
+    ["README.md", "usr/share/doc/quill/README.md", "644"],
+]
+
+[package.metadata.deb.variants.uinput]
+name = "quill-uinput"
+# cargo-deb takes the one-line synopsis from `package.description`, which
+# describes the daemon. Left as-is, `apt search quill-uinput` would tell you
+# this udev rule turns a tablet into a drawing display. cargo-deb documents no
+# override, so build-in-container.sh rewrites the line after the fact and
+# checks that it took.
+# Cleared, not inherited: the base package's Recommends would have this package
+# recommending itself.
+recommends = ""
+suggests = ""
+depends = "quill"
+maintainer-scripts = "packaging/deb/quill-uinput"
+extended-description = """
+Installs one udev rule granting /dev/uinput to the user holding the active
+local seat session, which is what lets the Quill daemon create the virtual pen
+and report real pressure and tilt.
+
+The grant does not extend to users connected over SSH, or to an inactive
+session on a switched seat. Declining or removing this package leaves the
+daemon working through the RemoteDesktop portal instead, with no pressure and
+no tilt.
+"""
+assets = [
+    ["packaging/60-quill-uinput.rules", "usr/lib/udev/rules.d/60-quill-uinput.rules", "644"],
+]
+
+# The 60- prefix is load-bearing on both formats. TAG+="uaccess" does nothing by
+# itself; systemd's 73-seat-late.rules is what consumes it, and udev runs rules
+# in lexical filename order -- so anything numbered above 73 sets the tag after
+# the only thing that reads it has already run. See MILESTONES.md, Milestone 10.
+
+[package.metadata.generate-rpm]
+name = "quill"
+summary = "Use an Android tablet as a drawing display for a Linux desktop"
+assets = [
+    { source = "target/release/quill-daemon", dest = "/usr/bin/quill-daemon", mode = "755" },
+    { source = "packaging/generated/quill", dest = "/usr/bin/quill", mode = "755" },
+    { source = "packaging/generated/quill-daemon.service", dest = "/usr/lib/systemd/user/quill-daemon.service", mode = "644" },
+    { source = "packaging/99-quill-daemon.rules", dest = "/usr/lib/udev/rules.d/99-quill-daemon.rules", mode = "644" },
+    { source = "README.md", dest = "/usr/share/doc/quill/README.md", mode = "644", doc = true },
+    { source = "../LICENSE", dest = "/usr/share/licenses/quill/LICENSE", mode = "644", doc = true },
+]
+post_install_script = '''
+/usr/bin/udevadm control --reload-rules || :
+/usr/bin/udevadm trigger --subsystem-match=usb || :
+cat <<'EOF'
+
+quill: daemon installed at /usr/bin/quill-daemon.
+
+Its systemd user unit is in /usr/lib/systemd/user, which a session that is
+already running does not re-scan. It will be picked up at the next login, or
+immediately if that user runs:
+
+    systemctl --user daemon-reload
+
+EOF
+'''
+post_uninstall_script = '''
+/usr/bin/udevadm control --reload-rules || :
+/usr/bin/udevadm trigger --subsystem-match=usb || :
+'''
+
+[package.metadata.generate-rpm.recommends]
+quill-uinput = "*"
+mesa-va-drivers = "*"
+
+[package.metadata.generate-rpm.suggests]
+krfb = "*"
+
+[package.metadata.generate-rpm.variants.uinput]
+name = "quill-uinput"
+summary = "udev rule granting /dev/uinput to Quill's active-seat user"
+assets = [
+    { source = "packaging/60-quill-uinput.rules", dest = "/usr/lib/udev/rules.d/60-quill-uinput.rules", mode = "644" },
+]
+post_install_script = '''
+/usr/bin/udevadm control --reload-rules || :
+/usr/bin/udevadm trigger --subsystem-match=misc || :
+cat <<'EOF'
+
+quill-uinput: /dev/uinput is now granted to the user holding the *active local
+seat session* -- not to users connected over SSH, and not to inactive sessions
+on a switched seat. The grant is an ACL systemd-logind attaches when a session
+becomes active, so it does not apply to the session running right now:
+
+    log out and back in.
+
+This is what buys pen pressure and tilt. Remove this package to withdraw it;
+the daemon then falls back to the RemoteDesktop portal, which carries neither.
+
+EOF
+'''
+post_uninstall_script = '''
+/usr/bin/udevadm control --reload-rules || :
+/usr/bin/udevadm trigger --subsystem-match=misc || :
+'''
+
+[package.metadata.generate-rpm.variants.uinput.requires]
+quill = "*"

@@ -1,0 +1,29 @@
+#!/bin/sh
+# This package is nothing but 60-quill-uinput.rules -- one udev rule that
+# grants /dev/uinput. It is a separate package precisely so that grant is a
+# named, auditable thing an administrator can decline or remove on its own.
+set -e
+
+if [ "$1" = "configure" ]; then
+    if command -v udevadm >/dev/null 2>&1; then
+        udevadm control --reload-rules || true
+        # misc, not usb: /dev/uinput is SUBSYSTEM=="misc".
+        udevadm trigger --subsystem-match=misc || true
+    fi
+
+    cat <<'EOF'
+
+quill-uinput: /dev/uinput is now granted to the user holding the *active local
+seat session* -- not to users connected over SSH, and not to inactive sessions
+on a switched seat. The grant is an ACL systemd-logind attaches when a session
+becomes active, so it does not apply to the session running right now:
+
+    log out and back in.
+
+This is what buys pen pressure and tilt. Remove this package to withdraw it;
+the daemon then falls back to the RemoteDesktop portal, which carries neither.
+
+EOF
+fi
+
+exit 0
